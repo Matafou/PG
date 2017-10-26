@@ -1615,7 +1615,9 @@ Near here means PT is either inside or just aside of a comment."
   (when (fboundp 'smie-setup) ; always use smie, old indentation code removed
     (smie-setup coq-smie-grammar #'coq-smie-rules
                   :forward-token #'coq-smie-forward-token
-                  :backward-token #'coq-smie-backward-token))
+                  :backward-token #'coq-smie-backward-token)
+    (setq coq-indent-line 'coq-smie-indent-line)
+    )
 
   ;; old indentation code.
   ;; (require 'coq-indent)

@@ -42,6 +42,10 @@
 ;     ,@body
 ;     (message "%.06f" (float-time (time-since time)))))
 
+(defvar coq-smie-indent-region-start nil)
+(defvar coq-smie-indent-region-end nil)
+
+
 (defcustom coq-smie-user-tokens nil
   "Alist of (syntax . token) pairs to extend the coq smie parser.
 These are user configurable additional syntax for smie tokens. It
@@ -80,6 +84,23 @@ attention to case differences."
 (defun coq-dot-friend-p (s)
   (and (not (string-equal ".." s)) ;; string-equal because ... should return t.
        (string-match "[^[:word:]]\\.\\'" s)))
+
+
+(defun coq-default-backward-token (&optional limit)
+  (forward-comment (- (point)))
+  (buffer-substring-no-properties
+   (point)
+   (progn (if (zerop (skip-syntax-backward "." limit))
+              (skip-syntax-backward "w_'" limit))
+          (point))))
+
+(defun coq-default-forward-token (&optional limit)
+  (forward-comment (point-max))
+  (buffer-substring-no-properties
+   (point)
+   (progn (if (zerop (skip-syntax-forward "." limit))
+              (skip-syntax-forward "w_'" limit))
+          (point))))
 
 ; for debuging
 (defun coq-time-indent ()
@@ -148,7 +169,7 @@ the token of \".\" is simply \".\"."
 	    (coq-smie-detect-goal-command))
 	(save-excursion
 	  (goto-char (+ p 1))
-          (let ((tok (smie-default-forward-token)))
+          (let ((tok (coq-default-forward-token)))
             (cond
              ;; If the next token is "Proof", then the current command does
              ;; introduce a proof, but the user opted to use the explicit
@@ -198,7 +219,7 @@ the token of \".\" is simply \".\"."
 
 
 
-;; A variant of smie-default-backward-token that recognize "." and ";"
+;; A variant of coq-default-backward-token that recognize "." and ";"
 ;; as single token even if glued at the end of another symbols.
 
 (defun coq-backward-token-fast-nogluing-dot-friends ()
@@ -384,16 +405,36 @@ The point should be at the beginning of the command name."
 (defun coq-is-cmdend-token (tok)
   (or (coq-is-bullet-token tok) (coq-is-subproof-token tok) (coq-is-dot-token tok)))
 
+(defun coq-is-at-first-cmd-line ()
+  (save-excursion
+    (back-to-indentation)
+    (coq-is-at-command-real-start)))
+
+(defun coq-find-cmdend ()
+  (save-excursion
+    (coq-script-parse-cmdend-forward)
+    (point)))
 
 (defun coq-smie-forward-token ()
-  (let ((tok (smie-default-forward-token)))
+  (let ((tok (coq-smie-forward-token-rec coq-smie-indent-region-start coq-smie-indent-region-end)))
+    (if (or (< 0 (length tok))
+            (looking-at "\\s(\\|\\s)\\(\\)")
+            (looking-at "\\s\"\\|\\s|")
+            (eobp))
+        tok
+      "")))
+
+
+
+(defun coq-smie-forward-token-rec (start end)
+  (let ((tok (coq-default-forward-token end)))
     (cond
      ((assoc tok coq-smie-user-tokens)
       (let ((res (assoc tok coq-smie-user-tokens)))
         (cdr res)))
      ;; @ may be  ahead of an id, it is part of the id.
      ((and (equal tok "@") (looking-at "[[:alpha:]_]"))
-      (let ((newtok (coq-smie-forward-token))) ;; recursive call
+      (let ((newtok (coq-smie-forward-token-rec start end))) ;; recursive call
 	(concat tok newtok)))
      ;; detecting if some qualification (dot notation) follows that id and
      ;; extend it if yes. Does not capture other alphanumerical token (captured
@@ -401,22 +442,22 @@ The point should be at the beginning of the command name."
      ((and (string-match "@?[[:alpha:]_][[:word:]]*" tok)
 	   (looking-at "\\.[[:alpha:]_]")
 	   (progn (forward-char 1)
-		  (let ((newtok (coq-smie-forward-token))) ; recursive call
+		  (let ((newtok (coq-smie-forward-token-rec start end))) ; recursive call
 		    (concat tok "." newtok)))))
      ((member tok '("." "..."))
       ;; swallow if qualid, call backward-token otherwise
       (cond
        ((member (char-after) '(?w ?_))  ;(looking-at "[[:alpha:]_]") ;; extend qualifier
-	(let ((newtok (coq-smie-forward-token))) ;; recursive call
+	(let ((newtok (coq-smie-forward-token-rec start end))) ;; recursive call
 	  (concat tok newtok)))
-       (t (save-excursion (coq-smie-backward-token))))) ;; recursive call
+       (t (save-excursion (coq-smie-backward-token-rec start end))))) ;; recursive call
      ((or (string-match coq-bullet-regexp-nospace tok)
 	  (member tok '("=>" ":=" "::=" "exists" "in" "as" "∀" "∃" "→" "∨" "∧" ";"
 			"," ":" "eval")))
       ;; The important lexer for indentation's performance is the backward
       ;; lexer, so for the forward lexer we delegate to the backward one when
       ;; we can.
-      (save-excursion (coq-smie-backward-token)))
+      (save-excursion (coq-smie-backward-token-rec start end)))
 
      ;; easier to return directly than calling coq-smie-backward-token
      ((member tok '("lazymatch" "multimatch")) "match")
@@ -424,41 +465,41 @@ The point should be at the beginning of the command name."
      ;; detect "with signature", otherwies use coq-smie-backward-token
      ((equal tok "with")
       (let ((p (point)))
-	(if (equal (smie-default-forward-token) "signature")
+	(if (equal (coq-default-forward-token end) "signature")
 	    "with signature"
 	  (goto-char p)
-	  (save-excursion (coq-smie-backward-token)))))
+	  (save-excursion (coq-smie-backward-token-rec start end)))))
 
      ((member tok '("transitivity" "symmetry" "reflexivity"))
       (let ((p (point)))
-	(if (and (equal (smie-default-forward-token) "proved")
-		 (equal (smie-default-forward-token) "by"))
+	(if (and (equal (coq-default-forward-token end) "proved")
+		 (equal (coq-default-forward-token end) "by"))
 	    "xxx provedby"
 	  (goto-char p)
 	  tok))) ; by tactical
 
      ((member tok '("Module")) ; TODO: Declare
       (let ((pos (point))
-	    (next (smie-default-forward-token)))
+	    (next (coq-default-forward-token end)))
 	(unless (equal next "Type") (goto-char pos))
-	(save-excursion (coq-smie-backward-token))))
+	(save-excursion (coq-smie-backward-token-rec start end))))
 
      ((member tok '("End"))
-      (save-excursion (coq-smie-backward-token)))
+      (save-excursion (coq-smie-backward-token-rec start end)))
 
      ; empty token if a prenthesis is met.
      ((and (zerop (length tok)) (looking-at "{|")) (goto-char (match-end 0)) "{|")
 
      ;; this must be after detecting "{|":
      ((and (zerop (length tok)) (eq (char-after) ?\{))
-      (if (equal (save-excursion (forward-char 1) (coq-smie-backward-token))
+      (if (equal (save-excursion (forward-char 1) (coq-smie-backward-token-rec start end))
 		 "{ subproof")
 	  (progn (forward-char 1) "{ subproof")
 	tok))
 
      ((and (zerop (length tok)) (eq (char-after) ?\}))
       (if (equal (save-excursion (forward-char 1)
-				 (coq-smie-backward-token))
+				 (coq-smie-backward-token-rec start end))
 		 "} subproof")
 	  (progn (forward-char 1) "} subproof")
 	tok))
@@ -470,7 +511,7 @@ The point should be at the beginning of the command name."
      ;; smie-default-forward... by a smarter function.
      ((coq-dot-friend-p tok) ".")
      ;; Try to rely on backward-token for non empty tokens: bugs (hangs)
-     ;; ((not (zerop (length tok))) (save-excursion (coq-smie-backward-token)))
+     ;; ((not (zerop (length tok))) (save-excursion (coq-smie-backward-token-rec start end)))
      ;; return it.
      (tok)
      )))
@@ -493,7 +534,7 @@ The point should be at the beginning of the command name."
      ((equal corresp ".") ":= def") ; := outside of any parenthesis
      ((equal corresp "Module")
       (let ((p (point)))
-	(if (equal (smie-default-backward-token) "with")
+	(if (equal (coq-default-backward-token) "with")
 	    ":= with"
 	  (goto-char p)
 	  ":= module")))
@@ -504,9 +545,20 @@ The point should be at the beginning of the command name."
      (t ":=")))) ; a parenthesis stopped the search
 
 
-
 (defun coq-smie-backward-token ()
-  (let* ((tok (smie-default-backward-token)))
+  (let ((tok (coq-smie-backward-token-rec coq-smie-indent-region-start coq-smie-indent-region-end)))
+    (if
+        (or (< 0 (length tok))
+            ;; 4 == open paren syntax, 5 == close.
+            (memq (setq class (syntax-class (syntax-after (1- (point))))) '(4 5))
+            (memq class '(7 15))
+            (bobp))
+        tok
+      "")))
+
+
+(defun coq-smie-backward-token-rec (start end)
+  (let* ((tok (coq-default-backward-token start)))
     (cond
      ((assoc tok coq-smie-user-tokens)
       (let ((res (assoc tok coq-smie-user-tokens)))
@@ -520,7 +572,7 @@ The point should be at the beginning of the command name."
 	  (cond
 	   ((member backtok '("forall" "∀" "∃")) ", quantif")
 	   ((equal backtok "exists") ; there is a tactic called exists
-	    (if (equal (coq-smie-forward-token) ;; recursive call
+	    (if (equal (coq-smie-forward-token-rec nil) ;; recursive call
 		       "quantif exists")
 		", quantif" tok))
 	   (t tok)))))
@@ -534,7 +586,7 @@ The point should be at the beginning of the command name."
 	   ((equal backtok nil)
 	    (if (or (looking-back "(" nil) (looking-back "\\[")
 		    (and (looking-back "{" nil)
-			 (equal (coq-smie-backward-token) "{ subproof"))) ;; recursive call
+			 (equal (coq-smie-backward-token-rec start end) "{ subproof"))) ;; recursive call
 		"; tactic"
 	      "; record"))))))
 
@@ -546,14 +598,14 @@ The point should be at the beginning of the command name."
 	   ((member backtok '("." "Ltac")) "|| tactic")
 	   ((and (equal backtok ";")
 		 (or (forward-char) t)
-		 (equal (coq-smie-backward-token) "; tactic")) ;; recursive
+		 (equal (coq-smie-backward-token-rec start end) "; tactic")) ;; recursive
 	    "|| tactic")
 	   ;; this is wrong half of the time but should not harm indentation
 	   ((and (equal backtok nil) (looking-back "(" nil)) "||") 
 	   ((equal backtok nil)
 	    (if (or (looking-back "\\[" nil)
 		    (and (looking-back "{" nil)
-			 (equal (coq-smie-backward-token) "{ subproof"))) ;; recursive call
+			 (equal (coq-smie-backward-token-rec start end) "{ subproof"))) ;; recursive call
 		"|| tactic"
 	      "||"))))))
 
@@ -588,7 +640,7 @@ The point should be at the beginning of the command name."
      ((and (zerop (length tok)) (member (char-before) '(?\{ ?\}))
 	   (save-excursion
 	     (forward-char -1)
-	     (let ((nxttok (coq-smie-backward-token))) ;; recursive call
+	     (let ((nxttok (coq-smie-backward-token-rec start end))) ;; recursive call
 	       (coq-is-cmdend-token nxttok))))
       (forward-char -1)
       (if (looking-at "{") "{ subproof" "} subproof"))
@@ -625,7 +677,7 @@ The point should be at the beginning of the command name."
      ((and (member tok '("exists" "∃"))
 	   (save-excursion
 	     ;; recursive call looking at the ptoken immediately before
-	     (let ((prevtok (coq-smie-backward-token)))
+	     (let ((prevtok (coq-smie-backward-token-rec start end)))
 	       ;; => may be wrong here but rare (have "=> ltac"?)
 	       (not (or (coq-is-cmdend-token prevtok)
 			(member prevtok '("; tactic" "[" "]" "|" "=>")))))))
@@ -642,13 +694,13 @@ The point should be at the beginning of the command name."
       "where")
 
      ((and (equal tok "signature")
-	   (equal (smie-default-backward-token) "with"))
+	   (equal (coq-default-backward-token start) "with"))
       "with signature")
 
      ((equal tok "by")
       (let ((p (point)))
-	(if (and (equal (smie-default-backward-token) "proved")
-		 (member (smie-default-backward-token)
+	(if (and (equal (coq-default-backward-token start) "proved")
+		 (member (coq-default-backward-token start)
 			 '("transitivity" "symmetry" "reflexivity")))
 	    "xxx provedby"
 	  (goto-char p)
@@ -669,8 +721,8 @@ The point should be at the beginning of the command name."
 
      ((equal tok "by")
       (let ((p (point)))
-	(if (and (equal (smie-default-backward-token) "proved")
-		 (member (smie-default-backward-token)
+	(if (and (equal (coq-default-backward-token start) "proved")
+		 (member (coq-default-backward-token start)
 			 '("transitivity" "symmetry" "reflexivity")))
 	    "xxx provedby"
 	  (goto-char p)
@@ -680,7 +732,7 @@ The point should be at the beginning of the command name."
      ((equal tok "eval")
       (if (member (save-excursion
 		    (forward-char 4)
-		    (smie-default-forward-token))
+		    (coq-default-forward-token end))
 		  '("red" "hnf" "compute" "simpl" "cbv" "lazy" "unfold" "fold" "pattern"))
 	  "eval in" tok))
      
@@ -724,7 +776,7 @@ The point should be at the beginning of the command name."
      ((and (and (eq (char-before) ?.) (member (char-syntax (char-after))
 					      '(?w ?_))))
       (forward-char -1)
-      (let ((newtok (coq-smie-backward-token))) ; recursive call
+      (let ((newtok (coq-smie-backward-token-rec start end))) ; recursive call
 	(concat newtok "." tok)))
 
      ((coq-dot-friend-p tok) ".")
@@ -1189,6 +1241,19 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
 ;;        (smie-rule-parent 2))
 
 
+
+
+(defun coq-smie-indent-line ()
+  (if (coq-is-at-first-cmd-line) 
+      (progn
+        (setq coq-smie-indent-region-start (point))
+        (setq coq-smie-indent-region-end (point))
+        (smie-indent-line)) 
+    (setq coq-smie-indent-region-start (save-excursion (coq-find-real-start)))
+    (setq coq-smie-indent-region-end (save-excursion (coq-find-cmdend)))
+    (smie-indent-line)
+    )
+  )
 
 
 (provide 'coq-smie)
