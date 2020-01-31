@@ -148,6 +148,22 @@ attention to case differences."
          ((not (string-equal backtok "")) backtok)
          (t (char-to-string (char-before))))))))
 
+;; are we exactly at command start? But not before a bullet.
+(defun coq-smie-is-cmdstart()
+  (let* ((cmdstrt (save-excursion (coq-find-real-start)))
+         (isbullet (save-excursion (coq-find-real-start) (looking-at coq-bullet-regexp-nospace)))
+         )
+    (and (equal (point) cmdstrt)
+         (not isbullet)
+         )))
+
+(defun coq-smie-is-precommand()
+  (let ((cmdstrt (save-excursion (coq-find-current-start)))
+        (cmdrealstrt (save-excursion (coq-find-real-start))))
+    (or (equal (point) (point-min))
+        ;; cmdstrt is one space after the previous final "."
+        (and (>= (point) (- cmdstrt 1))(<= (point) cmdrealstrt)) )))
+
 ;; Fragile: users can define tactics with uppercases... Returns t if
 ;; we are inside a tactic and not inside a record notation. Ideally we
 ;; would like to know if the interpretation scope is term or tactic
@@ -206,6 +222,8 @@ the token of \".\" is simply \".\"."
       (coq-find-real-start) ; Move to real start of command.
       (cond
        ((looking-at "BeginSubproof\\>") ". proofstart")
+       ((looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens)) ". proofend")
+       ((looking-at "End") ". proofend")
        ((looking-at "Proof\\>")
 	(forward-char 5)
         (forward-comment (point-max))
@@ -466,8 +484,18 @@ The point should be at the beginning of the command name."
      (tok))))
 
 (defun coq-smie-forward-token-aux ()
-  (let ((tok (smie-default-forward-token)))
+  (let ((orig (point))
+        (is-precmd (coq-smie-is-precommand))
+        (tok (smie-default-forward-token)))
     (cond
+     ((and is-precmd
+           (equal (char-before orig) ?\.)
+           (not (string-match coq-bullet-regexp-nospace tok)))
+      (goto-char (+ orig 1))" next command")
+     ((and is-precmd
+           (not (string-equal tok ""))
+           (not (string-match coq-bullet-regexp-nospace tok)))
+      " command start")
      ;; @ may be  ahead of an id, it is part of the id.
      ((and (equal tok "@") (looking-at "[[:alpha:]_]"))
       (let ((newtok (coq-smie-forward-token))) ;; recursive call
@@ -541,7 +569,8 @@ The point should be at the beginning of the command name."
 	tok))
      ((and (equal tok "|") (eq (char-after) ?\}))
       (goto-char (1+ (point))) "|}")
-     ((member tok coq-smie-proof-end-tokens) "Proof End")
+     ;;  we prefer detecting te following "." as ". proofend"
+     ;;((member tok coq-smie-proof-end-tokens) "Proof End")
      ((member tok '("Obligation")) "Proof")
      ;; FIXME: this case should be useless now that we replace
      ;; smie-default-forward... by a smarter function.
@@ -611,8 +640,11 @@ The point should be at the beginning of the command name."
      (tok))))
 
 (defun coq-smie-backward-token-aux ()
-  (let* ((tok (smie-default-backward-token)))
+  (let* ((orig (point))
+         (tok (smie-default-backward-token)))
     (cond
+     ((and (not (string-equal tok "")) ; if at point-min or after a closing parenth
+           (coq-smie-is-cmdstart)) " command start")
      ;; Distinguish between "," from quantification and other uses of
      ;; "," (tuples, tactic arguments)
      ((equal tok ",")
@@ -828,17 +860,25 @@ The point should be at the beginning of the command name."
       (forward-char -1)
       (concat "@" tok))
 
-     ((member tok coq-smie-proof-end-tokens) "Proof End")
+     ;;((member tok coq-smie-proof-end-tokens) "Proof End")
 
      ((member tok '("." "..."))
-      ;; Distinguish field-selector "." from terminator "." from module
-      ;; qualifier.
+      ;; Distinguish field-selector "." from terminator "." from
+      ;; module qualifier. + detect the space token following the "."
+      ;; if we were not exactly after the "."
       (let ((nxtnxt (char-after (+ (point) (length tok)))))
 	(if (eq nxtnxt ?\() ". selector"
 	  (if (or (null nxtnxt) (eq (char-syntax nxtnxt) ?\ ))
-	      ;; command terminator: ". proofstart" et al
-	      (save-excursion (forward-char (- (length tok) 1))
-			      (coq-smie-.-deambiguate))
+              (if (and (< (+ (point) (length tok)) orig)
+                       (not (save-excursion
+                              (goto-char (+ (point) (length tok)))
+                              (string-match (smie-default-forward-token)
+                                            coq-bullet-regexp-nospace))))
+                  (progn (goto-char (+ (point) (length tok)))
+                         " next command")
+	        ;; command terminator: ". proofstart" et al
+	        (save-excursion (forward-char (- (length tok) 1))
+			        (coq-smie-.-deambiguate)))
 	    (if (eq (char-syntax nxtnxt) ?w)
 		(let ((newtok (coq-smie-complete-qualid-backward)))
 		  ;; qualified name
@@ -994,12 +1034,15 @@ Typical values are 2 or 4."
       ;; goal starter and returns the ". proofstart" and ". moduelstart"
       ;; tokens.
       (bloc ("{ subproof" commands "} subproof")
-	    (". proofstart" commands  "Proof End")
-	    (". modulestart" commands  "end module" exp)
 	    (moduledecl) (moduledef)
 	    (exp))
 
-      (commands (commands "." commands)
+      (commands (" command start" exp ".")
+                (" command start" exp ". proofstart")
+                (" command start" exp ". proofend")
+                (" command start" exp ". modulestart")
+                (" command start" exp ". proof end ")
+                (commands " next command" commands)
 		(commands "- bullet" commands)
 		(commands "+ bullet" commands)
 		(commands "* bullet" commands)
@@ -1025,13 +1068,15 @@ Typical values are 2 or 4."
     ;; each line orders tokens by increasing priority
     ;; | C x => fun a => b | C2 x => ...
     ;;'((assoc "=>") (assoc "|")  (assoc "|-" "=> fun")) ; (assoc ", quantif")
-    '((assoc "- bullet") (assoc "+ bullet") (assoc "* bullet")
+    '((assoc " next command")
+      (assoc "- bullet") (assoc "+ bullet") (assoc "* bullet")
       (assoc "-- bullet") (assoc "++ bullet") (assoc "** bullet")
       (assoc "--- bullet") (assoc "+++ bullet") (assoc "*** bullet")
       (assoc "---- bullet") (assoc "++++ bullet") (assoc "**** bullet")
       (assoc ".")
       (assoc "with inductive" "with fixpoint" "where"))
-    '((assoc ":= def" ":= inductive")
+    '(
+      (assoc ":= def" ":= inductive")
       (assoc "|") (assoc "=>")
       (assoc ":=") (assoc "xxx provedby")
       (assoc "as morphism") (assoc "with signature") (assoc "with match")
@@ -1051,7 +1096,7 @@ Typical values are 2 or 4."
       (assoc "+") (assoc "-") (assoc "*")(assoc "&&")
       (assoc ": ltacconstr") (assoc ". selector"))
     '((assoc ":" ":<")  (assoc "<"))
-    '((assoc ". modulestart" "." ". proofstart") (assoc "Module def")
+    '((assoc ". modulestart" ". proofstart") (assoc "Module def")
       (assoc "with module" "module nodecl") (assoc ":= module")
       (assoc ":= with module")  (assoc ":" ":<"))
     '((assoc ":= def") (assoc "; record") (assoc ":= record"))))
@@ -1114,6 +1159,25 @@ If nil, default to `proof-indent' if it exists or to `smie-indent-basic'."
   :type '(choice (const :tag "Fallback on global settings" nil)
           integer))
 
+;; Debugging smie parent token, needs the highlight library
+;;and something like this in .emacs:
+;; (require 'highlight)
+;; (custom-set-faces '(highlight ((((type x) (class color) (background light)) (:background "Wheat")))))
+(defun coq-show-smie--parent (parent token parent-token &optional num msg)
+  (ignore-errors
+   (message "%s token: %S ; parent: %S ; parent-token: %S" msg token parent parent-token)
+   (hlt-unhighlight-region)
+   (let* ((beg (if (listp (car parent)) (caar parent) (car parent)))
+          (end (cadr parent))
+          (regi (list (list beg end)))
+          (tok (caddr parent))
+          (face (cond
+                 ((equal num 1) 'hlt-regexp-level-1)
+                 ((equal num 2) 'hlt-regexp-level-2)
+                 (t 'hlt-regexp-level-1))))
+     (and parent (hlt-highlight-regions regi face)))))
+
+
 (defun coq-smie-rules (kind token)
   "Indentation rules for Coq.  See `smie-rules-function'.
 KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
@@ -1136,6 +1200,7 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
 ;	    (equal (coq-smie-forward-token) "{ subproof"))
 	  ))
      (`:after
+      ;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 1 "AFTER")
       (cond
        ;; Override the default indent step added because of their presence
        ;; in smie-closer-alist.
@@ -1206,12 +1271,26 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
        ((equal token ". proofstart")
 	(save-excursion (forward-char -1) (coq-find-real-start)
 			`(column . ,(+ coq-indent-proofstart (current-column)))))
+
        ((equal token ". modulestart")
 	(save-excursion (forward-char -1) (coq-find-real-start)
-			`(column . ,(+ coq-indent-modulestart (current-column)))))))
+			`(column . ,(+ coq-indent-modulestart (current-column)))))
+
+       ((equal token ".")
+	(save-excursion (forward-char -1) (coq-find-real-start)
+			`(column . ,(current-column))))
+       ))
 
      (`:before
+      ;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 2 "BEFORE")
       (cond
+       ((looking-at (proof-regexp-alt-list coq-keywords-save-strict))
+        (message "ICI")
+        (save-excursion (coq-find-current-start) (forward-char -2) (coq-find-real-start)
+			`(column . ,(- (current-column) coq-indent-proofstart))))
+       ((equal token ". end module")
+	(save-excursion (forward-char -1) (coq-find-real-start)
+			`(column . ,(- (current-column) coq-indent-modulestart))))
 
 ;       ((and (member token '("{ subproof"))
 ;	     (not coq-indent-box-style)
@@ -1301,25 +1380,11 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
 	(save-excursion (coq-find-real-start)
 			`(column . ,(current-column))))
 
-       ((or (member token '(":= inductive" ":= def"))
-            (and (equal token ":") (smie-rule-parent-p ".")))
-        (let ((pcol
-               (save-excursion
-                 ;; Indent relative to the beginning of the current command
-                 ;; rather than relative to the previous command.
-                 (smie-backward-sexp token)
-                 ;; special case: if this ":=" corresponds to a "with
-                 ;; foo", then the previous smie-backward-sexp stopped
-                 ;; between "with" and "foo" (because "with inductive"
-                 ;; and co are considered as ".", maybe this is the
-                 ;; problem), but we want to indent from the column of
-                 ;; "with" instead
-                 (let ((col1 (current-column)))
-                   (if (equal (coq-smie-backward-token) "with inductive")
-                       (current-column)
-                     col1)
-                   ))))
-          `(column . ,(if (smie-rule-hanging-p) pcol (+ 2 pcol)))))
+       ((member token '("with inductive"))
+        (smie-rule-parent))
+
+       ((member token '(":= inductive" ":= def" ":"))
+        (if (smie-rule-hanging-p) (smie-rule-parent) (smie-rule-parent 2)))
 
        ((equal token "|")
 	(cond ((smie-rule-parent-p "with match")
@@ -1329,22 +1394,6 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
 	       
 	      (t (smie-rule-separator kind))))))
      ))
-
-;; No need of this hack anymore?
-;;       ((and (equal token "Proof End")
-;;             (smie-rule-parent-p "Module" "Section" "goalcmd"))
-;;        ;; ¡¡Major gross hack!!
-;;        ;; This typically happens when a Lemma had no "Proof" keyword.
-;;        ;; We should ideally find some other way to handle it (e.g. matching Qed
-;;        ;; not with Proof but with any of the keywords like Lemma that can
-;;        ;; start a new proof), but we can workaround the problem here, because
-;;        ;; SMIE happened to decide arbitrarily that Qed will stop before Module
-;;        ;; when parsing backward.
-;;        ;; FIXME: This is fundamentally very wrong, but it seems to work
-;;        ;; OK in practice.
-;;        (smie-rule-parent 2))
-
-
 
 
 (provide 'coq-smie)
