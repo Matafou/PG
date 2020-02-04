@@ -151,18 +151,20 @@ attention to case differences."
 ;; are we exactly at command start? But not before a bullet.
 (defun coq-smie-is-cmdstart()
   (let* ((cmdstrt (save-excursion (coq-find-real-start)))
-         (isbullet (save-excursion (coq-find-real-start) (looking-at coq-bullet-regexp-nospace)))
-         )
+         (isbullet (save-excursion (coq-find-real-start)
+                                   (looking-at coq-bullet-regexp-nospace))))
     (and (equal (point) cmdstrt)
-         (not isbullet)
-         )))
+         (not isbullet))))
 
+;; are we between the end of previous command and the real start of current command?
 (defun coq-smie-is-precommand()
   (let ((cmdstrt (save-excursion (coq-find-current-start)))
         (cmdrealstrt (save-excursion (coq-find-real-start))))
     (or (equal (point) (point-min))
         ;; cmdstrt is one space after the previous final "."
         (and (>= (point) (- cmdstrt 1))(<= (point) cmdrealstrt)) )))
+
+;; are we exactly
 
 ;; Fragile: users can define tactics with uppercases... Returns t if
 ;; we are inside a tactic and not inside a record notation. Ideally we
@@ -204,6 +206,7 @@ attention to case differences."
 	   (coq-smie-search-token-backward '("#dummy#") strt)
 	   (> (point) strt)))))
 
+
 (defun coq-smie-.-deambiguate ()
   "Return the token of the command terminator of the current command.
 For example in:
@@ -223,7 +226,6 @@ the token of \".\" is simply \".\"."
       (cond
        ((looking-at "BeginSubproof\\>") ". proofstart")
        ((looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens)) ". proofend")
-       ((looking-at "End") ". proofend")
        ((looking-at "Proof\\>")
 	(forward-char 5)
         (forward-comment (point-max))
@@ -247,6 +249,36 @@ the token of \".\" is simply \".\"."
 	". modulestart")
        (t ".")))))
 
+;; cmd-end is the position just before the command end token
+(defun coq-smie-generate-.-token (cmd-end &optional forward)
+  (save-excursion (goto-char cmd-end)
+                  (coq-smie-.-deambiguate)))
+
+;; Precondition: cmd-start points exactly after the space following a
+;; "." finishing a command
+(defun coq-smie-generate-bloc-token (cmd-start &optional forward)
+  (goto-char cmd-start)
+  (let* ((final-pos (if forward cmd-start (- cmd-start 1)))
+         (prev-. (save-excursion ;; enter previous command and determine its kind
+                   (smie-default-backward-token)
+                   (coq-smie-.-deambiguate)))
+         (prev-is-open (member prev-. '(". proofstart" ". modulestart")))
+         (next-is-close
+          (save-excursion
+            (coq-find-real-start) ;; we move point to the real start
+            (looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens))))
+         )
+    (let ((res 
+           (cond
+            ;; special case: start module and endproof just after.
+            ((and prev-is-open next-is-close) " next command")
+            ;(next-is-bullet " next command")
+            (prev-is-open " open bloc")
+            (next-is-close " close bloc")
+            (t " next command")
+            (t (error "PLEASE REPORT coq-smie-generate-bloc-token")))))
+      (goto-char final-pos)
+      res)))
 
 (defun coq-smie-complete-qualid-backward ()
   "Return the qualid finishing at the current point."
@@ -455,10 +487,10 @@ The point should be at the beginning of the command name."
 ;	       (proof-looking-at "\\(\\(?:Declare\\s-+\\)?Module\\|Section\\)\\>"))
 ;      (coq-lonely-:=-in-this-command))))
 
-
+;; proof or module end keywords
 (defconst coq-smie-proof-end-tokens
   ;; '("Qed" "Save" "Defined" "Admitted" "Abort")
-  (cons "EndSubproof" (remove "End" coq-keywords-save-strict)))
+  (cons "EndSubproof" coq-keywords-save-strict))
 
 
 (defun coq-is-at-command-real-start()
@@ -491,7 +523,7 @@ The point should be at the beginning of the command name."
      ((and is-precmd
            (equal (char-before orig) ?\.)
            (not (string-match coq-bullet-regexp-nospace tok)))
-      (goto-char (+ orig 1))" next command")
+      (coq-smie-generate-bloc-token (+ 1 orig) t ))
      ((and is-precmd
            (not (string-equal tok ""))
            (not (string-match coq-bullet-regexp-nospace tok)))
@@ -639,18 +671,83 @@ The point should be at the beginning of the command name."
         (cdr res)))
      (tok))))
 
+
 (defun coq-smie-backward-token-aux ()
   (let* ((orig (point))
+         (cmd-strt (save-excursion (coq-find-current-start)))
+         (cmd-realstrt (save-excursion (coq-find-real-start)))
          (tok (smie-default-backward-token)))
     (cond
-     ((and (not (string-equal tok "")) ; if at point-min or after a closing parenth
+
+
+     ;; the principle is the following. We detect each command as a
+     ;; pair of parenthesis (" command start",".") or
+     ;; similar. Each command is tokenized as follows:
+     ;;; Foo bar    ...    ...   bar.
+     ;;; ^^^                        ^
+     ;;; " command start"          "." or ". proofstart..."
+     ;; But we also need to consider each command as chained with the
+     ;; following and/or enclosed in bloc delimiters. So we add 3
+     ;; extra tokens *outiside of any syntax* (on some space). In the
+     ;; following "#" "[" and "]" represent tokens " next command", "
+     ;; open bloc" and "close bloc" that must be detected at
+     ;; particular places (always on a space character). Notice the
+     ;; token is generated at unintuitive places:
+     ;;; Proof.[
+     ;;;   intros.#
+     ;;;   induction x.
+     ;;;   - intros.#
+     ;;;     auto.#
+     ;;;     auto with arith.
+     ;;;   - auto.]
+     ;;; Qed.#
+     ;;; Some particular cases must be dealt with in presence of { }
+     ;;; Proof.[
+     ;;;   intros.#
+     ;;;   induction x.
+     ;;;   { intros.#
+     ;;;     auto. }
+     ;;;  { auto.
+     ;;;  }]   <--- here we have a " close bloc" even if no "."
+     ;;; Qed.#
+
+     ;;;;;;; Detecting special " next command"/" open bloc"/" close bloc" tokens
+     ;; we found a "." or "..." but we started the (backward) search
+     ;; from at least one space after the last ".".
+
+     ((and (<= orig cmd-realstrt)
+           (>= orig cmd-strt)
+           ;; next token is not a bullet
+           (not (save-excursion (goto-char cmd-realstrt)
+                                (looking-at coq-bullet-regexp-nospace)))
+           ;; if token end with '.'
+           (not (zerop (length tok))) (equal (elt tok (- (length tok) 1)) ?.))
+      (coq-smie-generate-bloc-token cmd-strt))
+
+     ((equal orig (- cmd-strt 1)) (coq-smie-generate-.-token (point)))
+
+     ((and (not (zerop (length tok))) ; if at point-min or after a closing parenth
            (coq-smie-is-cmdstart)) " command start")
+
+     ;; Secial case, we are after a "}"
+     ((and (zerop (length tok)) (equal (char-before) ?\})
+           (<= orig cmd-realstrt) (> orig cmd-strt) ;; > strict here
+           (equal (save-excursion (forward-char -1)(coq-smie-backward-token)) "} subproof")
+           (save-excursion
+             (coq-find-real-start) ;; we move point to the real start
+             (looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens))))
+      (goto-char cmd-strt)
+      " close bloc")
+
+     ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
      ;; Distinguish between "," from quantification and other uses of
      ;; "," (tuples, tactic arguments)
      ((equal tok ",")
       (save-excursion
-	(let ((backtok (coq-smie-search-token-backward
-			'("forall" "∀" "∃" "exists" "|" "match" "lazymatch" "multimatch" "."))))
+	(let ((backtok
+               (coq-smie-search-token-backward
+		'("forall" "∀" "∃" "exists" "|" "match" "lazymatch" "multimatch" "."))))
 	  (cond
 	   ((member backtok '("forall" "∀" "∃")) ", quantif")
 	   ((equal backtok "exists") ; there is a tactic called exists
@@ -728,7 +825,9 @@ The point should be at the beginning of the command name."
                       (looking-back "\\([0-9]+\\s-*:\\s-*\\)" nil t))
                  (goto-char (match-beginning 0)))
              (let ((nxttok (coq-smie-backward-token))) ;; recursive call
-               (coq-is-cmdend-token nxttok))))
+               (or (coq-is-cmdend-token nxttok)
+                   (equal nxttok " next command")
+                   (equal nxttok " open bloc")))))
       (forward-char -1)
       (if (looking-at "}") "} subproof"
         (if (and (looking-at "{")
@@ -860,30 +959,11 @@ The point should be at the beginning of the command name."
       (forward-char -1)
       (concat "@" tok))
 
-     ;;((member tok coq-smie-proof-end-tokens) "Proof End")
+     ((and (member tok '("." "...")) (eq (char-after (+ (point) (length tok))) ?\()) ". selector")
 
-     ((member tok '("." "..."))
-      ;; Distinguish field-selector "." from terminator "." from
-      ;; module qualifier. + detect the space token following the "."
-      ;; if we were not exactly after the "."
-      (let ((nxtnxt (char-after (+ (point) (length tok)))))
-	(if (eq nxtnxt ?\() ". selector"
-	  (if (or (null nxtnxt) (eq (char-syntax nxtnxt) ?\ ))
-              (if (and (< (+ (point) (length tok)) orig)
-                       (not (save-excursion
-                              (goto-char (+ (point) (length tok)))
-                              (string-match (smie-default-forward-token)
-                                            coq-bullet-regexp-nospace))))
-                  (progn (goto-char (+ (point) (length tok)))
-                         " next command")
-	        ;; command terminator: ". proofstart" et al
-	        (save-excursion (forward-char (- (length tok) 1))
-			        (coq-smie-.-deambiguate)))
-	    (if (eq (char-syntax nxtnxt) ?w)
-		(let ((newtok (coq-smie-complete-qualid-backward)))
-		  ;; qualified name
-		  (concat newtok tok))
-	      ". selector")))))  ;; probably a user defined syntax
+     ;; qualified name 
+     ((and (member tok '("." "...")) (eq (char-syntax (char-after (+ (point) (length tok)))) ?w))
+      (concat (coq-smie-complete-qualid-backward) tok))
 
      ((and (and (eq (char-before) ?.) (member (char-syntax (char-after))
 					      '(?w ?_))))
@@ -1034,6 +1114,7 @@ Typical values are 2 or 4."
       ;; goal starter and returns the ". proofstart" and ". moduelstart"
       ;; tokens.
       (bloc ("{ subproof" commands "} subproof")
+            (" open bloc" commands " close bloc")
 	    (moduledecl) (moduledef)
 	    (exp))
 
@@ -1068,11 +1149,11 @@ Typical values are 2 or 4."
     ;; each line orders tokens by increasing priority
     ;; | C x => fun a => b | C2 x => ...
     ;;'((assoc "=>") (assoc "|")  (assoc "|-" "=> fun")) ; (assoc ", quantif")
-    '((assoc " next command")
-      (assoc "- bullet") (assoc "+ bullet") (assoc "* bullet")
+    '((assoc "- bullet") (assoc "+ bullet") (assoc "* bullet")
       (assoc "-- bullet") (assoc "++ bullet") (assoc "** bullet")
       (assoc "--- bullet") (assoc "+++ bullet") (assoc "*** bullet")
       (assoc "---- bullet") (assoc "++++ bullet") (assoc "**** bullet")
+      (assoc " next command")
       (assoc ".")
       (assoc "with inductive" "with fixpoint" "where"))
     '(
@@ -1200,15 +1281,27 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
 ;	    (equal (coq-smie-forward-token) "{ subproof"))
 	  ))
      (`:after
-      ;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 1 "AFTER")
+      ;;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 1 "AFTER")
       (cond
+       ((coq-is-bullet-token token) (smie-rule-parent 2))
+
+       ((equal token " open bloc") (smie-rule-parent 2))
+
+       ;; compensate the -2 in the "before" rule?
+       ;; remember that clos bloc is after the las "." of a bloc, not
+       ;; on the closing command itself.
+       ((equal token " close bloc") (smie-rule-parent 0))
+
+
        ;; Override the default indent step added because of their presence
        ;; in smie-closer-alist.
-       ((or (coq-is-bullet-token token)
+       ((or ;(coq-is-bullet-token token)
 	    (member token '(":" ":=" ":= with" ":= def"
 			    "by" "in tactic" "<:" "<+" ":= record"
 			    "with module" "as" ":= inductive" ":= module" )))
 	2)
+
+
 
        ((equal token "with match") coq-match-indent)
 
@@ -1268,29 +1361,25 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
        ;; computed by smie is therefore wrong and default indetation
        ;; is broken. We fix this by indenting from the real-start of
        ;; the command terminated by ". proofstart".
-       ((equal token ". proofstart")
-	(save-excursion (forward-char -1) (coq-find-real-start)
-			`(column . ,(+ coq-indent-proofstart (current-column)))))
 
-       ((equal token ". modulestart")
-	(save-excursion (forward-char -1) (coq-find-real-start)
-			`(column . ,(+ coq-indent-modulestart (current-column)))))
+       ;((equal token ". proofstart")
+	;(save-excursion (forward-char -1) (coq-find-real-start)
+			;`(column . ,(+ coq-indent-proofstart (current-column)))))
 
-       ((equal token ".")
-	(save-excursion (forward-char -1) (coq-find-real-start)
-			`(column . ,(current-column))))
        ))
 
      (`:before
-      ;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 2 "BEFORE")
+      ;;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 2 "BEFORE")
       (cond
-       ((looking-at (proof-regexp-alt-list coq-keywords-save-strict))
-        (message "ICI")
-        (save-excursion (coq-find-current-start) (forward-char -2) (coq-find-real-start)
-			`(column . ,(- (current-column) coq-indent-proofstart))))
-       ((equal token ". end module")
-	(save-excursion (forward-char -1) (coq-find-real-start)
-			`(column . ,(- (current-column) coq-indent-modulestart))))
+
+       ((equal token " open bloc") (smie-rule-parent 0))
+       ;; remember that close bloc is after the last "." of a bloc, not
+       ;; on the closing command itself.
+       ((equal token " close bloc") (smie-rule-parent -2))
+
+       ;; ((equal token ". end module")
+       ;;  (save-excursion (forward-char -1) (coq-find-real-start)
+       ;;  		`(column . ,(- (current-column) coq-indent-modulestart))))
 
 ;       ((and (member token '("{ subproof"))
 ;	     (not coq-indent-box-style)
@@ -1376,9 +1465,9 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
        ;;    "Proof" ". proofstart"
        ;;    "Qed" <- parent is ". proofstart" above
        ;; Align with the real command start of the ". xxxstart"
-       ((member token '(". proofstart" ". modulestart"))
-	(save-excursion (coq-find-real-start)
-			`(column . ,(current-column))))
+       ;((member token '(". proofstart" ". modulestart"))
+        ;(save-excursion (coq-find-real-start)
+        		;`(column . ,(current-column))))
 
        ((member token '("with inductive"))
         (smie-rule-parent))

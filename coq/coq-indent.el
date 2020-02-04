@@ -510,9 +510,10 @@ The point is put exactly after the end of previous command, or at
 the (point-min) if there is no previous command."
   (coq-script-parse-cmdend-backward)
   (let ((case-fold-search nil))
-    (when
-        (looking-at "\\.\\s-\\|{\\|}\\|\\++\\|\\*+\\|-+")
-      (forward-char (- (match-end 0) (match-beginning 0))))) ; else = no match found
+    (cond
+     ((looking-at "\\.\\s-\\|{\\|}\\|\\++\\|\\*+\\|-+")
+      (forward-char (- (match-end 0) (match-beginning 0))))))
+ ; else = no match found
   (point))
 
 
