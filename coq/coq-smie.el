@@ -515,6 +515,10 @@ The point should be at the beginning of the command name."
         (cdr res)))
      (tok))))
 
+;; TODO speed up this and bacward too. 
+;; with precomputes regexp
+;; by evaluating things only when needed.
+;; removing useless cases?
 (defun coq-smie-forward-token-aux ()
   (let ((orig (point))
         (is-precmd (coq-smie-is-precommand))
@@ -526,8 +530,17 @@ The point should be at the beginning of the command name."
       (coq-smie-generate-bloc-token (+ 1 orig) t ))
      ((and is-precmd
            (not (string-equal tok ""))
-           (not (string-match coq-bullet-regexp-nospace tok)))
+           (not (string-match coq-bullet-regexp-nospace tok))
+           (not (string-match (proof-regexp-alt-list coq-smie-proof-end-tokens) tok)))
       " command start")
+     ((and is-precmd
+           ;; TODO: have a variable for this regexp:
+           (string-match (proof-regexp-alt-list coq-smie-proof-end-tokens) tok)
+           (equal (char-before orig) ?\})
+           )
+      (goto-char (+ 1 orig))
+      " close bloc")
+
      ;; @ may be  ahead of an id, it is part of the id.
      ((and (equal tok "@") (looking-at "[[:alpha:]_]"))
       (let ((newtok (coq-smie-forward-token))) ;; recursive call
@@ -1281,7 +1294,7 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
 ;	    (equal (coq-smie-forward-token) "{ subproof"))
 	  ))
      (`:after
-      ;;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 1 "AFTER")
+      (coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 1 "AFTER")
       (cond
        ((coq-is-bullet-token token) (smie-rule-parent 2))
 
@@ -1369,7 +1382,7 @@ KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
        ))
 
      (`:before
-      ;;(coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 2 "BEFORE")
+      (coq-show-smie--parent smie--parent smie--token (smie-indent--parent) 2 "BEFORE")
       (cond
 
        ((equal token " open bloc") (smie-rule-parent 0))
