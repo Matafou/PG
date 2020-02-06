@@ -43,6 +43,7 @@
 (require 'coq-indent)
 (require 'coq-syntax)                   ;For coq-keywords-save-strict!
 (require 'smie)
+(require 'proof-utils)
 
 ; debugging
 ;(defmacro measure-time (&rest body)
@@ -192,6 +193,14 @@ attention to case differences."
       (coq-find-real-start)
       (looking-at "\\(\\(Local\\|Global\\)\\s-+\\)?\\(Ltac\\|Tactic\\s-+Notation\\)\\s-"))))
 
+;; proof or module end keywords
+(defconst coq-smie-proof-end-tokens
+  ;; '("Qed" "Save" "Defined" "Admitted" "Abort")
+  (cons "EndSubproof" coq-keywords-save-strict))
+
+(defconst coq-smie-proof-end-tokens-re
+  (proof-regexp-alt-list coq-smie-proof-end-tokens))
+
 (defun coq-smie-is-inside-parenthesized-tactic ()
   (and (coq-smie-is-tactic) ;; fragile (uppercase test only)
        (save-excursion
@@ -225,7 +234,7 @@ the token of \".\" is simply \".\"."
       (coq-find-real-start) ; Move to real start of command.
       (cond
        ((looking-at "BeginSubproof\\>") ". proofstart")
-       ((looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens)) ". proofend")
+       ((looking-at coq-smie-proof-end-tokens-re) ". proofend")
        ((looking-at "Proof\\>")
 	(forward-char 5)
         (forward-comment (point-max))
@@ -266,7 +275,7 @@ the token of \".\" is simply \".\"."
          (next-is-close
           (save-excursion
             (coq-find-real-start) ;; we move point to the real start
-            (looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens))))
+            (looking-at coq-smie-proof-end-tokens-re)))
          )
     (let ((res 
            (cond
@@ -275,8 +284,7 @@ the token of \".\" is simply \".\"."
             ;(next-is-bullet " next command")
             (prev-is-open " open bloc")
             (next-is-close " close bloc")
-            (t " next command")
-            (t (error "PLEASE REPORT coq-smie-generate-bloc-token")))))
+            (t " next command"))))
       (goto-char final-pos)
       res)))
 
@@ -487,10 +495,6 @@ The point should be at the beginning of the command name."
 ;	       (proof-looking-at "\\(\\(?:Declare\\s-+\\)?Module\\|Section\\)\\>"))
 ;      (coq-lonely-:=-in-this-command))))
 
-;; proof or module end keywords
-(defconst coq-smie-proof-end-tokens
-  ;; '("Qed" "Save" "Defined" "Admitted" "Abort")
-  (cons "EndSubproof" coq-keywords-save-strict))
 
 
 (defun coq-is-at-command-real-start()
@@ -522,24 +526,32 @@ The point should be at the beginning of the command name."
 (defun coq-smie-forward-token-aux ()
   (let ((orig (point))
         (is-precmd (coq-smie-is-precommand))
-        (tok (smie-default-forward-token)))
+        (tok (smie-default-forward-token))
+        (orig2 (point)))
     (cond
+     ;; This is a condition-only case, its value should be bloc or nil
+     ;; We started from exactly the point after an "." command ending.
      ((and is-precmd
            (equal (char-before orig) ?\.)
-           (not (string-match coq-bullet-regexp-nospace tok)))
-      (coq-smie-generate-bloc-token (+ 1 orig) t ))
+           (let ((nxtisbullet (string-match coq-bullet-regexp-nospace tok))
+                 (bloc (coq-smie-generate-bloc-token (+ 1 orig) t )))
+             (if (or (not nxtisbullet) (equal bloc " open bloc")) bloc
+               (goto-char orig2)
+               nil))))
+     ;; this must be before " command start" detection
+     ;; we were just after a "}" and there is an End proof token after.
      ((and is-precmd
-           (not (string-equal tok ""))
-           (not (string-match coq-bullet-regexp-nospace tok))
-           (not (string-match (proof-regexp-alt-list coq-smie-proof-end-tokens) tok)))
-      " command start")
-     ((and is-precmd
-           ;; TODO: have a variable for this regexp:
-           (string-match (proof-regexp-alt-list coq-smie-proof-end-tokens) tok)
-           (equal (char-before orig) ?\})
-           )
+           (string-match coq-smie-proof-end-tokens-re tok)
+           ;; TODO: should we make this more precise ("} subproof"?)
+           (equal (char-before orig) ?\}))
       (goto-char (+ 1 orig))
       " close bloc")
+
+     ;; Last case where we started from the start of a command:
+     ((and is-precmd
+           (not (string-equal tok ""))
+           (not (string-match coq-bullet-regexp-nospace tok)))
+      " command start")
 
      ;; @ may be  ahead of an id, it is part of the id.
      ((and (equal tok "@") (looking-at "[[:alpha:]_]"))
@@ -689,7 +701,8 @@ The point should be at the beginning of the command name."
   (let* ((orig (point))
          (cmd-strt (save-excursion (coq-find-current-start)))
          (cmd-realstrt (save-excursion (coq-find-real-start)))
-         (tok (smie-default-backward-token)))
+         (tok (smie-default-backward-token))
+         (orig2 (point)))
     (cond
 
 
@@ -701,18 +714,18 @@ The point should be at the beginning of the command name."
      ;;; " command start"          "." or ". proofstart..."
      ;; But we also need to consider each command as chained with the
      ;; following and/or enclosed in bloc delimiters. So we add 3
-     ;; extra tokens *outiside of any syntax* (on some space). In the
+     ;; extra tokens *outside of any syntax* (on some space). In the
      ;; following "#" "[" and "]" represent tokens " next command", "
      ;; open bloc" and "close bloc" that must be detected at
      ;; particular places (always on a space character). Notice the
      ;; token is generated at unintuitive places:
      ;;; Proof.[
      ;;;   intros.#
-     ;;;   induction x.
+     ;;;   induction x.    <- no next command here
      ;;;   - intros.#
      ;;;     auto.#
      ;;;     auto with arith.
-     ;;;   - auto.]
+     ;;;   - auto.]         <- the close bloc is BEFORE the End token.
      ;;; Qed.#
      ;;; Some particular cases must be dealt with in presence of { }
      ;;; Proof.[
@@ -723,19 +736,36 @@ The point should be at the beginning of the command name."
      ;;;  { auto.
      ;;;  }]   <--- here we have a " close bloc" even if no "."
      ;;; Qed.#
+     ;;; Other special case
+     ;;; Proof.[
+     ;;;   - intros.#
+     ;;;     induction x.
+     ;;;   - intros.#
+     ;;;     auto.]
+     ;;; Qed.#
 
-     ;;;;;;; Detecting special " next command"/" open bloc"/" close bloc" tokens
      ;; we found a "." or "..." but we started the (backward) search
-     ;; from at least one space after the last ".".
-
+     ;; from at least one space after the last ".". Then we detect a
+     ;; token at the sapce just after "." unless it would be " next
+     ;; command" and there is a bullet after it. This first cond is a
+     ;; condition with no return value (the condition is the return
+     ;; vlalue) to avoid computing things twice
      ((and (<= orig cmd-realstrt)
            (>= orig cmd-strt)
-           ;; next token is not a bullet
-           (not (save-excursion (goto-char cmd-realstrt)
-                                (looking-at coq-bullet-regexp-nospace)))
+           (or (message "zerop : %S" (zerop (length tok))) t)
            ;; if token end with '.'
-           (not (zerop (length tok))) (equal (elt tok (- (length tok) 1)) ?.))
-      (coq-smie-generate-bloc-token cmd-strt))
+           (not (zerop (length tok)))
+           (or (message "ICI tok = %S , elt = %S" tok (elt tok (- (length tok) 1))) t)
+           (equal (elt tok (- (length tok) 1)) ?\.)           
+           ;; next token is not a bullet
+           (let ((nxtisbullet (save-excursion (goto-char cmd-realstrt)
+                                              (looking-at coq-bullet-regexp-nospace)))
+                 (bloc (coq-smie-generate-bloc-token cmd-strt)))
+             ;; this must return the token itself (bloc) or nil
+             (if (or (not nxtisbullet) (equal bloc " open bloc"))
+                 bloc 
+               (goto-char orig2)
+               nil))))
 
      ((equal orig (- cmd-strt 1)) (coq-smie-generate-.-token (point)))
 
@@ -745,10 +775,12 @@ The point should be at the beginning of the command name."
      ;; Secial case, we are after a "}"
      ((and (zerop (length tok)) (equal (char-before) ?\})
            (<= orig cmd-realstrt) (> orig cmd-strt) ;; > strict here
-           (equal (save-excursion (forward-char -1)(coq-smie-backward-token)) "} subproof")
+           ;; recursive call
+           (equal (save-excursion (goto-char orig2)
+                                  (coq-smie-backward-token)) "} subproof")
            (save-excursion
              (coq-find-real-start) ;; we move point to the real start
-             (looking-at (proof-regexp-alt-list coq-smie-proof-end-tokens))))
+             (looking-at coq-smie-proof-end-tokens-re)))
       (goto-char cmd-strt)
       " close bloc")
 
