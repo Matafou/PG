@@ -144,7 +144,13 @@ Namely, goals that do not fit in the goals window."
 (defconst coq-interrupt-regexp "User Interrupt."
   "Regexp corresponding to an interrupt.")
 
-(defcustom coq-end-goals-regexp-show-subgoals "\n(dependent evars:"
+(defcustom coq-shell-start-goals-regexp "\\(<notice>\\s-*\\)?[0-9]+\\(?: focused\\)? subgoals?"
+  "Regexp for `proof-shell-start-goals-regexp'.
+A setting of nil means show all output from Coq. "
+  :type '(choice regexp (const nil))
+  :group 'coq)
+
+(defcustom coq-end-goals-regexp-show-subgoals "</notice>\\|\n(dependent evars:"
   "Regexp for `proof-shell-end-goals-regexp' when showing all subgoals.
 A setting of nil means show all output from Coq.  See also option
 `coq-hide-additional-subgoals'."
@@ -437,7 +443,7 @@ This is a subroutine of `proof-shell-filter'."
   (let*
       ((face
         (progn (goto-char start)
-               (if (looking-at "<infomsg>") 'default
+               (if (looking-at "<infomsg>\\|<notice>") 'default
                  'proof-eager-annotation-face)))
        (str (proof-shell-strip-eager-annotations start end))
        (strnotrailingspace
@@ -1813,21 +1819,44 @@ at `proof-assistant-settings-cmds' evaluation time.")
 ;; *default* value to nil.
 (custom-set-default 'proof-output-tooltips nil)
 
-;;;;;;;;;;;;;;;;;;;;;;;attempt to deal with debug mode ;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;; adhoc code to deal with debug mode ;;;;;;;;;;;;;;;;
 
-;; tries to extract the last debug goal and display it in goals buffer
+;; At each "step" the debug mode displays something like this:
+;; <notice>Goal:
+          
+;;           ============================
+;;            (forall a : nat, a + 0 = a /\ 0 + a = a)
+        
+;;         </notice>
+;; <infomsg>Debug: Going to execute:
+;;          intro
+;;          </infomsg>
+;; <notice>
+;;         TcDebug (0) > </notice>
+;; (<notice> appeared in coq 8.12, before that there was no just nothing.
+
+;; We want goals to be dispatch to the goal buffer, and the other information
+;; to the response buffer.
 (defun coq-display-debug-goal ()
   (interactive)
   (with-current-buffer proof-shell-buffer
+    ;; find a limit pt to the next search (the shell buffer is big...)
     (let ((pt (progn (save-excursion (forward-line -1) (point)))))
       (save-excursion
+        ;; Find the "debug prompt" near the end
         (re-search-backward "^TcDebug" pt t)
+        ;; from there find the debug message
         (re-search-backward "<infomsg>\\|^TcDebug\\|^</prompt>" nil t)
+        ;; If we found it then look for a goal displayed just before
         (when (looking-at "<infomsg>")
           (let ((pt2 (point)))
             (re-search-backward "Goal:\\|^TcDebug\\|^</prompt>" nil t)
             (when (looking-at "Goal")
-              (pg-goals-display (buffer-substring (point) pt2) nil))))))))
+              (let ((pt3 (save-excursion
+                           (if (re-search-forward "</notice>" pt2 t)
+                               (match-beginning 0)
+                             pt2))))
+                  (pg-goals-display (buffer-substring (point) pt3) nil)))))))))
 
 ;; overwrite the generic one, interactive prompt is Debug mode;; try to display
 ;; the debug goal in the goals buffer.
@@ -1968,11 +1997,10 @@ at `proof-assistant-settings-cmds' evaluation time.")
    proof-shell-result-end "\372 End Pbp result \373"
 
 ;   proof-shell-start-goals-regexp          "^\\(?:(dependent evars:[^)]*)\\s-+\\)?[0-9]+\\(?: focused\\)? subgoals?"
-   proof-shell-start-goals-regexp          "[0-9]+\\(?: focused\\)? subgoals?"
-   proof-shell-end-goals-regexp
-   (if coq-hide-additional-subgoals
-       (setq proof-shell-end-goals-regexp coq-end-goals-regexp-hide-subgoals)
-     (setq proof-shell-end-goals-regexp coq-end-goals-regexp-show-subgoals))
+   proof-shell-start-goals-regexp coq-shell-start-goals-regexp
+   proof-shell-end-goals-regexp (if coq-hide-additional-subgoals
+                                    coq-end-goals-regexp-hide-subgoals
+                                  coq-end-goals-regexp-show-subgoals)
 
    proof-shell-init-cmd coq-shell-init-cmd
 
