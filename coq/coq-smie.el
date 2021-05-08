@@ -557,6 +557,11 @@ The point should be at the beginning of the command name."
   ;; This is very approximate and should be used with care
   (let ((case-fold-search nil)) (looking-at coq-command-defn-regexp)))
 
+(defun coq-is-at-def-or-decl ()
+  ;; This is very approximate and should be used with care
+  (let ((case-fold-search nil))
+    (or (looking-at coq-command-defn-regexp) (looking-at coq-command-decl-regexp))))
+
 
 ;; ":= with module" is really to declare some sub-information ":=
 ;; with" is for mutual definitions where both sides are of the same
@@ -590,7 +595,8 @@ The point should be at the beginning of the command name."
      ((or (eq ?\{ (char-before))) ":= record")
      ((equal (point) cmdstrt)
       (if (or (looking-at "Equations") ;; note: "[[]" is the regexp for a single "["  
-              (not (coq-is-at-def))
+              ;; even a Lemma with a := is a definition let us remove this
+              ;;(not (coq-is-at-def-or-decl)) ;; we were at := so decl is actually a defn
               )
           ":="
         ":= def")) ; := outside of any parenthesis
@@ -1141,22 +1147,27 @@ Typical values are 2 or 4."
   "Return non-nil if PARENT-POS is on same line as CHILD-POS."
   (= (line-number-at-pos parent-pos) (line-number-at-pos child-pos)))
 
-(defcustom coq-indent-basic nil
+(defcustom coq-indent-basic 2
   "Basic indentation step.
 If nil, default to `proof-indent' if it exists or to `smie-indent-basic'."
   :group 'coq-mode
   :type '(choice (const :tag "Fallback on global settings" nil)
           integer))
 
+;; otherwise there are some glitches
+(setq smie-indent-basic coq-indent-basic)
+
+(defun if-def (symb) (or (and (boundp symb) (symbol-value symb)) "undefined"))
 
 ;; Debugging smie parent token, needs the highlight library
 ;;and something like this in .emacs:
 ;; (require 'highlight)
 ;; (custom-set-faces '(highlight ((((type x) (class color) (background light)) (:background "Wheat")))))
-(defun coq-show-smie--parent (parent token parent-token &optional num msg)
+(defun coq-show-smie--parent (point parent token &optional num msg is-sibling)
   (ignore-errors
-   (message "%s token: %S ; parent: %S ; parent-token: %S" msg token parent parent-token)
-   (hlt-unhighlight-region)
+   (message "%s token: %S ; parent: %S; is-sibling:%S" msg token parent is-sibling)
+   ;(hlt-unhighlight-region)
+   ;; we highlight the token, we approximate its real length in the buffer by stopping at its first space
    (let* ((beg (if (listp (car parent)) (caar parent) (car parent)))
           (end (cadr parent))
           (regi (list (list beg end)))
@@ -1165,11 +1176,123 @@ If nil, default to `proof-indent' if it exists or to `smie-indent-basic'."
                  ((equal num 1) 'hlt-regexp-level-1)
                  ((equal num 2) 'hlt-regexp-level-2)
                  (t 'hlt-regexp-level-1))))
-     (and parent (hlt-highlight-regions regi face)))))
+     ;; uncomment to see visually the region
+     ;;(and parent (hlt-highlight-regions regi face))
+     ;; and the point considered
+     (hlt-highlight-regions (list (list point (+ point (or (string-match " " token) (length token))))) 'holiday)
+     )))
+
+(defun add-indent (ref n)
+  (pcase ref
+    (`(column . ,m) `(column . ,(+ m n)))
+    (_ (+ ref n))))
+
+(defun coq-indent-categorize-token-after (tk)
+  "Factorize tokens behaving the same \"smie-rules\"-wise (kind:after)."
+  (cond
+   ((coq-is-bullet-token tk) "after bullet")
+   ((member tk '("with" ":" "by" "in tactic" "as")) "tactic infix")
+   ((member tk '("<:" "<+" "with module")) "modulespec infix") ;;  ":= inductive" ":= module" and other ":= xxx"
+   ((string-prefix-p ":= " tk) "after :=")
+   ;; by default we pass the token name, but maybe it would be safer
+   ;; to simply fail, so that we detect missing tokens in this function?
+   (t tk)))
+
+(defun coq-indent-categorize-token-before (tk)
+  "Factorize tokens behaving the same \"smie-rules\"-wise (kind:after)."
+  (cond
+   ((member tk '(". proofstart" ". modulestart")) "dot script parent open")
+   ((member tk '("with" ":" "by" "in tactic" "as")) "tactic infix")
+   ((string-prefix-p ":= " tk) "before :=")
+
+   ;; by default we pass the token name, but maybe it would be safer
+   ;; to simply fail, so that we detect missing tokens in this function?
+   (t tk)))
 
 
-
+;; smie indentation rules. The default rules are quite good to indent inside commands when there is
+;; no command above. This comes from the fact that the grammar considers the coq end of command
+;; (token ".") as a separator. So for instance in:
+;; Module foo.         
+;;   Definition x
+;;       := y.
+;; the smie tree is:
+;;   Module foo
+;;  /
+;; .(1)
+;; |\   Definition x
+;; | :=
+;; |    y
+;; .(2)
+;; So the top-node of a command (e.g. here ":=") should never be indented wrt to its parent.
 (defun coq-smie-rules (kind token)
+  "Indentation rules for Coq.  See `smie-rules-function'.
+KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
+  (message "******** RULES at %S ****** %S / %S (%S)" (point) kind token
+           (pcase kind (':after(coq-indent-categorize-token-after token))
+                  (':before (coq-indent-categorize-token-before token))
+                  (_ "")))
+  (pcase kind ; for debug
+    (':after (coq-show-smie--parent (point) (if-def 'smie--parent) token 1 "AFTER" (smie-rule-sibling-p)))
+    (':before (coq-show-smie--parent (point) (if-def 'smie--parent) token 2 "BEFORE" (smie-rule-sibling-p)))
+    (':close-all (coq-show-smie--parent (point) (if-def 'smie--parent) token 2 "CLOSEALL"))
+    (':list-intro (coq-show-smie--parent (point) (if-def 'smie--parent) token 2 "LISTINTRO"))
+    (':elem (coq-show-smie--parent (point) (if-def 'smie--parent) token 2 "ELEM")))
+
+  (let ((res
+         (pcase (cons kind token)
+           (`(:elem basic) (or coq-indent-basic
+                               (bound-and-true-p proof-indent)
+                               2)) ;;smie-indent-basic
+           (`(:close-all . ,_) t)
+           (`(:list-intro . ,_) (or (member token '("fun" "forall" "quantif exists" "with"))))
+           ;; Does not work because in inductive there are no parenthesis around the list of cases
+           ;;(`(,_ . "|")   (message "SEPARATOR") (smie-rule-separator kind))
+       ;;; ###### AFTER
+           ;; offset by number are relative to current token
+           (`(:after . ,_)
+            (pcase (coq-indent-categorize-token-after token)
+              ("} subproof" (smie-rule-parent))
+              ("{" (if coq-indent-box-style `(column . ,(+ (current-column) coq-indent-basic)) nil))
+              ("after bullet" 2)
+              ("modulespec infix" 2)
+              ("match indent" coq-match-indent)
+              ("after :=" (if (and coq-indent-box-style (not (smie-rule-hanging-p)))
+                              `(column . ,(+ (current-column) coq-indent-basic))
+                            nil))
+              ;; FIXME marche pas après un modulestart.
+              ((and "tactic infix" (guard )) 0)
+              ))
+       ;;; ###### BEFORE
+           ;; offset by number are relative to parent token (i.e. the one against which we are matching
+           ;; here, but whiich is not the one the cursor is on)
+           (`(:before . ,_)
+            (let ((parent-col
+                   (if (smie-rule-parent-p ". modulestart")
+                       (save-excursion (coq-find-real-start) `(column . ,(current-column)))
+                     0)))
+              (pcase (coq-indent-categorize-token-before token)
+                ("tactic infix" (add-indent parent-col coq-indent-basic))
+                ("dot script parent open" (add-indent parent-col coq-indent-basic))
+                ("before :=" (add-indent parent-col coq-indent-basic))
+                ("|" (cond ((smie-rule-parent-p ":= inductive") -2)
+                           ((smie-rule-parent-p "|") 0)
+                           (t 0)))
+                ((and (or "forall" "quantif exists") (guard (not coq-indent-box-style)) (guard (not (smie-rule-bolp))))
+                 (smie-rule-parent coq-smie-after-bolp-indentation))
+                ((and (or "forall" "quantif exists") (guard (smie-rule-parent-p "forall" "quantif exists")))
+                 (if (save-excursion
+	               (coq-smie-search-token-backward '("forall" "quantif exists"))
+	               (equal (current-column) (current-indentation)))
+	             (smie-rule-parent)
+	           (smie-rule-parent 2)))
+                ))))))
+    (message "**** result= %S" res)
+    (message "************************")
+    res))
+ 
+
+(defun coq-smie-rulesOLD (kind token)
   "Indentation rules for Coq.  See `smie-rules-function'.
 KIND is the situation and TOKEN is the thing w.r.t which the rule applies."
   (pcase kind
