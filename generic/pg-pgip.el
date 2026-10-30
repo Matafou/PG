@@ -1,4 +1,4 @@
-;;; pg-pgip.el --- PGIP manipulation for Proof General
+;;; pg-pgip.el --- PGIP manipulation for Proof General  -*- lexical-binding: t; -*-
 
 ;; This file is part of Proof General.
 

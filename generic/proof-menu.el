@@ -1,4 +1,4 @@
-;;; proof-menu.el --- Menus, keymaps, misc commands for Proof General
+;;; proof-menu.el --- Menus, keymaps, misc commands for Proof General  -*- lexical-binding: t; -*-
 
 ;; This file is part of Proof General.
 

@@ -1,4 +1,4 @@
-;;; proof-utils.el --- Proof General utility functions and macros
+;;; proof-utils.el --- Proof General utility functions and macros  -*- lexical-binding: t; -*-
 
 ;; This file is part of Proof General.
 
