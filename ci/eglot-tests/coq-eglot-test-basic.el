@@ -76,9 +76,10 @@ asynchronously."
   "Skip the test if the server is not usable.
 Fail instead if COQ_EGLOT_REQUIRE_SERVER is set, as in the CI, where
 a missing server should not go unnoticed."
-  (if (getenv "COQ_EGLOT_REQUIRE_SERVER")
-      (should (server-usable-p))
-    (skip-unless (server-usable-p))))
+  (unless (server-usable-p)
+    (if (getenv "COQ_EGLOT_REQUIRE_SERVER")
+        (ert-fail "No usable Coq language server")
+      (ert-skip "No usable Coq language server"))))
 
 (defmacro with-test-file (&rest body)
   "Run BODY in a buffer visiting eglot_test.v, kill it afterwards."
@@ -283,27 +284,33 @@ edited sentence and the goals are displayed when the server is ready."
   (with-file "eglot_slow.v"
     (force-new-check)
     (coq-eglot-process-buffer)
-    (sleep-for 1.2)
+    ;; in the middle of the check
+    (should (wait-until (lambda ()
+                          (>= (how-many "Qed\\." (point-min) (coq-eglot-position))
+                              2))
+                        10))
     (should coq-eglot--running)
     (goto-char (coq-eglot-position))
     (search-backward "vm_compute")
     ;; a pending request on the part not checked yet, like the hover
     ;; of eldoc
-    (let ((hover-cancelled nil)
+    (let ((hover-answered nil)
           (start (float-time)))
       (jsonrpc-async-request (coq-eglot-lsp-current-server) :textDocument/hover
                              (list :textDocument (eglot--TextDocumentIdentifier)
                                    :position (eglot--pos-to-lsp-position
                                               (1- (point-max))))
-                             :error-fn (lambda (_) (setq hover-cancelled t)))
+                             :success-fn (lambda (_) (setq hover-answered t)))
       (insert " ")
       (run-hooks 'post-command-hook)
       (should (< (- (float-time) start) 0.1))
       ;; the edition is sent right away
       (should-not eglot--recent-changes)
       (accept-process-output nil 0.5)
-      ;; pending requests are cancelled
-      (should hover-cancelled))
+      ;; the hover does not make the server check up to the end: coq-lsp
+      ;; answers that the document is not ready, or drops the request
+      ;; when it is cancelled first
+      (should-not hover-answered))
     (should-not coq-eglot--running)
     (accept-process-output nil 1)
     ;; just before the edited sentence
