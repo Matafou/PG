@@ -289,6 +289,84 @@ Like in Proof General, \\[universal-argument] means Printing All."
     ;; fontification keeps the face of errors
     (should (eq (face-of "*response*" "The reference") 'error))))
 
+(ert-deftest coq-eglot-split-goals ()
+  "The conclusion can be displayed apart from the hypotheses."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (let ((whole (buffer-text "*goals*")))
+      (should (string-match-p "n : nat\n *=+\n *double n = n \\+ n" whole))
+      (unwind-protect
+          (progn
+            (coq-eglot-toggle-split-goals)
+            (should (equal (buffer-text "*goals*") "2 goals\n\n  n : nat"))
+            ;; no separator: the windows separate
+            (should (equal (buffer-text "*conclusion*")
+                           "double n = n + n\n\ngoal 2 is:\n True"))
+            ;; both are displayed, each in its window
+            (should (get-buffer-window "*goals*" t))
+            (should (get-buffer-window "*conclusion*" t))
+            ;; the conclusion comes right below the hypotheses, after a
+            ;; line drawn with our face
+            (let ((window (get-buffer-window "*goals*" t)))
+              (should (= (window-body-height window)
+                         (window-total-height window))))
+            (with-current-buffer "*conclusion*"
+              ;; format-mode-line gives nothing in batch mode
+              (should (string-match-p "\\`─+\\'" header-line-format))
+              (should (eq (get-text-property 0 'face header-line-format)
+                          'coq-eglot-goals-separator)))
+            ;; next goals go to both buffers
+            (goto-marker "subproof")
+            (run #'coq-eglot-goto-point)
+            (should (equal (buffer-text "*goals*") ""))
+            (should (equal (buffer-text "*conclusion*") "No more goals."))
+            (coq-eglot-toggle-split-goals)
+            (should-not (get-buffer "*conclusion*"))
+            (let ((window (get-buffer-window "*goals*" t)))
+              (should (< (window-body-height window)
+                         (window-total-height window))))
+            (should (equal (buffer-text "*goals*") "No more goals."))
+            (run #'coq-eglot-undo-last-command)
+            (goto-marker "split")
+            (run #'coq-eglot-goto-point)
+            (should (equal (buffer-text "*goals*") whole)))
+        (setq coq-eglot-split-goals nil)))))
+
+(ert-deftest coq-eglot-allocate-heights ()
+  "Windows get the height they need by priority, the last one the rest."
+  ;; enough for everybody
+  (should (equal (coq-eglot--allocate-heights 30 '(5 6 4) 4) '(5 6 19)))
+  ;; the first one takes what it needs, the others their minimum
+  (should (equal (coq-eglot--allocate-heights 30 '(40 6 4) 4) '(22 4 4)))
+  (should (equal (coq-eglot--allocate-heights 30 '(10 40 4) 4) '(10 16 4)))
+  ;; too small
+  (should-not (coq-eglot--allocate-heights 10 '(5 6 4) 4)))
+
+(ert-deftest coq-eglot-resize-windows ()
+  "With split goals, the conclusion gets its height first, the response
+the remaining height."
+  (with-test-file
+    (unwind-protect
+        (progn
+          (setq coq-eglot-split-goals t)
+          (goto-marker "split")
+          (run #'coq-eglot-goto-point)
+          (let ((goals (get-buffer-window "*goals*"))
+                (conclusion (get-buffer-window "*conclusion*"))
+                (response (get-buffer-window "*response*")))
+            (should (and goals conclusion response))
+            ;; the separator line, 4 lines and a mode line
+            (should (= (window-total-height conclusion) 6))
+            ;; 3 lines and a mode line, the minimal height
+            (should (= (window-total-height goals) window-min-height))
+            (should (> (window-total-height response) window-min-height))))
+      (setq coq-eglot-split-goals nil)
+      (let ((buffer (get-buffer "*conclusion*")))
+        (when buffer
+          (mapc #'delete-window (get-buffer-window-list buffer nil t))
+          (kill-buffer buffer))))))
+
 (ert-deftest coq-eglot-id-at-point ()
   "The default argument of queries is the qualified identifier at point."
   (with-temp-buffer
