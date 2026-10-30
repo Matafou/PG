@@ -1219,16 +1219,18 @@ This function calls `proof-add-to-queue' with args QUEUEITEMS and QUEUEMODE."
 
 
 ;;;###autoload
-(defun proof-extend-queue (end queueitems)
-  "Extend the current queue with QUEUEITEMS, queue end END.
+(defun proof-extend-queue (end items)
+  "Extend the current queue with ITEMS, queue end END.
 To make sense, the commands should correspond to processing actions
 for processing a region from (buffer-queue-or-locked-end) to END.
 The queue mode is set to \\+`advancing'"
   (proof-set-queue-endpoints (proof-unprocessed-begin) end)
   ;; Functions on `proof-shell-extend-queue-hook' read and may modify
-  ;; `queueitems' through dynamic scoping.
+  ;; `queueitems' through dynamic scoping.  The argument must not be
+  ;; called `queueitems': in interpreted code, the lexical argument
+  ;; would hide the dynamic binding when reading `queueitems' below.
   (defvar queueitems)
-  (let ((queueitems queueitems))
+  (let ((queueitems items))
     (condition-case err
 	(run-hooks 'proof-shell-extend-queue-hook)
       ((error quit)

@@ -4109,16 +4109,16 @@ Input to the proof shell via the queue region is managed by the
 functions @code{proof-extend-queue} and @code{proof-shell-exec-loop}.
 
 @c TEXI DOCSTRING MAGIC: proof-extend-queue
-@defun proof-extend-queue end queueitems
-Extend the current queue with @var{queueitems}, queue end @var{end}.@*
+@defun proof-extend-queue end items
+Extend the current queue with @var{items}, queue end @var{end}.@*
 To make sense, the commands should correspond to processing actions
 for processing a region from (buffer-queue-or-locked-end) to @var{end}.
 The queue mode is set to @code{advancing}
 @end defun
 
 @c TEXI DOCSTRING MAGIC: proof-extend-queue
-@defun proof-extend-queue end queueitems
-Extend the current queue with @var{queueitems}, queue end @var{end}.@*
+@defun proof-extend-queue end items
+Extend the current queue with @var{items}, queue end @var{end}.@*
 To make sense, the commands should correspond to processing actions
 for processing a region from (buffer-queue-or-locked-end) to @var{end}.
 The queue mode is set to @code{advancing}
