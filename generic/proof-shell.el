@@ -1,4 +1,4 @@
-;;; proof-shell.el --- Proof General shell mode
+;;; proof-shell.el --- Proof General shell mode  -*- lexical-binding: t; -*-
 
 ;; This file is part of Proof General.
 
@@ -587,6 +587,7 @@ shell buffer, called by `proof-shell-bail-out' if process exits."
 	 (proc     (get-buffer-process (current-buffer)))
 	 (bufname  (buffer-name)))
     (message "%s, cleaning up and exiting..." bufname)
+    (defvar prover-was-busy)  ; see `proof-shell-signal-interrupt-hook'
     (let (prover-was-busy)
       ;; hook functions might set prover-was-busy
       (run-hooks 'proof-shell-signal-interrupt-hook))
@@ -949,6 +950,7 @@ In the first case, PG will terminate the queue of commands at the first
 available point.  In the second case, you may need to press enter inside
 the prover command buffer (e.g., with Isabelle2009 press RET inside *isabelle*)."
   (interactive)
+  (defvar prover-was-busy)  ; see `proof-shell-signal-interrupt-hook'
   (let ((prover-was-busy nil))
     (unless (proof-shell-live-buffer)
       (error "Proof process not started!"))
@@ -1006,9 +1008,16 @@ used in `proof-add-to-queue' when we start processing a queue, and in
   (with-current-buffer proof-shell-buffer
     (goto-char (point-max))
 
+    ;; Functions on `proof-shell-insert-hook' read and modify these
+    ;; variables through dynamic scoping.
+    (defvar string)
+    (defvar action)
+    (defvar scriptspan)
     ;; TEMP: next step: preprocess list of strings directly
     (let ((string (if (stringp strings) strings
-		    (apply 'concat strings))))
+		    (apply 'concat strings)))
+	  (action action)
+	  (scriptspan scriptspan))
       ;; Hook for munging `string' and other dirty hacks.
       (run-hooks 'proof-shell-insert-hook)
 
@@ -1216,12 +1225,16 @@ To make sense, the commands should correspond to processing actions
 for processing a region from (buffer-queue-or-locked-end) to END.
 The queue mode is set to \\+`advancing'"
   (proof-set-queue-endpoints (proof-unprocessed-begin) end)
-  (condition-case err
-      (run-hooks 'proof-shell-extend-queue-hook)
-    ((error quit)
-     (proof-detach-queue)
-     (signal (car err) (cdr err))))
-  (proof-add-to-queue queueitems 'advancing))
+  ;; Functions on `proof-shell-extend-queue-hook' read and may modify
+  ;; `queueitems' through dynamic scoping.
+  (defvar queueitems)
+  (let ((queueitems queueitems))
+    (condition-case err
+	(run-hooks 'proof-shell-extend-queue-hook)
+      ((error quit)
+       (proof-detach-queue)
+       (signal (car err) (cdr err))))
+    (proof-add-to-queue queueitems 'advancing)))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
