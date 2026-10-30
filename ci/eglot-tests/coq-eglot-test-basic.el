@@ -224,6 +224,49 @@ the error location with `proof-warning-face', and point moves there."
     ;; the proof position does not move
     (should (position-at-marker-p "definition"))))
 
+(defun query-interactively (command prefix argument &optional flags)
+  "Run COMMAND with PREFIX as if typed, answering ARGUMENT and FLAGS.
+Return the text of the response buffer."
+  (cl-letf (((symbol-function 'read-string) (lambda (&rest _) argument))
+            ((symbol-function 'completing-read-multiple)
+             (lambda (&rest _) flags)))
+    (let ((current-prefix-arg prefix))
+      (query #'call-interactively command))))
+
+(ert-deftest coq-eglot-query-flags ()
+  "Queries can use other printing flags, for this query only.
+Like in Proof General, \\[universal-argument] means Printing All."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (should (equal (query-interactively #'coq-eglot-Check nil "double 2")
+                   "double 2\n     : nat"))
+    (should (string-match-p "\\`double (S (S O))"
+                            (query-interactively #'coq-eglot-Check '(4)
+                                                 "double 2")))
+    ;; not kept for the next query
+    (should (string-match-p "\\`double 2"
+                            (query-interactively #'coq-eglot-Check nil
+                                                 "double 2")))
+    ;; with C-u C-u, flags are chosen by name
+    (should (string-match-p "\\`@id nat 0"
+                            (query-interactively #'coq-eglot-Check '(16)
+                                                 "id 0" '("Implicit"))))
+    (should (string-match-p "\\`@eq nat 0 0"
+                            (query-interactively #'coq-eglot-query '(16)
+                                                 "Check 0 = 0"
+                                                 '("Implicit" "No Notations"))))
+    (should (string-match-p "\\`0 = 0"
+                            (query #'coq-eglot-Check "0 = 0")))))
+
+(ert-deftest coq-eglot-search ()
+  "Search finds the lemmas proved before the proof position."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (should (string-match-p "^l: forall n : nat, double n = n \\+ n /\\\\ True"
+                            (query #'coq-eglot-Search "double")))))
+
 (ert-deftest coq-eglot-id-at-point ()
   "The default argument of queries is the qualified identifier at point."
   (with-temp-buffer

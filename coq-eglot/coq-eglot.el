@@ -683,6 +683,36 @@ meanwhile."
 (defvar coq-eglot--query-history nil
   "History of the arguments of queries.")
 
+(defcustom coq-eglot-query-flags
+  '(("All" . "Set Printing All")
+    ("Implicit" . "Set Printing Implicit")
+    ("Coercions" . "Set Printing Coercions")
+    ("Parentheses" . "Set Printing Parentheses")
+    ("No Notations" . "Unset Printing Notations")
+    ("Universes" . "Set Printing Universes"))
+  "Printing flags that a query can use, by name.
+With \\[universal-argument] \\[universal-argument], query commands ask
+which ones to use.  Each value is a Coq command run just before the
+query, for this query only."
+  :type '(alist :key-type (string :tag "Name")
+                :value-type (string :tag "Coq command"))
+  :group 'coq-eglot)
+
+(defun coq-eglot--query-flags (arg)
+  "Return the flag commands for a query with prefix argument ARG.
+None without prefix, Set Printing All with \\[universal-argument],
+otherwise ask among `coq-eglot-query-flags'."
+  (cond
+   ((null arg) nil)
+   ((equal arg '(4)) (list "Set Printing All"))
+   (t (mapcar (lambda (name) (cdr (assoc name coq-eglot-query-flags)))
+              (completing-read-multiple "Printing flags: "
+                                        coq-eglot-query-flags nil t)))))
+
+(defun coq-eglot--query-prompt (prompt flags)
+  "PROMPT for a query, mentioning FLAGS if any."
+  (if flags (format "%s [%s]" prompt (string-join flags ", ")) prompt))
+
 (defun coq-eglot--id-at-point ()
   "Return the qualified identifier at point, or nil."
   (save-excursion
@@ -701,33 +731,59 @@ The default is the region if active, or the identifier at point."
     (read-string (format-prompt prompt guess) nil
                  'coq-eglot--query-history guess)))
 
-(defun coq-eglot-query (command)
+(defun coq-eglot-query (command &optional flags)
   "Run Coq COMMAND at the proof position and display its messages.
 COMMAND does not change the document, nor the proof position.  The
-final dot may be omitted."
-  (interactive (list (read-string "Coq command: " nil
-                                  'coq-eglot--query-history)))
+final dot may be omitted.  FLAGS are Coq commands run just before,
+like \"Set Printing All\", for this query only.  Interactively, they
+come from the prefix argument, see `coq-eglot--query-flags'."
+  (interactive
+   (let ((flags (coq-eglot--query-flags current-prefix-arg)))
+     (list (read-string (format-prompt (coq-eglot--query-prompt
+                                        "Coq command" flags)
+                                       nil)
+                        nil 'coq-eglot--query-history)
+           flags)))
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
     (setq command (concat command ".")))
+  ;; the server runs all the sentences on a copy of the state
+  (setq command (concat (mapconcat (lambda (flag) (concat flag ". ")) flags "")
+                        command))
   ;; in the last processed sentence: the state after it
   (coq-eglot-lsp-query-async
    (1- (coq-eglot-position)) command
    (lambda (messages)
-     (coq-eglot--show-response (mapconcat #'identity messages "\n")))
+     (coq-eglot--show-response (mapconcat #'identity messages "\n"))
+     (unless messages (message "Coq: no output")))
    (lambda (err)
      (coq-eglot--show-error (or (plist-get err :message) (format "%S" err))))))
 
-(defun coq-eglot-About (name)
-  "Run About NAME at the proof position."
-  (interactive (list (coq-eglot--read-query-argument "About")))
-  (coq-eglot-query (concat "About " name)))
+(defmacro coq-eglot--define-query (name command prompt)
+  "Define query NAME running Coq COMMAND on an argument read with PROMPT."
+  `(defun ,name (arg &optional flags)
+     ,(format "Run %s ARG at the proof position.
+With \\[universal-argument], with Printing All.  With \\[universal-argument] \
+\\[universal-argument], ask
+which printing flags to use, see `coq-eglot-query-flags'.  FLAGS are
+the commands setting them." command)
+     (interactive
+      (let ((flags (coq-eglot--query-flags current-prefix-arg)))
+        (list (coq-eglot--read-query-argument
+               (coq-eglot--query-prompt ,prompt flags))
+              flags)))
+     (coq-eglot-query (concat ,command " " arg) flags)))
 
-(defun coq-eglot-Check (term)
-  "Run Check TERM at the proof position."
-  (interactive (list (coq-eglot--read-query-argument "Check")))
-  (coq-eglot-query (concat "Check " term)))
+(defun coq-eglot--call-with-prefix (command arg)
+  "Call COMMAND interactively with prefix argument ARG, for menus."
+  (let ((current-prefix-arg arg))
+    (call-interactively command)))
+
+(coq-eglot--define-query coq-eglot-About "About" "About")
+(coq-eglot--define-query coq-eglot-Check "Check" "Check")
+(coq-eglot--define-query coq-eglot-Search "Search"
+                         "Search (ex: \"eq_\" eq -bool)")
 
 ;;; Hover
 
@@ -761,6 +817,7 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-x" #'coq-eglot-exit
   "C-c C-p" #'coq-eglot-show-goals
   "C-c C-." #'coq-eglot-goto-end-of-locked
+  "C-c C-a C-a" #'coq-eglot-Search
   "C-c C-a C-b" #'coq-eglot-About
   "C-c C-a C-c" #'coq-eglot-Check
   "C-c C-v" #'coq-eglot-query)
@@ -779,7 +836,21 @@ Run when Eglot starts or stops managing the buffer."
     ("Queries"
      ["About..." coq-eglot-About]
      ["Check..." coq-eglot-Check]
-     ["Other Command..." coq-eglot-query])
+     ["Search..." coq-eglot-Search]
+     ["Other Command..." coq-eglot-query]
+     "---"
+     ["About with Printing All..."
+      (coq-eglot--call-with-prefix #'coq-eglot-About '(4))
+      :keys "C-u C-c C-a C-b"]
+     ["Check with Printing All..."
+      (coq-eglot--call-with-prefix #'coq-eglot-Check '(4))
+      :keys "C-u C-c C-a C-c"]
+     ("With Printing Flags"
+      ["About..." (coq-eglot--call-with-prefix #'coq-eglot-About '(16))]
+      ["Check..." (coq-eglot--call-with-prefix #'coq-eglot-Check '(16))]
+      ["Search..." (coq-eglot--call-with-prefix #'coq-eglot-Search '(16))]
+      ["Other Command..."
+       (coq-eglot--call-with-prefix #'coq-eglot-query '(16))]))
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
