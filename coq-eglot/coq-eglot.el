@@ -35,6 +35,10 @@
 ;; first error found stops the proof position before its sentence.
 ;; Goals are asked only for the final proof position.
 ;;
+;; Like in Proof General with `coq-compile-before-require', the
+;; libraries required by the part to check are compiled before, see
+;; coq-eglot-compile.el.
+;;
 ;; Sentences are delimited by the server, not by regexps.  The answers
 ;; of the server are kept with the processed sentences: moving back to
 ;; a sentence whose goals were displayed does not ask the server.
@@ -46,6 +50,7 @@
 (require 'coq-indent)
 (require 'color)
 (require 'coq-eglot-lsp)
+(require 'coq-eglot-compile)
 
 (defvar coq-eglot-mode)                 ; defined below
 
@@ -660,13 +665,43 @@ Only used to display the part being checked."
     (if (eq (coq-script-parse-cmdend-forward) 'cmd) (point)
       (line-end-position))))
 
+(defun coq-eglot--compile-then (start end continue)
+  "Compile the libraries required between START and END, then CONTINUE.
+CONTINUE is called with nil, or with the start of the first Require
+sentence whose compilation failed.  It is called right away if there
+is nothing to compile, never if the running check is cancelled
+meanwhile.  See `coq-eglot-compile-requires'."
+  (let ((running coq-eglot--running))
+    (unless (coq-eglot-compile-requires
+             start end
+             (lambda (failed)
+               (when (eq coq-eglot--running running)
+                 (funcall continue failed))))
+      (funcall continue nil))))
+
+(defun coq-eglot--compilation-failed (start)
+  "Report that the compilation for the Require sentence at START failed."
+  (coq-eglot--show-error
+   (format "Compilation of the required libraries failed, see buffer %s."
+           coq--compile-response-buffer))
+  (coq-eglot--highlight-error start (coq-eglot--guess-end start)))
+
 (defun coq-eglot--next ()
-  "Process the sentence after the proof position, asynchronously."
+  "Process the sentence after the proof position, asynchronously.
+Compile first the libraries it requires, if any."
   (let ((start (coq-eglot--next-sentence-start)))
     (when start
       (coq-eglot--start (coq-eglot--guess-end start))
-      (coq-eglot--send #'coq-eglot-lsp-goals-async start
-                       #'coq-eglot--next-done))))
+      (coq-eglot--compile-then
+       start (1+ start)
+       (lambda (failed)
+         (if (not failed)
+             ;; inside the sentence: at the start of the buffer, the
+             ;; server finds no sentence
+             (coq-eglot--send #'coq-eglot-lsp-goals-async (1+ start)
+                              #'coq-eglot--next-done)
+           (coq-eglot--stop)
+           (coq-eglot--compilation-failed failed)))))))
 
 (defun coq-eglot--next-done (answer)
   "Handle ANSWER of the server for the sentence after the proof position."
@@ -684,19 +719,39 @@ Only used to display the part being checked."
 
 (defun coq-eglot--advance (target)
   "Process the sentences up to the one containing the character before TARGET.
-Asynchronously: the server is asked to check up to it, without goals."
+Asynchronously: the libraries required there are compiled, then the
+server is asked to check up to it, without goals.  If a compilation
+fails, the server checks up to the Require sentence."
   (let ((last (1- (coq-eglot--skip-backward target)))
         (start (coq-eglot--next-sentence-start)))
     ;; nothing to do if no sentence starts before TARGET
     (when (and start (< start target))
       (coq-eglot--start (max target (coq-eglot--guess-end last)))
-      (coq-eglot--send #'coq-eglot-lsp-check-async last
-                       (lambda (_answer)
-                         (coq-eglot--advance-done start last))))))
+      (coq-eglot--compile-then
+       start target
+       (lambda (failed)
+         (coq-eglot--check start
+                           (if failed (1- (coq-eglot--skip-backward failed))
+                             last)
+                           failed))))))
 
-(defun coq-eglot--advance-done (start last)
+(defun coq-eglot--check (start last failed)
+  "Ask the server to check from START up to the sentence containing LAST.
+FAILED is the start of a Require sentence after LAST whose compilation
+failed, or nil.  It is reported after the check."
+  (if (< last start)
+      (progn
+        (coq-eglot--stop)
+        (coq-eglot--compilation-failed failed))
+    (coq-eglot--send #'coq-eglot-lsp-check-async last
+                     (lambda (_answer)
+                       (coq-eglot--advance-done start last failed)))))
+
+(defun coq-eglot--advance-done (start last &optional failed)
   "The server checked from START up to the sentence containing LAST.
-Stop at the first error, or ask the goals after the last sentence."
+Stop at the first error, or ask the goals after the last sentence.
+FAILED is the start of a Require sentence after LAST whose compilation
+failed, reported if there was no error before."
   (coq-eglot--stop)
   (let ((error (coq-eglot-lsp-error-range start (1+ last))))
     (if error
@@ -710,7 +765,9 @@ Stop at the first error, or ask the goals after the last sentence."
              (range (plist-get answer :range)))
         (when range
           (coq-eglot--set-position (cdr (coq-eglot-lsp-range range)) answer)
-          (coq-eglot--show-answer answer))))))
+          (coq-eglot--show-answer answer))
+        (when failed
+          (coq-eglot--compilation-failed failed))))))
 
 ;;; Moving back
 
@@ -769,7 +826,9 @@ the end of the last sentence before point."
   (coq-eglot--goals-at-position))
 
 (defun coq-eglot--cancel ()
-  "Cancel the running check and all pending requests, display nothing."
+  "Cancel the running check and all pending requests, display nothing.
+Kill the compilation of the required libraries, if running."
+  (coq-eglot-compile-cancel)
   (coq-eglot--stop)
   (coq-eglot-lsp-cancel-all))
 
@@ -1079,6 +1138,8 @@ Run when Eglot starts or stops managing the buffer."
     ["Show Goals" coq-eglot-show-goals]
     ["Conclusion Apart" coq-eglot-toggle-split-goals
      :style toggle :selected coq-eglot-split-goals]
+    ["Compile Before Require" coq-compile-before-require-toggle
+     :style toggle :selected coq-compile-before-require]
     ("Queries"
      ["About..." coq-eglot-About]
      ["Check..." coq-eglot-Check]
@@ -1115,12 +1176,14 @@ Run when Eglot starts or stops managing the buffer."
                     (append coq-eglot-ignored-capabilities
                             eglot-ignored-server-capabilities))
         (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
+        (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
         (add-hook 'post-command-hook #'coq-eglot--post-command nil t)
         (add-hook 'kill-buffer-hook #'coq-eglot--forget-active nil t)
         (coq-eglot--update-overlays))
     (setq coq-eglot-lsp-progress-function nil)
+    (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)
     (remove-hook 'post-command-hook #'coq-eglot--post-command t)

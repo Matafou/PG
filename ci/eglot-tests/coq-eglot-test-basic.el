@@ -707,6 +707,128 @@ OCaml >= 5.3): set COQ_LSP_STRONG_INTERRUPT to run this test."
       ;; the server still works
       (coq-eglot-restart-server))))
 
+
+;;; compilation of the required libraries
+
+(defconst compile-directory (expand-file-name "compile/")
+  "Directory of the tests of the compilation, with a _CoqProject.")
+
+(defun clean-compiled ()
+  "Delete the files produced by the compilation in `compile-directory'."
+  (dolist (file (directory-files
+                 compile-directory t "\\.\\(vo[sk]?\\|glob\\|aux\\)\\'"))
+    (delete-file file)))
+
+(defun compiled-p (library)
+  "Non-nil if LIBRARY of `compile-directory' is compiled."
+  (file-exists-p (expand-file-name (concat library ".vo") compile-directory)))
+
+(defmacro with-compile-file (&rest body)
+  "Run BODY visiting compile/eglot_compile.v, nothing compiled before.
+The compilation before Require is on.  The server forgets the
+libraries loaded by the previous tests."
+  (declare (indent 0) (debug t))
+  `(let ((coq-compile-before-require t))
+     (clean-compiled)
+     (unwind-protect
+         (with-file (expand-file-name "eglot_compile.v" compile-directory)
+           (coq-eglot-lsp-workspace-update)
+           ,@body)
+       (clean-compiled))))
+
+(ert-deftest coq-eglot-compile-project-root ()
+  "The server of a file runs in the directory of its _CoqProject."
+  (skip-unless-server)
+  (let ((project (coq-eglot-lsp-project compile-directory)))
+    (should (eq (car project) 'transient))
+    (should (file-equal-p (cdr project) compile-directory)))
+  (should-not (coq-eglot-lsp-project default-directory)))
+
+(ert-deftest coq-eglot-compile-before-require ()
+  "Required libraries are compiled before the server checks the Require."
+  (with-compile-file
+    (goto-marker "def")
+    (run #'coq-eglot-goto-point)
+    (should (position-at-marker-p "def"))
+    (should (equal (buffer-text "*response*") "a is defined"))
+    (should (compiled-p "eglot_compile_b"))
+    (should (compiled-p "eglot_compile_c"))
+    (should-not (compiled-p "eglot_compile_bad"))
+    ;; the compiler is the one of the server
+    (should (equal (file-name-directory coq-compiler)
+                   (file-name-directory
+                    (executable-find (car (coq-eglot-lsp-server-command))))))))
+
+(ert-deftest coq-eglot-compile-next ()
+  "A Require processed alone is compiled first too.
+The file starts with a sentence, not a comment."
+  (with-compile-file
+    (run #'coq-eglot-assert-next-command)
+    (should-not (compiled-p "eglot_compile_b"))
+    (run #'coq-eglot-assert-next-command)
+    (should (position-at-marker-p "require"))
+    (should (compiled-p "eglot_compile_b"))))
+
+(ert-deftest coq-eglot-compile-failure ()
+  "A failed compilation stops the proof position before its Require.
+The sentences before it are checked."
+  (with-compile-file
+    (run #'coq-eglot-process-buffer)
+    (should (position-at-marker-p "def"))
+    (should (string-match-p "Compilation of the required libraries failed"
+                            (buffer-text "*response*")))
+    (should (string-match-p "undefined_identifier"
+                            (buffer-text coq--compile-response-buffer)))
+    (should (string-prefix-p "From EglotCompile Require eglot_compile_bad."
+                             (error-overlay-text 'proof-boring-face)))
+    ;; nothing is compiled when the Require is the next sentence
+    (run #'coq-eglot-assert-next-command)
+    (should (position-at-marker-p "def"))
+    (should (string-match-p "Compilation of the required libraries failed"
+                            (buffer-text "*response*")))))
+
+(ert-deftest coq-eglot-compile-off ()
+  "Nothing is compiled if `coq-compile-before-require' is nil."
+  (with-compile-file
+    (let ((coq-compile-before-require nil))
+      (goto-marker "def")
+      (run #'coq-eglot-goto-point)
+      (should (position-at-marker-p "before"))
+      (should-not (compiled-p "eglot_compile_b")))))
+
+(ert-deftest coq-eglot-compile-interrupt ()
+  "Interrupting kills the compilation, the proof position stays."
+  (with-compile-file
+    (goto-marker "def")
+    (coq-eglot-goto-point)
+    (should (coq-eglot-compile-running-p))
+    (coq-eglot-interrupt)
+    (should-not coq-eglot--running)
+    (should-not (coq-eglot-compile-running-p))
+    (should-not (cl-some (lambda (p) (process-get p 'coq-compilation-job))
+                         (process-list)))
+    (accept-process-output nil 0.3)
+    (should (= (coq-eglot-position) (point-min)))))
+
+(ert-deftest coq-eglot-compile-changed-library ()
+  "A library changed after it was loaded is recompiled and reloaded."
+  (let ((source (expand-file-name "eglot_compile_c.v" compile-directory)))
+    (with-compile-file
+      (unwind-protect
+          (progn
+            (goto-marker "def")
+            (run #'coq-eglot-goto-point)
+            (should (equal (query #'coq-eglot-query "Compute a")
+                           "= 42\n     : nat"))
+            (run #'coq-eglot-retract-buffer)
+            (with-temp-file source (insert "Definition c := 1.\n"))
+            (goto-marker "def")
+            (run #'coq-eglot-goto-point)
+            (should (position-at-marker-p "def"))
+            (should (equal (query #'coq-eglot-query "Compute a")
+                           "= 2\n     : nat")))
+        (with-temp-file source (insert "Definition c := 41.\n"))))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here

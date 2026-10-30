@@ -20,3 +20,4 @@ all: $(COQ_EGLOT_SUCCESS)
 .PHONY: clean
 clean:
 	rm -f *.vo *.glob *.vos *.vok .*.aux *.success
+	cd compile && rm -f *.vo *.glob *.vos *.vok .*.aux

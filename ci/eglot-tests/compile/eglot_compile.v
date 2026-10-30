@@ -1,0 +1,5 @@
+Definition before := 0. (* marker before *)
+From EglotCompile Require eglot_compile_b. (* marker require *)
+Definition a := eglot_compile_b.b. (* marker def *)
+From EglotCompile Require eglot_compile_bad. (* marker bad *)
+Definition after := 0. (* marker after *)

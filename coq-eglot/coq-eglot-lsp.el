@@ -21,6 +21,7 @@
 (require 'eglot)
 (require 'jsonrpc)
 (require 'subr-x)                       ; hash-table-keys
+(require 'coq-system)                   ; coq-project-filename
 
 (defgroup coq-eglot nil
   "Coq backend using a language server through Eglot."
@@ -162,6 +163,15 @@ reset the options given at initialization."
 
 (add-to-list 'eglot-server-programs '(coq-mode . coq-eglot-lsp--contact))
 
+(defun coq-eglot-lsp-project (dir)
+  "Return the project of a Coq file in DIR, for `project-find-functions'.
+It is the directory of the dominating Coq project file (_CoqProject),
+if any.  The server is started there, where it reads the project file,
+and is shared by the files of this directory and its subdirectories."
+  (when-let* ((root (locate-dominating-file
+                     dir (lambda (d) (funcall coq-project-filename d)))))
+    (cons 'transient root)))
+
 ;;; Positions and requests
 
 (defun coq-eglot-lsp-position (pos)
@@ -269,6 +279,14 @@ Eglot sends them only after a short idle time otherwise.  Must not be
 called from `after-change-functions'."
   (when (coq-eglot-lsp-current-server)
     (eglot--signal-textDocument/didChange)))
+
+(defun coq-eglot-lsp-workspace-update ()
+  "Tell the server of the current buffer that .vo files changed.
+It checks again the Require sentences of all documents, and cancels
+their pending requests.  Ignored before coq-lsp 0.2.5."
+  (let ((server (coq-eglot-lsp-current-server)))
+    (when server
+      (jsonrpc-notify server :coq/workspace_update (make-hash-table)))))
 
 (defun coq-eglot-lsp--goals-params (pos)
   "Parameters of a goals request at buffer position POS."
