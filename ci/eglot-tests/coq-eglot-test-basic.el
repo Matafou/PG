@@ -220,7 +220,7 @@ the error location with `proof-warning-face', and point moves there."
     ;; errors are displayed as such
     (should (string-match-p "was not found" (query #'coq-eglot-Check "l")))
     (with-current-buffer "*response*"
-      (should (eq (get-text-property (point-min) 'face) 'error)))
+      (should (eq (get-text-property (point-min) 'font-lock-face) 'error)))
     ;; the proof position does not move
     (should (position-at-marker-p "definition"))))
 
@@ -266,6 +266,28 @@ Like in Proof General, \\[universal-argument] means Printing All."
     (run #'coq-eglot-goto-point)
     (should (string-match-p "^l: forall n : nat, double n = n \\+ n /\\\\ True"
                             (query #'coq-eglot-Search "double")))))
+
+(defun face-of (buffer text)
+  "Face of the first occurrence of TEXT in BUFFER, after fontification."
+  (with-current-buffer buffer
+    (font-lock-mode 1)                  ; not on in batch mode
+    (font-lock-ensure)
+    (goto-char (point-min))
+    (should (search-forward text nil t))
+    (or (get-text-property (match-beginning 0) 'face)
+        (get-text-property (match-beginning 0) 'font-lock-face))))
+
+(ert-deftest coq-eglot-highlighting ()
+  "Goals and response buffers are highlighted like in Proof General."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (should (eq (face-of "*goals*" "n :") 'proof-declaration-name-face))
+    (query #'coq-eglot-About "double")
+    (should (eq (face-of "*response*" "double :") 'proof-declaration-name-face))
+    (query #'coq-eglot-Check "unknown_thing")
+    ;; fontification keeps the face of errors
+    (should (eq (face-of "*response*" "The reference") 'error))))
 
 (ert-deftest coq-eglot-id-at-point ()
   "The default argument of queries is the qualified identifier at point."

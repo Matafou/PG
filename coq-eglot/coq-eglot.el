@@ -223,7 +223,8 @@ error."
   (setq-local font-lock-defaults '(coq-goals-font-lock-keywords)))
 
 (define-derived-mode coq-eglot-response-mode special-mode "Coq Response"
-  "Major mode for the messages of the Eglot backend of Coq.")
+  "Major mode for the messages of the Eglot backend of Coq."
+  (setq-local font-lock-defaults '(coq-response-font-lock-keywords)))
 
 (defun coq-eglot--display-buffer (name mode slot)
   "Return buffer NAME in MODE, displayed in the right side window SLOT."
@@ -315,7 +316,8 @@ Return the empty string if GOALS is nil (outside of proofs)."
 
 (defun coq-eglot--show-error (text)
   "Display error TEXT in the response buffer."
-  (coq-eglot--show-response (propertize text 'face 'error)))
+  ;; not face: font-lock would remove it
+  (coq-eglot--show-response (propertize text 'font-lock-face 'error)))
 
 (defun coq-eglot--goals-at-position (&optional ask)
   "Display the goals and messages at the proof position.
