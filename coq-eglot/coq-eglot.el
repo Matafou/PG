@@ -198,6 +198,7 @@ current one."
       (setq coq-eglot--active-buffer (current-buffer))
       (when (buffer-live-p previous)
         (with-current-buffer previous (coq-eglot--update-overlays)))
+      (coq-eglot-compile-check-outdated)
       (coq-eglot--update-overlays)
       (coq-eglot--goals-at-position-async))))
 
@@ -215,6 +216,7 @@ current one."
                    'proof-locked-face
                  (coq-eglot--inactive-locked-face)))
   (move-overlay coq-eglot--locked-overlay (point-min) (coq-eglot-position))
+  (coq-eglot-compile-show-outdated (coq-eglot-position))
   (if (not coq-eglot--running)
       (when (overlayp coq-eglot--queue-overlay)
         (delete-overlay coq-eglot--queue-overlay))
@@ -1163,11 +1165,19 @@ Run when Eglot starts or stops managing the buffer."
     ["Restart Server" coq-eglot-restart-server]
     ["Exit Server" coq-eglot-exit]))
 
+(defun coq-eglot--lighter ()
+  "Mode line indicator of `coq-eglot-mode'.
+Warn if processed Require sentences load outdated libraries."
+  (if coq-eglot-compile--outdated-p
+      (propertize " Coq-LSP!" 'face 'warning
+                  'help-echo "Some required libraries changed since loaded")
+    " Coq-LSP"))
+
 (define-minor-mode coq-eglot-mode
   "Interaction with Coq through a language server, like Proof General.
 
 \\{coq-eglot-mode-map}"
-  :lighter " Coq-LSP"
+  :lighter (:eval (coq-eglot--lighter))
   (if coq-eglot-mode
       (progn
         (unless coq-eglot-use-flymake

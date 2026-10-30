@@ -829,6 +829,108 @@ The sentences before it are checked."
                            "= 2\n     : nat")))
         (with-temp-file source (insert "Definition c := 41.\n"))))))
 
+(defun outdated-require ()
+  "Text of the processed Require sentence marked as outdated, or nil."
+  (cl-loop for ov in coq-eglot-compile--loaded
+           when (eq (overlay-get ov 'face) 'coq-eglot-outdated-require)
+           return (buffer-substring (overlay-start ov) (overlay-end ov))))
+
+(ert-deftest coq-eglot-compile-outdated ()
+  "A processed Require loading a library changed since is marked.
+Until the user goes back before it."
+  (let* ((source (expand-file-name "eglot_compile_c.v" compile-directory))
+         (contents (with-temp-buffer
+                     (insert-file-contents source) (buffer-string)))
+         library)
+    (with-compile-file
+      (unwind-protect
+          (let ((script (current-buffer)))
+            (goto-marker "def")
+            (run #'coq-eglot-goto-point)
+            (should-not (outdated-require))
+            (should (equal (coq-eglot--lighter) " Coq-LSP"))
+            ;; an indirect dependency is edited in a buffer
+            (setq library (find-file-noselect source))
+            (with-current-buffer library
+              (goto-char (point-max))
+              (insert "(* edited *)\n"))
+            (accept-process-output nil 0.1)
+            (should (equal (outdated-require)
+                           "From EglotCompile Require eglot_compile_b."))
+            (should (string-match-p "eglot_compile_c\\.v"
+                                    (get-char-property
+                                     (save-excursion (goto-marker "require")
+                                                     (line-beginning-position))
+                                     'help-echo)))
+            (should (equal (coq-eglot--lighter) " Coq-LSP!"))
+            ;; undone by reverting
+            (with-current-buffer library (revert-buffer t t))
+            (should-not (outdated-require))
+            ;; saved: the source is newer than the loaded library
+            (with-current-buffer library
+              (goto-char (point-max))
+              (insert "(* edited *)\n")
+              (let ((inhibit-message t)) (save-buffer)))
+            (accept-process-output nil 0.1)
+            (with-current-buffer script
+              (should (outdated-require))
+              ;; the proof position does not move
+              (should (position-at-marker-p "def"))
+              ;; going back before the Require removes the mark
+              (goto-marker "before")
+              (run #'coq-eglot-goto-point)
+              (should-not (outdated-require))
+              (should (equal (coq-eglot--lighter) " Coq-LSP"))
+              ;; processing it again compiles the new version
+              (goto-marker "def")
+              (run #'coq-eglot-goto-point)
+              (should (position-at-marker-p "def"))
+              (should-not (outdated-require))))
+        (when (buffer-live-p library)
+          (with-current-buffer library (set-buffer-modified-p nil))
+          (kill-buffer library))
+        (with-temp-file source (insert contents))))))
+
+(ert-deftest coq-eglot-compile-shared-library ()
+  "Two scripts loading the same library are both marked when it changes.
+When one of them loads the new version, the other stays marked."
+  (let* ((source (expand-file-name "eglot_compile_c.v" compile-directory))
+         (contents (with-temp-buffer
+                     (insert-file-contents source) (buffer-string)))
+         library)
+    (with-compile-file
+      (unwind-protect
+          (let ((script (current-buffer)))
+            (goto-marker "def")
+            (run #'coq-eglot-goto-point)
+            (with-file (expand-file-name "eglot_compile2.v" compile-directory)
+              (goto-marker "def")
+              (run #'coq-eglot-goto-point)
+              (should (position-at-marker-p "def"))
+              (should-not (outdated-require))
+              ;; the shared library changes
+              (setq library (find-file-noselect source))
+              (with-current-buffer library
+                (goto-char (point-max))
+                (insert "(* edited *)\n")
+                (let ((inhibit-message t)) (save-buffer)))
+              (should (outdated-require))
+              (with-current-buffer script (should (outdated-require)))
+              ;; the second script loads the new version
+              (goto-marker "before")
+              (run #'coq-eglot-goto-point)
+              (goto-marker "def")
+              (run #'coq-eglot-goto-point)
+              (should (position-at-marker-p "def"))
+              (should-not (outdated-require))
+              (with-current-buffer script
+                (should (outdated-require))
+                (should (position-at-marker-p "def")))))
+        (when (buffer-live-p library)
+          (with-current-buffer library (set-buffer-modified-p nil))
+          (kill-buffer library))
+        (with-temp-file source (insert contents))))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here

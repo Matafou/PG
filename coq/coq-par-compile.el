@@ -500,9 +500,9 @@ background.")
 
 (defvar coq-par-release-items-function #'coq-par-add-items-to-action-list
   "Function called with the queue items of a successful require job.
-It is called when the compilation needed by the require command is
-finished and all the preceding require jobs are retired.  The script
-buffer of the job is current.")
+It is called with the items and the job when the compilation needed by
+the require command is finished and all the preceding require jobs are
+retired.  The script buffer of the job is current.")
 
 (defvar coq-par-failure-function #'coq-par-clear-queue-on-failure
   "Function called when the last require job is retired after a failure.
@@ -524,7 +524,7 @@ used.")
                               (current-buffer))
          ,@body))))
 
-(defun coq-par-add-items-to-action-list (items)
+(defun coq-par-add-items-to-action-list (items _job)
   "Add ITEMS to `proof-action-list' and start their execution."
   (proof-add-to-queue items 'advancing))
 
@@ -1632,7 +1632,7 @@ jobs when they transition from \\+`waiting-queue' to \\+`ready':
                                2nd-stage-counter)))
 		  (cdr items))))))
       (coq-par-with-script-buffer job
-        (funcall coq-par-release-items-function items))
+        (funcall coq-par-release-items-function items job))
       (when coq--debug-auto-compilation
 	(message "%s: add %s items to action list"
 		 (get job 'name) (length items)))
@@ -2501,8 +2501,8 @@ REQUIRE-ITEMS is a queue item (SPAN COMMANDS ...) for one require
 command: SPAN is the span or overlay of the command, COMMANDS a list
 containing its text.  The current buffer is the script buffer.  When
 the compilation for an item is finished and the previous items are
-released, the list containing just this item is passed to
-`coq-par-release-items-function'.  On failure, either
+released, the list containing just this item and the require job are
+passed to `coq-par-release-items-function'.  On failure, either
 `coq-par-failure-function' or `coq-par-abort-function' is called.
 Those functions are taken from the script buffer, where they should
 be set buffer locally.  Return non-nil if compilation started, nil

@@ -24,12 +24,23 @@
 ;;
 ;; The compiler and coqdep are taken next to the language server, to
 ;; produce .vo files the server can load.
+;;
+;; The overlay of a compiled Require sentence is kept: it records the
+;; libraries the sentence loaded, with the dates of their .vo files.
+;; When one of them changes afterwards (edited in a buffer, source or
+;; .vo file changed), the processed Require sentence is marked as
+;; outdated, and so is the mode line.  The user decides when to go back
+;; before it.
 
 ;;; Code:
 
+(require 'cl-lib)
+(require 'seq)
 (require 'coq-par-compile)
 (require 'coq-indent)
 (require 'coq-eglot-lsp)
+
+(declare-function coq-eglot-position "coq-eglot")
 
 ;; Settings of the Proof General backend (coq.el, pg-custom.el), used
 ;; by coq-system.el
@@ -38,6 +49,10 @@
 Set from _CoqProject by `coq-load-project-file'.")
 (defvar coq-debug nil
   "Non-nil to display debugging messages of the Coq settings.")
+
+(defface coq-eglot-outdated-require '((t :inherit flymake-warning))
+  "Face of a processed Require sentence whose libraries changed since."
+  :group 'coq-eglot)
 
 (defvar-local coq-eglot-compile--state nil
   "The compilation running for the current buffer, or nil.
@@ -121,17 +136,21 @@ libraries again."
       (setq coq-eglot-compile--state nil)
       (mapc #'delete-overlay pending)
       (when (coq-eglot-compile--recompiled-p)
-        (coq-eglot-lsp-workspace-update))
+        (coq-eglot-lsp-workspace-update)
+        ;; the libraries of other buffers may have changed
+        (coq-eglot-compile-check-all-outdated))
       (funcall (plist-get state :on-done) limit))))
 
-(defun coq-eglot-compile--release (items)
+(defun coq-eglot-compile--release (items job)
   "The compilation for the Require sentences of ITEMS is finished.
-`coq-par-release-items-function' of the script buffers."
+JOB is their require job.  `coq-par-release-items-function' of the
+script buffers.  The overlays of the sentences are kept, with the
+libraries they load."
   (when coq-eglot-compile--state
     (dolist (item items)
       (if (overlayp (car item))
           (let ((pending (plist-get coq-eglot-compile--state :pending)))
-            (delete-overlay (car item))
+            (coq-eglot-compile--record (car item) job)
             (plist-put coq-eglot-compile--state :pending
                        (delq (car item) pending)))
         ;; a callback item: there is no queue to wait for
@@ -167,6 +186,8 @@ whose compilation failed.  The errors are displayed by the
 compilation."
   (let ((requires (and coq-compile-before-require
                        (coq-eglot-compile--require-sentences start end))))
+    ;; the processed Require sentences are after the proof position
+    (coq-eglot-compile--forget-from start)
     (when requires
       (coq-eglot-compile--set-programs)
       (setq-local coq-par-release-items-function #'coq-eglot-compile--release)
@@ -196,6 +217,120 @@ the compilations of the other buffers fail."
     (setq coq-eglot-compile--state nil)
     (coq-par-kill-and-cleanup)
     (coq-eglot-compile--abort-all)))
+
+;;; Outdated libraries
+
+(defvar-local coq-eglot-compile--loaded nil
+  "Overlays of the compiled Require sentences.
+The property `coq-eglot-libraries' of an overlay is the list of
+\(SOURCE VO DATE) of the libraries the sentence loads, even indirectly:
+SOURCE is the .v file, VO the .vo file, DATE the modification time of
+VO when it was loaded.  The property `coq-eglot-outdated' is the list of the
+sources that changed since.")
+
+(defvar-local coq-eglot-compile--outdated-p nil
+  "Non-nil if a processed Require sentence loads outdated libraries.")
+
+(defun coq-eglot-compile--date (file)
+  "Modification time of FILE, nil if it does not exist."
+  (file-attribute-modification-time (file-attributes file)))
+
+(defun coq-eglot-compile--libraries (job)
+  "Return the (SOURCE VO DATE) of the libraries required by JOB.
+They are the file jobs JOB depends on, even indirectly, see
+`coq-eglot-compile--loaded'."
+  (let (visited libraries)
+    (cl-labels ((visit (job)
+                  (unless (memq job visited)
+                    (push job visited)
+                    (when (eq (get job 'type) 'file)
+                      (push (list (get job 'src-file) (get job 'vo-file)
+                                  (coq-eglot-compile--date (get job 'vo-file)))
+                            libraries))
+                    (mapc #'visit (get job 'coqc-dependees)))))
+      (visit job))
+    libraries))
+
+(defun coq-eglot-compile--record (overlay job)
+  "Keep OVERLAY on a compiled Require sentence, with the libraries of JOB."
+  (overlay-put overlay 'coq-eglot-libraries (coq-eglot-compile--libraries job))
+  (push overlay coq-eglot-compile--loaded))
+
+(defun coq-eglot-compile--forget-from (pos)
+  "Forget the compiled Require sentences ending after POS."
+  (setq coq-eglot-compile--loaded
+        (seq-filter (lambda (overlay)
+                      (if (and (overlay-buffer overlay)
+                               (<= (overlay-end overlay) pos))
+                          t
+                        (delete-overlay overlay)
+                        nil))
+                    coq-eglot-compile--loaded))
+  (coq-eglot-compile-show-outdated pos))
+
+(defun coq-eglot-compile--outdated-library-p (library)
+  "Non-nil if LIBRARY, a (SOURCE VO DATE), changed since it was loaded.
+Its source is modified in a buffer, or newer than DATE, or VO changed."
+  (pcase-let* ((`(,source ,vo ,date) library)
+               (buffer (find-buffer-visiting source))
+               (source-date (coq-eglot-compile--date source)))
+    (or (and buffer (buffer-modified-p buffer))
+        (and date source-date (time-less-p date source-date))
+        (not (equal date (coq-eglot-compile--date vo))))))
+
+(defun coq-eglot-compile-check-outdated ()
+  "Find the processed Require sentences loading outdated libraries.
+Mark them and the mode line."
+  (dolist (overlay coq-eglot-compile--loaded)
+    (overlay-put overlay 'coq-eglot-outdated
+                 (mapcar #'car (seq-filter
+                                #'coq-eglot-compile--outdated-library-p
+                                (overlay-get overlay 'coq-eglot-libraries)))))
+  (coq-eglot-compile-show-outdated (coq-eglot-position)))
+
+(defun coq-eglot-compile-show-outdated (pos)
+  "Mark the outdated Require sentences ending before POS, and the mode line."
+  (let (any)
+    (dolist (overlay coq-eglot-compile--loaded)
+      (let ((outdated (and (<= (overlay-end overlay) pos)
+                           (overlay-get overlay 'coq-eglot-outdated))))
+        (setq any (or any outdated))
+        (overlay-put overlay 'face (and outdated 'coq-eglot-outdated-require))
+        (overlay-put overlay 'help-echo
+                     (and outdated
+                          (concat "Changed since loaded: "
+                                  (mapconcat #'abbreviate-file-name
+                                             outdated ", "))))
+        (overlay-put overlay 'before-string
+                     (and outdated
+                          (propertize "!" 'display
+                                      '(left-fringe exclamation-mark
+                                                    warning))))))
+    (unless (eq (and any t) coq-eglot-compile--outdated-p)
+      (setq coq-eglot-compile--outdated-p (and any t))
+      (force-mode-line-update))))
+
+(defun coq-eglot-compile-check-all-outdated ()
+  "Run `coq-eglot-compile-check-outdated' in all the script buffers."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when coq-eglot-compile--loaded
+        (coq-eglot-compile-check-outdated)))))
+
+(defun coq-eglot-compile--file-changed ()
+  "A file buffer was saved or reverted: it may be a library."
+  (when buffer-file-name
+    (coq-eglot-compile-check-all-outdated)))
+
+(defun coq-eglot-compile--file-modified ()
+  "A file buffer is about to be modified: it may be a library.
+Check after the modification, when the buffer is marked as modified."
+  (when buffer-file-name
+    (run-at-time 0 nil #'coq-eglot-compile-check-all-outdated)))
+
+(add-hook 'first-change-hook #'coq-eglot-compile--file-modified)
+(add-hook 'after-save-hook #'coq-eglot-compile--file-changed)
+(add-hook 'after-revert-hook #'coq-eglot-compile--file-changed)
 
 (provide 'coq-eglot-compile)
 

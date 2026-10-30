@@ -280,13 +280,23 @@ called from `after-change-functions'."
   (when (coq-eglot-lsp-current-server)
     (eglot--signal-textDocument/didChange)))
 
+(defun coq-eglot-lsp--servers ()
+  "All the running Coq servers."
+  (let (servers)
+    (maphash (lambda (_project project-servers)
+               (dolist (server project-servers)
+                 (when (cl-typep server 'coq-eglot-lsp-server)
+                   (push server servers))))
+             eglot--servers-by-project)
+    servers))
+
 (defun coq-eglot-lsp-workspace-update ()
-  "Tell the server of the current buffer that .vo files changed.
-It checks again the Require sentences of all documents, and cancels
-their pending requests.  Ignored before coq-lsp 0.2.5."
-  (let ((server (coq-eglot-lsp-current-server)))
-    (when server
-      (jsonrpc-notify server :coq/workspace_update (make-hash-table)))))
+  "Tell all the Coq servers that .vo files changed.
+Each one checks again the Require sentences of its documents, and
+cancels their pending requests.  All of them, because the projects of
+different servers may share libraries.  Ignored before coq-lsp 0.2.5."
+  (dolist (server (coq-eglot-lsp--servers))
+    (jsonrpc-notify server :coq/workspace_update (make-hash-table))))
 
 (defun coq-eglot-lsp--goals-params (pos)
   "Parameters of a goals request at buffer position POS."
