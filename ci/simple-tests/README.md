@@ -25,6 +25,10 @@ coq-test-proof-stat
 coq-test-time-commands
 : test that `coq-time-commands` prefixes the commands sent to Coq with
   Time, except bullets and internal commands
+coq-test-hook-variables
+: test that the hooks of proof-shell.el can read and modify the
+  variables they share with Proof General through dynamic binding,
+  with proof-shell.el interpreted and byte-compiled
 coq-proof-stat-batch-test
 : Batch mode test for proof-check-proofs. There is no Emacs lisp file
   for this test. It is programmed out in the Makefile goal
