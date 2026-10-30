@@ -678,6 +678,57 @@ meanwhile."
              (coq-eglot--set-position (car found) (cdr found))
              (coq-eglot--show-answer (cdr found)))))))))
 
+;;; Queries
+
+(defvar coq-eglot--query-history nil
+  "History of the arguments of queries.")
+
+(defun coq-eglot--id-at-point ()
+  "Return the qualified identifier at point, or nil."
+  (save-excursion
+    (skip-chars-backward "[:alnum:]_'.")
+    (skip-chars-forward ".")
+    (when (looking-at "[[:alpha:]_][[:alnum:]_'.]*")
+      (string-trim-right (match-string-no-properties 0) "\\.+"))))
+
+(defun coq-eglot--read-query-argument (prompt)
+  "Read the argument of a query with PROMPT.
+The default is the region if active, or the identifier at point."
+  (let ((guess (if (use-region-p)
+                   (buffer-substring-no-properties (region-beginning)
+                                                   (region-end))
+                 (coq-eglot--id-at-point))))
+    (read-string (format-prompt prompt guess) nil
+                 'coq-eglot--query-history guess)))
+
+(defun coq-eglot-query (command)
+  "Run Coq COMMAND at the proof position and display its messages.
+COMMAND does not change the document, nor the proof position.  The
+final dot may be omitted."
+  (interactive (list (read-string "Coq command: " nil
+                                  'coq-eglot--query-history)))
+  (when (<= (coq-eglot-position) (point-min))
+    (user-error "Coq: process at least one sentence before a query"))
+  (unless (string-match-p "\\.[ \t\n]*\\'" command)
+    (setq command (concat command ".")))
+  ;; in the last processed sentence: the state after it
+  (coq-eglot-lsp-query-async
+   (1- (coq-eglot-position)) command
+   (lambda (messages)
+     (coq-eglot--show-response (mapconcat #'identity messages "\n")))
+   (lambda (err)
+     (coq-eglot--show-error (or (plist-get err :message) (format "%S" err))))))
+
+(defun coq-eglot-About (name)
+  "Run About NAME at the proof position."
+  (interactive (list (coq-eglot--read-query-argument "About")))
+  (coq-eglot-query (concat "About " name)))
+
+(defun coq-eglot-Check (term)
+  "Run Check TERM at the proof position."
+  (interactive (list (coq-eglot--read-query-argument "Check")))
+  (coq-eglot-query (concat "Check " term)))
+
 ;;; Hover
 
 (defun coq-eglot--hover-eldoc-function (callback &rest args)
@@ -709,7 +760,30 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-c" #'coq-eglot-interrupt
   "C-c C-x" #'coq-eglot-exit
   "C-c C-p" #'coq-eglot-show-goals
-  "C-c C-." #'coq-eglot-goto-end-of-locked)
+  "C-c C-." #'coq-eglot-goto-end-of-locked
+  "C-c C-a C-b" #'coq-eglot-About
+  "C-c C-a C-c" #'coq-eglot-Check
+  "C-c C-v" #'coq-eglot-query)
+
+(easy-menu-define coq-eglot-menu coq-eglot-mode-map
+  "Menu of the Eglot backend of Coq."
+  '("Coq"
+    ["Next Step" coq-eglot-assert-next-command]
+    ["Undo Step" coq-eglot-undo-last-command]
+    ["Goto Point" coq-eglot-goto-point]
+    ["Process Buffer" coq-eglot-process-buffer]
+    ["Retract Buffer" coq-eglot-retract-buffer]
+    ["Goto End of Locked" coq-eglot-goto-end-of-locked]
+    "---"
+    ["Show Goals" coq-eglot-show-goals]
+    ("Queries"
+     ["About..." coq-eglot-About]
+     ["Check..." coq-eglot-Check]
+     ["Other Command..." coq-eglot-query])
+    "---"
+    ["Interrupt" coq-eglot-interrupt]
+    ["Restart Server" coq-eglot-restart-server]
+    ["Exit Server" coq-eglot-exit]))
 
 (define-minor-mode coq-eglot-mode
   "Interaction with Coq through a language server, like Proof General.

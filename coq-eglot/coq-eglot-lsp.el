@@ -305,6 +305,23 @@ No goals are computed.  See `coq-eglot-lsp-async-request'."
          :opts (list :memo t :hash :json-false))
    on-success on-error))
 
+(defun coq-eglot-lsp-query-async (pos command on-success on-error)
+  "Run Coq COMMAND asynchronously in the state at POS.
+The state is the one after the sentences ending before POS.  The
+document does not change.  ON-SUCCESS is called with the messages of
+COMMAND, a list of strings.  See `coq-eglot-lsp-async-request'."
+  (coq-eglot-lsp-async-request
+   :petanque/run_at_point
+   (list :textDocument (eglot--VersionedTextDocumentIdentifier)
+         :position (coq-eglot-lsp-position pos)
+         :command command)
+   (lambda (answer)
+     ;; each feedback is [LEVEL TEXT]
+     (funcall on-success
+              (mapcar (lambda (feedback) (aref feedback 1))
+                      (plist-get answer :feedback))))
+   on-error))
+
 ;;; Notifications
 
 (defun coq-eglot-lsp--uri-to-path (uri)

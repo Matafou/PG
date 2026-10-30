@@ -195,6 +195,46 @@ the error location with `proof-warning-face', and point moves there."
       (should-not (capable :completionProvider))
       (should (capable :hoverProvider)))))
 
+(defun query (command &rest args)
+  "Run query COMMAND with ARGS, return the text of the response buffer."
+  (with-current-buffer (get-buffer-create "*response*")
+    (let ((inhibit-read-only t)) (erase-buffer)))
+  (apply command args)
+  (wait-until (lambda () (not (equal (buffer-text "*response*") ""))) 10)
+  (buffer-text "*response*"))
+
+(ert-deftest coq-eglot-queries ()
+  "Queries run in the state at the proof position."
+  (with-test-file
+    (should-error (coq-eglot-About "double") :type 'user-error)
+    (goto-marker "definition")
+    (run #'coq-eglot-goto-point)
+    (should (string-match-p "\\`double : nat -> nat"
+                            (query #'coq-eglot-About "double")))
+    ;; the final dot may be omitted
+    (should (string-match-p ": nat\\'" (query #'coq-eglot-Check "double 2")))
+    (should (string-match-p ": nat\\'" (query #'coq-eglot-query "Check 0.")))
+    ;; l is defined after the proof position
+    (should (string-match-p "not a defined object"
+                            (query #'coq-eglot-About "l")))
+    ;; errors are displayed as such
+    (should (string-match-p "was not found" (query #'coq-eglot-Check "l")))
+    (with-current-buffer "*response*"
+      (should (eq (get-text-property (point-min) 'face) 'error)))
+    ;; the proof position does not move
+    (should (position-at-marker-p "definition"))))
+
+(ert-deftest coq-eglot-id-at-point ()
+  "The default argument of queries is the qualified identifier at point."
+  (with-temp-buffer
+    (insert "Check Nat.add_comm. foo' x.")
+    (goto-char 10)
+    (should (equal (coq-eglot--id-at-point) "Nat.add_comm"))
+    (search-forward "foo")
+    (should (equal (coq-eglot--id-at-point) "foo'"))
+    (goto-char (point-max))
+    (should (equal (coq-eglot--id-at-point) "x"))))
+
 (ert-deftest coq-eglot-error-highlight-timeout ()
   "The highlighting of the error disappears after a while."
   (with-test-file
