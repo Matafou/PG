@@ -20,6 +20,7 @@
 
 (require 'eglot)
 (require 'jsonrpc)
+(require 'subr-x)                       ; hash-table-keys
 
 (defgroup coq-eglot nil
   "Coq backend using a language server through Eglot."
@@ -243,16 +244,24 @@ so that they can send synchronous requests."
                                      :error-fn (later on-error)
                                      :timeout nil)))))
 
+(defun coq-eglot-lsp--pending-ids (server)
+  "Ids of the requests sent to SERVER and not answered yet."
+  ;; internal: an alist since jsonrpc 1.0.24 (Emacs 30), a hash table
+  ;; before
+  (cond
+   ((fboundp 'jsonrpc--continuations)
+    (mapcar #'car (jsonrpc--continuations server)))
+   ((fboundp 'jsonrpc--request-continuations)
+    (hash-table-keys (jsonrpc--request-continuations server)))))
+
 (defun coq-eglot-lsp-cancel-all ()
   "Ask the server of the current buffer to cancel all pending requests.
 Including those sent by Eglot on its own, like hover.  Their answers,
 errors for cancelled requests, still come later."
   (let ((server (coq-eglot-lsp-current-server)))
     (when server
-      ;; internal: the pending requests, each element starts with its id
-      (dolist (continuation (jsonrpc--continuations server))
-        (jsonrpc-notify server :$/cancelRequest
-                        (list :id (car continuation)))))))
+      (dolist (id (coq-eglot-lsp--pending-ids server))
+        (jsonrpc-notify server :$/cancelRequest (list :id id))))))
 
 (defun coq-eglot-lsp-send-changes ()
   "Send now the pending changes of the current buffer to the server.

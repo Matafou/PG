@@ -178,8 +178,13 @@ the error location with `proof-warning-face', and point moves there."
   "Eglot does not ask completions: it would force a check up to point."
   (with-test-file
     (run #'coq-eglot-assert-next-command)
-    (should-not (eglot-server-capable :completionProvider))
-    (should (eglot-server-capable :hoverProvider))))
+    ;; eglot--server-capable before Eglot 1.16 (Emacs 29)
+    (cl-flet ((capable (feature)
+                (if (fboundp 'eglot-server-capable)
+                    (eglot-server-capable feature)
+                  (with-no-warnings (eglot--server-capable feature)))))
+      (should-not (capable :completionProvider))
+      (should (capable :hoverProvider)))))
 
 (ert-deftest coq-eglot-error-highlight-timeout ()
   "The highlighting of the error disappears after a while."
