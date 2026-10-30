@@ -38,7 +38,10 @@ DEST_PREFIX=$(DESTDIR)/usr
 PROVERS=coq easycrypt pghaskell pgocaml pgshell phox qrhl
 
 # generic lisp code: to be compiled and installed
-OTHER_ELISP=generic lib
+OTHER_ELISP=generic lib ${EGLOT_ELISP}
+
+# experimental Eglot backend for Coq: Eglot is part of Emacs since 29
+EGLOT_ELISP:=$(shell ${EMACS} --batch -Q --eval '(princ (if (>= emacs-major-version 29) "coq-eglot" ""))')
 
 # additional lisp code: to be compiled but not installed
 ADDITIONAL_ELISP:=ci/compile-tests			       \

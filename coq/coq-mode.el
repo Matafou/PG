@@ -74,8 +74,37 @@ With then 2025 new CLI \\+`rocq', this command only return \\+`rocq'."
   :type 'string)
 
 (defcustom coq-use-pg t
-  "If non-nil, activate the ProofGeneral backend."
+  "If non-nil, activate the ProofGeneral backend.
+Obsolete, use `coq-backend' instead."
   :type 'boolean)
+(make-obsolete-variable 'coq-use-pg 'coq-backend "4.6")
+
+(defcustom coq-backend (if (with-no-warnings coq-use-pg) 'pg nil)
+  "Backend used by `coq-mode' to interact with Coq.
+- `pg': the Proof General backend, running Coq in a shell.
+- `eglot': experimental backend using a language server (coq-lsp)
+  through Eglot.  Requires Emacs 29 or later.
+- nil: no interaction with Coq, edition only.
+This must be set before `coq-mode' is loaded, changing it afterwards
+has no effect until Emacs is restarted."
+  :type '(choice (const :tag "Proof General" pg)
+                 (const :tag "Eglot (experimental)" eglot)
+                 (const :tag "None" nil)))
+
+(defconst coq-eglot-directory
+  (expand-file-name "../coq-eglot/"
+                    (file-name-directory (or load-file-name buffer-file-name)))
+  "Directory of the Eglot backend.")
+
+(declare-function coq-eglot-setup "coq-eglot")
+
+(defun coq--eglot-setup ()
+  "Load the Eglot backend and set it up for the current buffer."
+  (unless (>= emacs-major-version 29)
+    (user-error "The Eglot backend for Coq requires Emacs 29 or later"))
+  (add-to-list 'load-path coq-eglot-directory)
+  (require 'coq-eglot)
+  (coq-eglot-setup))
 
 ;; prettify is in emacs > 24.4
 (defvar prettify-symbols-alist)
@@ -186,7 +215,7 @@ Near here means PT is either inside or just aside of a comment."
 (add-to-list 'auto-mode-alist '("\\.v\\'" . coq-mode))
 
 (defalias 'coq--parent-mode
-  (if coq-use-pg 'proof-mode 'prog-mode))
+  (if (eq coq-backend 'pg) 'proof-mode 'prog-mode))
 
 ;;;###autoload
 (define-derived-mode coq-mode coq--parent-mode "Coq"
@@ -235,8 +264,10 @@ Near here means PT is either inside or just aside of a comment."
   ;; we can cope with nested comments
   (set (make-local-variable 'comment-quote-nested) nil)
 
-  ;; Setup Proof-General interface to Coq.
-  (if coq-use-pg (coq-pg-setup))
+  ;; Setup the interface to Coq.
+  (pcase coq-backend
+    ('pg (coq-pg-setup))
+    ('eglot (coq--eglot-setup)))
 
   ;; font-lock
   (setq-local font-lock-defaults '(coq-font-lock-keywords-1))
