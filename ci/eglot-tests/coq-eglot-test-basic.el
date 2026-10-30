@@ -367,6 +367,69 @@ the remaining height."
           (mapc #'delete-window (get-buffer-window-list buffer nil t))
           (kill-buffer buffer))))))
 
+(defun locked-face ()
+  "Face of the processed part of the current buffer.
+The face of inactive buffers is simplified to its name."
+  (let ((face (overlay-get coq-eglot--locked-overlay 'face)))
+    (if (and (consp face) (memq 'coq-eglot-inactive-locked-face face))
+        'coq-eglot-inactive-locked-face
+      face)))
+
+(ert-deftest coq-eglot-active-buffer ()
+  "Several buffers can be scripted at once, only the active one displays
+its goals.  The processed part of the others is grayed."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (should (eq (locked-face) 'proof-locked-face))
+    (should (string-match-p "n : nat" (buffer-text "*goals*")))
+    (let ((first (current-buffer)))
+      (with-file "eglot_other.v"
+        (goto-marker "proof")
+        (run #'coq-eglot-goto-point)
+        (should (eq (locked-face) 'proof-locked-face))
+        (should (string-match-p "other = 0" (buffer-text "*goals*")))
+        (with-current-buffer first
+          (should (eq (locked-face) 'coq-eglot-inactive-locked-face))
+          ;; the first buffer displays nothing now
+          (coq-eglot--goals-at-position-async)
+          (accept-process-output nil 0.3)
+          (should (string-match-p "other = 0" (buffer-text "*goals*")))
+          ;; a command wakes it up
+          (run #'coq-eglot-assert-next-command)
+          (should (eq (locked-face) 'proof-locked-face))
+          (should (string-match-p "n : nat" (buffer-text "*goals*"))))
+        (should (eq (locked-face) 'coq-eglot-inactive-locked-face))
+        ;; the position of the other buffer did not move
+        (should (position-at-marker-p "proof"))))
+    ;; killing another buffer keeps the active one
+    (should (eq coq-eglot--active-buffer (current-buffer)))))
+
+(ert-deftest coq-eglot-inactive-color ()
+  "Inactive buffers use the color of `proof-locked-face', grayed."
+  (should (equal (coq-eglot--desaturate-rgb '(1.0 0.0 0.0) 1) "#ff0000"))
+  ;; color-rgb-to-hex truncates
+  (should (equal (coq-eglot--desaturate-rgb '(1.0 0.0 0.0) 0) "#7f7f7f"))
+  ;; same hue and lightness, less saturation
+  (pcase-let* ((`(,h ,s ,l) (color-rgb-to-hsl 0.2 0.4 0.8))
+               (hex (coq-eglot--desaturate-rgb '(0.2 0.4 0.8) 0.5))
+               ;; not color-name-to-rgb: approximated in batch mode
+               (`(,h2 ,s2 ,l2)
+                (apply #'color-rgb-to-hsl
+                       (mapcar (lambda (i)
+                                 (/ (string-to-number (substring hex i (+ i 2)) 16)
+                                    255.0))
+                               '(1 3 5)))))
+    (should (< (abs (- h h2)) 0.01))
+    (should (< (abs (- l l2)) 0.01))
+    (should (< (abs (- (/ s 2) s2)) 0.01)))
+  ;; a background given to the face wins
+  (cl-letf (((symbol-function 'face-background)
+             (lambda (face &rest _)
+               (if (eq face 'coq-eglot-inactive-locked-face) "gray50" "#eaf8ff"))))
+    (should (eq (coq-eglot--inactive-locked-face)
+                'coq-eglot-inactive-locked-face))))
+
 (ert-deftest coq-eglot-id-at-point ()
   "The default argument of queries is the qualified identifier at point."
   (with-temp-buffer

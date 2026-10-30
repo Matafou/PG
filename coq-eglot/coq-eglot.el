@@ -44,6 +44,7 @@
 (require 'coq-mode)
 (require 'coq-syntax)                   ; also loads the faces of PG
 (require 'coq-indent)
+(require 'color)
 (require 'coq-eglot-lsp)
 
 (defvar coq-eglot-mode)                 ; defined below
@@ -136,11 +137,78 @@ end of the part to check.")
       (marker-position (caar coq-eglot--ends))
     (point-min)))
 
+(defface coq-eglot-inactive-locked-face '((t :extend t))
+  "Face of the processed part of the script buffers that are not active.
+Only the active script buffer displays its goals and messages, see
+`coq-eglot--active-buffer'.  If this face has no background, the
+background is the one of `proof-locked-face', grayed: see
+`coq-eglot-inactive-saturation'."
+  :group 'coq-eglot)
+
+(defcustom coq-eglot-inactive-saturation 0.5
+  "Saturation of the processed part of inactive script buffers.
+A factor between 0 (gray) and 1 (same color), applied to the background
+of `proof-locked-face' when `coq-eglot-inactive-locked-face' has no
+background."
+  :type 'number
+  :group 'coq-eglot)
+
+(defun coq-eglot--desaturate-rgb (rgb factor)
+  "Return color RGB, a list of 3 numbers in [0,1], with saturation times FACTOR.
+The result is a hexadecimal color string."
+  (pcase-let ((`(,h ,s ,l) (apply #'color-rgb-to-hsl rgb)))
+    (apply #'color-rgb-to-hex
+           (append (color-hsl-to-rgb h (* s factor) l) '(2)))))
+
+(defun coq-eglot--inactive-locked-face ()
+  "Face of the processed part of an inactive script buffer.
+See `coq-eglot-inactive-locked-face'."
+  (let ((locked (face-background 'proof-locked-face nil t)))
+    (if (or (face-background 'coq-eglot-inactive-locked-face nil t)
+            (not (stringp locked))
+            (not (color-defined-p locked)))
+        'coq-eglot-inactive-locked-face
+      (list (list :background (coq-eglot--desaturate-rgb
+                               (color-name-to-rgb locked)
+                               coq-eglot-inactive-saturation))
+            'coq-eglot-inactive-locked-face))))
+
+(defvar coq-eglot--active-buffer nil
+  "The script buffer whose goals and messages are displayed.
+It is the last one where a command of the backend ran, or where the
+processed part was edited.  The processed part of the other script
+buffers is grayed: they go on checking, but display nothing.  Any
+command in one of them makes it active again.")
+
+(defun coq-eglot--active-p ()
+  "Non-nil if the current buffer is the active script buffer."
+  (eq (current-buffer) coq-eglot--active-buffer))
+
+(defun coq-eglot--activate ()
+  "Make the current buffer the active script buffer.
+Gray the processed part of the previous one, display the goals of the
+current one."
+  (unless (coq-eglot--active-p)
+    (let ((previous coq-eglot--active-buffer))
+      (setq coq-eglot--active-buffer (current-buffer))
+      (when (buffer-live-p previous)
+        (with-current-buffer previous (coq-eglot--update-overlays)))
+      (coq-eglot--update-overlays)
+      (coq-eglot--goals-at-position-async))))
+
+(defun coq-eglot--forget-active ()
+  "Forget the current buffer if it is the active script buffer."
+  (when (coq-eglot--active-p)
+    (setq coq-eglot--active-buffer nil)))
+
 (defun coq-eglot--update-overlays ()
   "Update the overlays of the processed part and of the checked part."
   (unless (overlayp coq-eglot--locked-overlay)
-    (setq coq-eglot--locked-overlay (make-overlay (point-min) (point-min)))
-    (overlay-put coq-eglot--locked-overlay 'face 'proof-locked-face))
+    (setq coq-eglot--locked-overlay (make-overlay (point-min) (point-min))))
+  (overlay-put coq-eglot--locked-overlay 'face
+               (if (or (coq-eglot--active-p) (null coq-eglot--active-buffer))
+                   'proof-locked-face
+                 (coq-eglot--inactive-locked-face)))
   (move-overlay coq-eglot--locked-overlay (point-min) (coq-eglot-position))
   (if (not coq-eglot--running)
       (when (overlayp coq-eglot--queue-overlay)
@@ -274,7 +342,13 @@ error."
 (defun coq-eglot--set-buffer-text (name mode slot text)
   "Replace the content of buffer NAME (in MODE, window SLOT) by TEXT.
 Then adjust the heights of the windows, see
-`coq-eglot-resize-windows-function'."
+`coq-eglot-resize-windows-function'.  Do nothing if called from a script
+buffer that is not active: only the active one displays its state."
+  (when (or (not coq-eglot-mode) (coq-eglot--active-p))
+    (coq-eglot--set-buffer-text-1 name mode slot text)))
+
+(defun coq-eglot--set-buffer-text-1 (name mode slot text)
+  "Replace the content of buffer NAME (in MODE, window SLOT) by TEXT."
   (with-current-buffer (coq-eglot--display-buffer name mode slot)
     (let ((inhibit-read-only t))
       (erase-buffer)
@@ -653,12 +727,14 @@ A sentence ending exactly at POS stays processed.  Display the goals."
 (defun coq-eglot-assert-next-command ()
   "Process the next sentence."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--check-busy)
   (coq-eglot--next))
 
 (defun coq-eglot-undo-last-command ()
   "Move the proof position back one sentence."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--check-busy)
   (when coq-eglot--ends
     (let* ((range (plist-get (cdar coq-eglot--ends) :range))
@@ -671,6 +747,7 @@ A sentence ending exactly at POS stays processed.  Display the goals."
 Process the sentences up to the one containing point, or move back to
 the end of the last sentence before point."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--check-busy)
   (if (< (point) (coq-eglot-position))
       (coq-eglot--retract (point))
@@ -679,12 +756,14 @@ the end of the last sentence before point."
 (defun coq-eglot-process-buffer ()
   "Process the whole buffer."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--check-busy)
   (coq-eglot--advance (point-max)))
 
 (defun coq-eglot-retract-buffer ()
   "Move the proof position to the beginning of the buffer."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--check-busy)
   (coq-eglot--set-position nil nil)
   (coq-eglot--goals-at-position))
@@ -712,6 +791,7 @@ answer since the last interruption, because it is finishing a
 computation that cannot be interrupted, restart it: see
 `coq-eglot-restart-server'."
   (interactive)
+  (coq-eglot--activate)
   (cond
    (coq-eglot--running
     (coq-eglot--cancel)
@@ -727,6 +807,7 @@ computation that cannot be interrupted, restart it: see
 The proof position and the kept goals stay: the text did not change.
 The new server checks again the processed part when needed."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--cancel)
   (setq coq-eglot--interrupting nil)
   (coq-eglot-lsp-restart)
@@ -738,6 +819,7 @@ The new server checks again the processed part when needed."
 The proof position goes back to the beginning in all the buffers the
 server managed.  The next command starts a new server."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--cancel)
   (dolist (buffer (or (coq-eglot-lsp-shutdown) (list (current-buffer))))
     (when (buffer-live-p buffer)
@@ -753,6 +835,7 @@ server managed.  The next command starts a new server."
 (defun coq-eglot-show-goals ()
   "Ask the server the goals at the proof position and display them."
   (interactive)
+  (coq-eglot--activate)
   (coq-eglot--check-busy)
   (coq-eglot--goals-at-position t))
 
@@ -820,7 +903,8 @@ server is then asked asynchronously for the last sentence before the
 edition, the proof position moves there if the buffer did not change
 meanwhile."
   (when (or coq-eglot--edited coq-eglot--interrupted)
-      (let ((beg coq-eglot--edited)
+    (coq-eglot--activate)
+    (let ((beg coq-eglot--edited)
           (tick (buffer-chars-modified-tick)))
       (setq coq-eglot--edited nil coq-eglot--interrupted nil)
       ;; the server must work on the new text right now
@@ -903,6 +987,7 @@ come from the prefix argument, see `coq-eglot--query-flags'."
                                        nil)
                         nil 'coq-eglot--query-history)
            flags)))
+  (coq-eglot--activate)
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
@@ -1033,11 +1118,14 @@ Run when Eglot starts or stops managing the buffer."
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
         (add-hook 'post-command-hook #'coq-eglot--post-command nil t)
+        (add-hook 'kill-buffer-hook #'coq-eglot--forget-active nil t)
         (coq-eglot--update-overlays))
     (setq coq-eglot-lsp-progress-function nil)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)
     (remove-hook 'post-command-hook #'coq-eglot--post-command t)
+    (remove-hook 'kill-buffer-hook #'coq-eglot--forget-active t)
+    (coq-eglot--forget-active)
     (coq-eglot--cancel)
     (coq-eglot--set-position nil nil)
     (coq-eglot--clear-error)))
