@@ -72,6 +72,14 @@ asynchronously."
            (and version
                 (not (version< version coq-eglot-lsp-minimal-version)))))))
 
+(defun skip-unless-server ()
+  "Skip the test if the server is not usable.
+Fail instead if COQ_EGLOT_REQUIRE_SERVER is set, as in the CI, where
+a missing server should not go unnoticed."
+  (if (getenv "COQ_EGLOT_REQUIRE_SERVER")
+      (should (server-usable-p))
+    (skip-unless (server-usable-p))))
+
 (defmacro with-test-file (&rest body)
   "Run BODY in a buffer visiting eglot_test.v, kill it afterwards."
   (declare (indent 0) (debug t))
@@ -81,7 +89,7 @@ asynchronously."
   "Run BODY in a buffer visiting FILE, kill it afterwards."
   (declare (indent 1) (debug t))
   `(progn
-     (skip-unless (server-usable-p))
+     (skip-unless-server)
      (let ((buffer (find-file-noselect ,file)))
        (unwind-protect
            (with-current-buffer buffer

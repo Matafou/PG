@@ -325,6 +325,55 @@ jobs:
           endGroup
 
   ###########################################################################
+  ####### Tests of the experimental Eglot backend in ci/eglot-tests
+  ###########################################################################
+  # The images do not contain coq-lsp, it is installed from opam. The
+  # tests need Emacs >= 29.
+  eglot-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        coq_emacs_version:
+          - coq-9.0.0-emacs-29.4
+          - coq-9.0.0-emacs-30.1
+      # don't cancel all in-progress jobs if one matrix job fails:
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Add ert problem matcher
+      run: echo "::add-matcher::.github/ert.json"
+
+    - uses: coq-community/docker-coq-action@v1
+      id: docker-coq-action
+      with:
+        opam_file: 'dummy.opam'
+        custom_image: proofgeneral/coq-emacs:${{matrix.coq_emacs_version}}
+        custom_script: |
+          startGroup Install coq-lsp
+            # the opam repository of the images is too old for coq-lsp
+            # >= 0.2.3; do not let opam change the version of Rocq
+            opam update -y
+            opam install -y "coq-lsp>=0.2.3" \
+              "rocq-core=$(opam show -f installed-version rocq-core)"
+          endGroup
+          startGroup other relevant configuration
+            echo getconf _NPROCESSORS_ONLN: $(getconf _NPROCESSORS_ONLN)
+            emacs --version
+            coqc --version || rocq --version
+            ocamlc -v
+            coq-lsp --version
+          endGroup
+          startGroup Run tests
+            sudo chown -R coq:coq .
+            # fail instead of skipping tests without a usable server;
+            # OCaml 4.x of the images supports memprof-limits
+            COQ_EGLOT_REQUIRE_SERVER=1 COQ_LSP_STRONG_INTERRUPT=1 \
+              make -C ci/eglot-tests
+          endGroup
+
+  ###########################################################################
   ####### indentation tests in ci/test-indent
   ###########################################################################
   # Run indentation tests in ci/test-indent on all supported emacs
