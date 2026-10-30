@@ -24,6 +24,7 @@
 
 ;;; Code:
 
+(require 'proof-syntax)                 ; proof-inside-comment, proof-looking-at...
 
 ;; debugging
 ;(defmacro measure-time (&rest body)
