@@ -20,19 +20,726 @@
 ;; coq-syntax...), but files from coq/ never require files from here,
 ;; except coq-mode.el which loads this file when the backend is
 ;; selected.
+;;
+;; Like in Proof General, a proof position, distinct from the point,
+;; tells up to where the script is processed.  It is displayed like
+;; the locked region of Proof General, but the text before it can be
+;; edited: the proof position then moves back before the edited
+;; sentence.
+;;
+;; The server checks the document only up to the requested positions.
+;; Moving forward asks it asynchronously to check up to the target,
+;; without computing goals.  Meanwhile the part to check is displayed
+;; like the queue region of Proof General, and the proof position
+;; follows the progress of the server, sentence by sentence.  The
+;; first error found stops the proof position before its sentence.
+;; Goals are asked only for the final proof position.
+;;
+;; Sentences are delimited by the server, not by regexps.  The answers
+;; of the server are kept with the processed sentences: moving back to
+;; a sentence whose goals were displayed does not ask the server.
 
 ;;; Code:
 
-(require 'eglot)
 (require 'coq-mode)
+(require 'coq-syntax)                   ; also loads the faces of PG
+(require 'coq-indent)
+(require 'coq-eglot-lsp)
 
-(defgroup coq-eglot nil
-  "Coq backend using a language server through Eglot."
-  :group 'coq-mode)
+(defvar coq-eglot-mode)                 ; defined below
+
+;;; Options
+
+(defcustom coq-eglot-error-highlight-duration 10
+  "Seconds during which the sentence that failed stays highlighted.
+If nil, until the next command or edition before the proof position."
+  :type '(choice (number :tag "Seconds")
+                 (const :tag "Until the next command" nil))
+  :group 'coq-eglot)
+
+(defcustom coq-eglot-ignored-capabilities '(:completionProvider)
+  "Capabilities of the server that Eglot ignores in Coq buffers.
+The server checks the document only up to the requested positions.
+Some requests sent by Eglot on its own force it to check up to point,
+which freezes Emacs meanwhile: completion is synchronous and asks the
+server to check everything before point.  See
+`eglot-ignored-server-capabilities' for the possible values.  Takes
+effect when the server starts managing the buffer."
+  :type '(repeat symbol)
+  :group 'coq-eglot)
+
+(defcustom coq-eglot-use-flymake nil
+  "If non-nil, Eglot displays the diagnostics of the server with Flymake.
+Errors are then underlined until they are fixed.  Like Proof General,
+only the error of the last command is highlighted by default.  Takes
+effect when the server starts managing the buffer."
+  :type 'boolean
+  :group 'coq-eglot)
+
+;;; Proof position
+
+(defvar-local coq-eglot--ends nil
+  "The processed sentences, the last one first.
+Each element is (MARKER . ANSWER): MARKER is at the end of a sentence,
+ANSWER is the answer of the server with the goals after it, or nil if
+they were not asked.  The text before MARKER did not change since, so
+ANSWER is still valid.  Not every processed sentence has an element.
+The proof position is the first marker, or the beginning of the
+buffer.")
+
+(defvar-local coq-eglot--locked-overlay nil
+  "Overlay displaying the processed part of the script.")
+
+(defvar-local coq-eglot--queue-overlay nil
+  "Overlay displaying the part of the script being checked.")
+
+(defvar-local coq-eglot--running nil
+  "The check running, or nil.
+A plist with :id, the id of the request, and :target, a marker at the
+end of the part to check.")
+
+(defun coq-eglot-position ()
+  "Return the proof position of the current buffer."
+  (if coq-eglot--ends
+      (marker-position (caar coq-eglot--ends))
+    (point-min)))
+
+(defun coq-eglot--update-overlays ()
+  "Update the overlays of the processed part and of the checked part."
+  (unless (overlayp coq-eglot--locked-overlay)
+    (setq coq-eglot--locked-overlay (make-overlay (point-min) (point-min)))
+    (overlay-put coq-eglot--locked-overlay 'face 'proof-locked-face))
+  (move-overlay coq-eglot--locked-overlay (point-min) (coq-eglot-position))
+  (if (not coq-eglot--running)
+      (when (overlayp coq-eglot--queue-overlay)
+        (delete-overlay coq-eglot--queue-overlay))
+    (unless (overlayp coq-eglot--queue-overlay)
+      (setq coq-eglot--queue-overlay (make-overlay (point-min) (point-min)))
+      (overlay-put coq-eglot--queue-overlay 'face 'proof-queue-face))
+    (move-overlay coq-eglot--queue-overlay (coq-eglot-position)
+                  (max (coq-eglot-position)
+                       (plist-get coq-eglot--running :target)))))
+
+(defun coq-eglot--pop-ends (pos)
+  "Forget the processed sentences ending after POS."
+  (while (and coq-eglot--ends (> (caar coq-eglot--ends) pos))
+    (set-marker (car (pop coq-eglot--ends)) nil)))
+
+(defun coq-eglot--set-position (end answer)
+  "Move the proof position to END, with the ANSWER of the server for it.
+END is the end of a sentence, or nil for the beginning of the buffer.
+ANSWER may be nil."
+  (coq-eglot--pop-ends (or end (point-min)))
+  (when end
+    (if (and coq-eglot--ends (= (caar coq-eglot--ends) end))
+        (when answer (setcdr (car coq-eglot--ends) answer))
+      (push (cons (copy-marker end) answer) coq-eglot--ends)))
+  (coq-eglot--update-overlays))
+
+(defun coq-eglot--skip-backward (pos)
+  "Return the position before the blanks and comments preceding POS."
+  (save-excursion (goto-char pos) (forward-comment (- (point))) (point)))
+
+(defun coq-eglot--skip-forward (pos)
+  "Return the position after the blanks and comments following POS."
+  (save-excursion (goto-char pos) (forward-comment (buffer-size)) (point)))
+
+(defun coq-eglot--sentence-before (pos)
+  "Return (END . ANSWER) for the last processed sentence ending before POS.
+A sentence ending exactly at POS counts.  END is the end of the
+sentence, ANSWER the answer of the server with the goals after it.
+Return nil if there is no such sentence.  The kept answers are used if
+possible, otherwise the server is asked for sentences it checked
+already."
+  (let ((end (coq-eglot--skip-backward pos)))
+    (if (<= end (point-min))
+        nil
+      (let ((kept (assoc end coq-eglot--ends #'=)))
+        (if (cdr kept)
+            (cons end (cdr kept))
+          ;; the sentence containing the last character before POS
+          (let* ((answer (coq-eglot-lsp-goals (1- end)))
+                 (range (plist-get answer :range))
+                 (bounds (and range (coq-eglot-lsp-range range))))
+            (cond
+             ((null bounds) nil)
+             ((<= (cdr bounds) pos) (cons (cdr bounds) answer))
+             ;; it does not end before POS: take the one before it
+             (t (coq-eglot--sentence-before (car bounds))))))))))
+
+;;; Errors
+
+(defvar-local coq-eglot--error-overlays nil
+  "Overlays on the sentence that failed and on the error location.")
+
+(defvar-local coq-eglot--error-timer nil
+  "Timer removing the highlighting of the sentence that failed.")
+
+(defun coq-eglot--clear-error ()
+  "Remove the highlighting of the sentence that failed."
+  (when (timerp coq-eglot--error-timer)
+    (cancel-timer coq-eglot--error-timer)
+    (setq coq-eglot--error-timer nil))
+  (mapc #'delete-overlay coq-eglot--error-overlays)
+  (setq coq-eglot--error-overlays nil))
+
+(defun coq-eglot--clear-error-in (buffer)
+  "Remove the highlighting of the sentence that failed in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq coq-eglot--error-timer nil)
+      (coq-eglot--clear-error))))
+
+(defun coq-eglot--error-overlay (start end face priority)
+  "Add an error overlay from START to END with FACE and PRIORITY."
+  (let ((ov (make-overlay start end)))
+    (overlay-put ov 'face face)
+    (overlay-put ov 'priority priority)
+    (push ov coq-eglot--error-overlays)))
+
+(defun coq-eglot--highlight-error (start end)
+  "Highlight the sentence between START and END, which failed.
+Like Proof General: the sentence with `proof-boring-face', the location
+of the error, if known, with `proof-warning-face'.  Move point to the
+error."
+  (coq-eglot--clear-error)
+  (coq-eglot--error-overlay start end 'proof-boring-face 0)
+  (let ((range (coq-eglot-lsp-error-range start end)))
+    (when range
+      (coq-eglot--error-overlay (car range) (cdr range) 'proof-warning-face 1))
+    (goto-char (if range (car range) start)))
+  (when coq-eglot-error-highlight-duration
+    (setq coq-eglot--error-timer
+          (run-at-time coq-eglot-error-highlight-duration nil
+                       #'coq-eglot--clear-error-in (current-buffer)))))
+
+;;; Display
+
+(defvar coq-eglot-goals-buffer-name "*goals*")
+(defvar coq-eglot-response-buffer-name "*response*")
+
+(define-derived-mode coq-eglot-goals-mode special-mode "Coq Goals"
+  "Major mode for the goals of the Eglot backend of Coq."
+  (setq-local font-lock-defaults '(coq-goals-font-lock-keywords)))
+
+(define-derived-mode coq-eglot-response-mode special-mode "Coq Response"
+  "Major mode for the messages of the Eglot backend of Coq.")
+
+(defun coq-eglot--display-buffer (name mode slot)
+  "Return buffer NAME in MODE, displayed in the right side window SLOT."
+  (let ((buffer (get-buffer-create name)))
+    (with-current-buffer buffer
+      (unless (eq major-mode mode) (funcall mode)))
+    (display-buffer buffer
+                    `((display-buffer-reuse-window
+                       display-buffer-in-side-window)
+                      (side . right) (slot . ,slot) (window-width . 0.5)))
+    buffer))
+
+(defun coq-eglot--set-buffer-text (name mode slot text)
+  "Replace the content of buffer NAME (in MODE, window SLOT) by TEXT."
+  (with-current-buffer (coq-eglot--display-buffer name mode slot)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert text)
+      (goto-char (point-min)))))
+
+(defun coq-eglot--format-hyp (hyp)
+  "Format hypothesis HYP of a goal."
+  (let ((names (mapconcat #'identity (plist-get hyp :names) ", "))
+        (def (plist-get hyp :def)))
+    (concat "  " names
+            (if def (concat " := " def) "")
+            " : " (plist-get hyp :ty))))
+
+(defun coq-eglot--format-goal (goal)
+  "Format GOAL with its hypotheses."
+  (concat (mapconcat #'coq-eglot--format-hyp (plist-get goal :hyps) "\n")
+          (if (> (length (plist-get goal :hyps)) 0) "\n" "")
+          "  ============================\n"
+          "  " (plist-get goal :ty) "\n"))
+
+(defun coq-eglot--unfocused-p (goals)
+  "Non-nil if GOALS has unfocused goals."
+  (seq-some (lambda (level)
+              (seq-some (lambda (side) (> (length side) 0)) level))
+            (plist-get goals :stack)))
+
+(defun coq-eglot--format-goals (goals)
+  "Format GOALS, as returned by the server, like Coq does.
+Return the empty string if GOALS is nil (outside of proofs)."
+  (if (null goals)
+      ""
+    (let* ((focused (plist-get goals :goals))
+           (n (length focused)))
+      (cond
+       ((> n 0)
+        (concat
+         (format "%d goal%s\n\n" n (if (= n 1) "" "s"))
+         (coq-eglot--format-goal (aref focused 0))
+         (mapconcat #'identity
+                    (cl-loop for i from 1 below n
+                             collect (format "\ngoal %d is:\n %s\n" (1+ i)
+                                             (plist-get (aref focused i) :ty)))
+                    "")))
+       ((coq-eglot--unfocused-p goals)
+        "This subproof is complete, but there are some unfocused goals.\n")
+       ((> (length (plist-get goals :given_up)) 0)
+        "No more goals, but there are some goals you gave up.\n")
+       ((> (length (plist-get goals :shelf)) 0)
+        "All the remaining goals are on the shelf.\n")
+       (t "No more goals.\n")))))
+
+(defun coq-eglot--format-messages (messages)
+  "Format MESSAGES of a sentence, as returned by the server."
+  (mapconcat (lambda (m) (if (stringp m) m (plist-get m :text)))
+             messages "\n"))
+
+(defun coq-eglot--show-goals (answer)
+  "Display the goals of ANSWER of the server."
+  (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
+                              #'coq-eglot-goals-mode 0
+                              (coq-eglot--format-goals
+                               (plist-get answer :goals))))
+
+(defun coq-eglot--show-response (text)
+  "Display TEXT in the response buffer."
+  (coq-eglot--set-buffer-text coq-eglot-response-buffer-name
+                              #'coq-eglot-response-mode 1 text))
+
+(defun coq-eglot--show-answer (answer)
+  "Display the goals and the messages of ANSWER of the server."
+  (coq-eglot--show-goals answer)
+  (coq-eglot--show-response
+   (coq-eglot--format-messages (plist-get answer :messages))))
+
+(defun coq-eglot--show-error (text)
+  "Display error TEXT in the response buffer."
+  (coq-eglot--show-response (propertize text 'face 'error)))
+
+(defun coq-eglot--goals-at-position (&optional ask)
+  "Display the goals and messages at the proof position.
+Use the answer kept for the last processed sentence if any, ask the
+server otherwise, or if ASK is non-nil."
+  (coq-eglot--clear-error)
+  (if (null coq-eglot--ends)
+      (progn (coq-eglot--show-goals nil)
+             (coq-eglot--show-response ""))
+    (when (or ask (null (cdar coq-eglot--ends)))
+      (setcdr (car coq-eglot--ends)
+              (coq-eglot-lsp-goals (1- (coq-eglot-position)))))
+    (coq-eglot--show-answer (cdar coq-eglot--ends))))
+
+(defun coq-eglot--goals-at-position-async ()
+  "Display the goals and messages at the proof position, without waiting.
+Use the answer kept for the last processed sentence if any.  Otherwise
+ask the server asynchronously, and display the answer when it comes if
+the proof position did not move meanwhile.  Used after editions: the
+server may still be finishing an interrupted sentence."
+  (coq-eglot--clear-error)
+  (cond
+   ((null coq-eglot--ends)
+    (coq-eglot--show-goals nil)
+    (coq-eglot--show-response ""))
+   ((cdar coq-eglot--ends)
+    (coq-eglot--show-answer (cdar coq-eglot--ends)))
+   (t
+    (let ((last (car coq-eglot--ends)))
+      (coq-eglot-lsp-goals-async
+       (1- (car last))
+       (lambda (answer)
+         (when (eq (car coq-eglot--ends) last)
+           (setcdr last answer)
+           (coq-eglot--show-answer answer)))
+       #'ignore)))))
+
+;;; Moving forward
+
+(defun coq-eglot--check-busy ()
+  "Signal an error if a check is running."
+  (when coq-eglot--running
+    (user-error "Coq is busy, use \\[coq-eglot-interrupt] to interrupt")))
+
+(defun coq-eglot--start (target)
+  "Mark the part from the proof position to TARGET as being checked."
+  (setq coq-eglot--running (list :target (copy-marker target)))
+  (coq-eglot--clear-error)
+  (coq-eglot--update-overlays))
+
+(defun coq-eglot--send (request-fn pos on-success)
+  "Send the request of the running check with REQUEST-FN at POS.
+ON-SUCCESS is called with the answer.  The answer is ignored if the
+check was interrupted meanwhile: an answer or an error may still come
+for a cancelled request."
+  (let ((running coq-eglot--running))
+    (plist-put running :id
+               (funcall request-fn pos
+                        (lambda (answer)
+                          (when (eq coq-eglot--running running)
+                            (funcall on-success answer)))
+                        (lambda (err)
+                          (when (eq coq-eglot--running running)
+                            (coq-eglot--failed-request err)))))))
+
+(defun coq-eglot--stop ()
+  "Mark the running check as finished."
+  (when coq-eglot--running
+    (set-marker (plist-get coq-eglot--running :target) nil)
+    (setq coq-eglot--running nil))
+  (coq-eglot--update-overlays))
+
+(defun coq-eglot--fail (start end text answer)
+  "The sentence between START and END failed with error TEXT.
+Move the proof position before it and display the error, with the
+goals before the sentence.  ANSWER is the answer of the server for the
+sentence before, if known."
+  (let ((before (if answer (cons (coq-eglot-position) answer)
+                  (coq-eglot--sentence-before start))))
+    (coq-eglot--set-position (car before) (cdr before))
+    (coq-eglot--goals-at-position)
+    (coq-eglot--show-error text)
+    (coq-eglot--highlight-error start end)))
+
+(defun coq-eglot--failed-request (err)
+  "Handle the failure ERR of a request: stop the running check."
+  (coq-eglot--stop)
+  (message "Coq request failed: %s" (or (plist-get err :message) err)))
+
+(defun coq-eglot--progress (pos)
+  "The server checked the sentences up to POS: move the proof position.
+Do not go past the target, nor past an error."
+  (when (and coq-eglot--running
+             (> pos (coq-eglot-position))
+             (<= pos (plist-get coq-eglot--running :target))
+             (not (coq-eglot-lsp-error-range (coq-eglot-position) pos)))
+    (coq-eglot--set-position pos nil)))
+
+(defun coq-eglot--next-sentence-start ()
+  "Return the start of the first sentence after the proof position, or nil."
+  (let ((start (coq-eglot--skip-forward (coq-eglot-position))))
+    (and (< start (point-max)) start)))
+
+(defun coq-eglot--guess-end (start)
+  "Return the end of the sentence at START, as guessed locally.
+Only used to display the part being checked."
+  (save-excursion
+    (goto-char start)
+    (if (eq (coq-script-parse-cmdend-forward) 'cmd) (point)
+      (line-end-position))))
+
+(defun coq-eglot--next ()
+  "Process the sentence after the proof position, asynchronously."
+  (let ((start (coq-eglot--next-sentence-start)))
+    (when start
+      (coq-eglot--start (coq-eglot--guess-end start))
+      (coq-eglot--send #'coq-eglot-lsp-goals-async start
+                       #'coq-eglot--next-done))))
+
+(defun coq-eglot--next-done (answer)
+  "Handle ANSWER of the server for the sentence after the proof position."
+  (let* ((range (plist-get answer :range))
+         (bounds (and range (coq-eglot-lsp-range range))))
+    (coq-eglot--stop)
+    (cond
+     ((null bounds) nil)
+     ((plist-get answer :error)
+      (coq-eglot--fail (car bounds) (cdr bounds) (plist-get answer :error)
+                       nil))
+     (t
+      (coq-eglot--set-position (cdr bounds) answer)
+      (coq-eglot--show-answer answer)))))
+
+(defun coq-eglot--advance (target)
+  "Process the sentences up to the one containing the character before TARGET.
+Asynchronously: the server is asked to check up to it, without goals."
+  (let ((last (1- (coq-eglot--skip-backward target)))
+        (start (coq-eglot--next-sentence-start)))
+    ;; nothing to do if no sentence starts before TARGET
+    (when (and start (< start target))
+      (coq-eglot--start (max target (coq-eglot--guess-end last)))
+      (coq-eglot--send #'coq-eglot-lsp-check-async last
+                       (lambda (_answer)
+                         (coq-eglot--advance-done start last))))))
+
+(defun coq-eglot--advance-done (start last)
+  "The server checked from START up to the sentence containing LAST.
+Stop at the first error, or ask the goals after the last sentence."
+  (coq-eglot--stop)
+  (let ((error (coq-eglot-lsp-error-range start (1+ last))))
+    (if error
+        ;; the sentence that failed and its error message
+        (let* ((answer (coq-eglot-lsp-goals (car error)))
+               (range (plist-get answer :range))
+               (bounds (if range (coq-eglot-lsp-range range) error)))
+          (coq-eglot--fail (car bounds) (cdr bounds)
+                           (or (plist-get answer :error) "Error.") nil))
+      (let* ((answer (coq-eglot-lsp-goals last))
+             (range (plist-get answer :range)))
+        (when range
+          (coq-eglot--set-position (cdr (coq-eglot-lsp-range range)) answer)
+          (coq-eglot--show-answer answer))))))
+
+;;; Moving back
+
+(defun coq-eglot--retract (pos)
+  "Move the proof position back to the last sentence ending before POS.
+A sentence ending exactly at POS stays processed.  Display the goals."
+  (coq-eglot--pop-ends pos)
+  (let ((before (coq-eglot--sentence-before pos)))
+    (coq-eglot--set-position (car before) (cdr before)))
+  (coq-eglot--goals-at-position))
+
+;;; Commands
+
+(defun coq-eglot-assert-next-command ()
+  "Process the next sentence."
+  (interactive)
+  (coq-eglot--check-busy)
+  (coq-eglot--next))
+
+(defun coq-eglot-undo-last-command ()
+  "Move the proof position back one sentence."
+  (interactive)
+  (coq-eglot--check-busy)
+  (when coq-eglot--ends
+    (let* ((range (plist-get (cdar coq-eglot--ends) :range))
+           (start (if range (car (coq-eglot-lsp-range range))
+                    (1- (coq-eglot-position)))))
+      (coq-eglot--retract start))))
+
+(defun coq-eglot-goto-point ()
+  "Move the proof position to the sentence at point.
+Process the sentences up to the one containing point, or move back to
+the end of the last sentence before point."
+  (interactive)
+  (coq-eglot--check-busy)
+  (if (< (point) (coq-eglot-position))
+      (coq-eglot--retract (point))
+    (coq-eglot--advance (point))))
+
+(defun coq-eglot-process-buffer ()
+  "Process the whole buffer."
+  (interactive)
+  (coq-eglot--check-busy)
+  (coq-eglot--advance (point-max)))
+
+(defun coq-eglot-retract-buffer ()
+  "Move the proof position to the beginning of the buffer."
+  (interactive)
+  (coq-eglot--check-busy)
+  (coq-eglot--set-position nil nil)
+  (coq-eglot--goals-at-position))
+
+(defun coq-eglot--cancel ()
+  "Cancel the running check and all pending requests, display nothing."
+  (coq-eglot--stop)
+  (coq-eglot-lsp-cancel-all))
+
+(defvar-local coq-eglot--interrupting nil
+  "Non-nil while the server did not answer since an interruption.
+It may still be finishing a computation that cannot be interrupted.")
+
+(defun coq-eglot--wait-interruption ()
+  "Note that an interruption was sent, clear it when the server answers.
+Send a cheap request: its answer, coming after the interruption, tells
+that the server is ready again."
+  (setq coq-eglot--interrupting t)
+  (coq-eglot-lsp-ping (lambda (_) (setq coq-eglot--interrupting nil))))
+
+(defun coq-eglot-interrupt ()
+  "Interrupt the running check, without waiting.
+The proof position stays where the server was.  If the server does not
+answer since the last interruption, because it is finishing a
+computation that cannot be interrupted, restart it: see
+`coq-eglot-restart-server'."
+  (interactive)
+  (cond
+   (coq-eglot--running
+    (coq-eglot--cancel)
+    (coq-eglot--wait-interruption)
+    (coq-eglot--goals-at-position-async)
+    (message "Coq: interrupted (%s again to restart the server if it stays busy)"
+             (substitute-command-keys "\\[coq-eglot-interrupt]")))
+   (coq-eglot--interrupting (coq-eglot-restart-server))
+   (t (message "Coq: nothing to interrupt"))))
+
+(defun coq-eglot-restart-server ()
+  "Restart the server, even if it is busy.
+The proof position and the kept goals stay: the text did not change.
+The new server checks again the processed part when needed."
+  (interactive)
+  (coq-eglot--cancel)
+  (setq coq-eglot--interrupting nil)
+  (coq-eglot-lsp-restart)
+  (coq-eglot--goals-at-position-async)
+  (message "Coq: server restarted"))
+
+(defun coq-eglot-exit ()
+  "Stop the server, like `proof-shell-exit' in Proof General.
+The proof position goes back to the beginning in all the buffers the
+server managed.  The next command starts a new server."
+  (interactive)
+  (coq-eglot--cancel)
+  (dolist (buffer (or (coq-eglot-lsp-shutdown) (list (current-buffer))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when coq-eglot-mode
+          (setq coq-eglot--interrupting nil)
+          (coq-eglot--set-position nil nil)
+          (coq-eglot--clear-error)))))
+  (coq-eglot--show-goals nil)
+  (coq-eglot--show-response "")
+  (message "Coq: server stopped"))
+
+(defun coq-eglot-show-goals ()
+  "Ask the server the goals at the proof position and display them."
+  (interactive)
+  (coq-eglot--check-busy)
+  (coq-eglot--goals-at-position t))
+
+(defun coq-eglot-goto-end-of-locked ()
+  "Move point to the proof position."
+  (interactive)
+  (goto-char (coq-eglot-position)))
+
+;;; Edition before the proof position
+
+(defvar-local coq-eglot--edited nil
+  "Start of the first edition before the proof position, or nil.
+The proof position is moved back at the end of the current command.")
+
+(defvar-local coq-eglot--interrupted nil
+  "Non-nil if an edition interrupted the running check.
+The goals are displayed at the end of the current command.")
+
+(defun coq-eglot--after-change (beg _end _len)
+  "Move the proof position before the sentence edited at BEG.
+Typing right at the proof position does not move it.  Editing the
+processed part, or the part being checked, interrupts the server: all
+pending requests are cancelled, and the edition is sent to the server
+at the end of the command (not here, see `coq-eglot-lsp-send-changes')."
+  (when (< beg (if coq-eglot--running
+                   (plist-get coq-eglot--running :target)
+                 (coq-eglot-position)))
+    (coq-eglot--cancel)
+    (setq coq-eglot--interrupted t))
+  (when (< beg (coq-eglot-position))
+    ;; a sentence ending at BEG is edited too
+    (coq-eglot--pop-ends (1- beg))
+    (coq-eglot--update-overlays)
+    (coq-eglot--clear-error)
+    (setq coq-eglot--edited (min beg (or coq-eglot--edited beg)))))
+
+(defun coq-eglot--sentence-before-async (pos on-found)
+  "Like `coq-eglot--sentence-before' for POS, but without waiting.
+Call ON-FOUND with (END . ANSWER) when found.  Do nothing if there is
+no such sentence or a request fails."
+  (let* ((end (coq-eglot--skip-backward pos))
+         (kept (and (> end (point-min)) (assoc end coq-eglot--ends #'=))))
+    (cond
+     ((<= end (point-min)) nil)
+     ((cdr kept) (funcall on-found (cons end (cdr kept))))
+     (t
+      (coq-eglot-lsp-goals-async
+       (1- end)
+       (lambda (answer)
+         (let* ((range (plist-get answer :range))
+                (bounds (and range (coq-eglot-lsp-range range))))
+           (cond
+            ((null bounds) nil)
+            ((<= (cdr bounds) pos)
+             (funcall on-found (cons (cdr bounds) answer)))
+            (t (coq-eglot--sentence-before-async (car bounds) on-found)))))
+       #'ignore)))))
+
+(defun coq-eglot--post-command ()
+  "Display the goals after an edition moved back or interrupted.
+Never wait for the server here: it may still be finishing an
+interrupted sentence.  The proof position is first the end of the last
+known sentence before the edition (see `coq-eglot--after-change').  The
+server is then asked asynchronously for the last sentence before the
+edition, the proof position moves there if the buffer did not change
+meanwhile."
+  (when (or coq-eglot--edited coq-eglot--interrupted)
+    (let ((beg coq-eglot--edited)
+          (tick (buffer-chars-modified-tick)))
+      (setq coq-eglot--edited nil coq-eglot--interrupted nil)
+      ;; the server must work on the new text right now
+      (coq-eglot-lsp-send-changes)
+      (coq-eglot--wait-interruption)
+      (coq-eglot--goals-at-position-async)
+      (when beg
+        (coq-eglot--sentence-before-async
+         (1- beg)
+         (lambda (found)
+           (when (and (= tick (buffer-chars-modified-tick))
+                      (not coq-eglot--running)
+                      (> (car found) (coq-eglot-position)))
+             (coq-eglot--set-position (car found) (cdr found))
+             (coq-eglot--show-answer (cdr found)))))))))
+
+;;; Hover
+
+(defun coq-eglot--hover-eldoc-function (callback &rest args)
+  "Like `eglot-hover-eldoc-function' with CALLBACK and ARGS.
+But only in the processed part: elsewhere the server has nothing to
+say, and a pending hover would make it check up to point."
+  (when (< (point) (coq-eglot-position))
+    (apply #'eglot-hover-eldoc-function callback args)))
+
+(defun coq-eglot--setup-eldoc ()
+  "Replace the hover function of Eglot by `coq-eglot--hover-eldoc-function'.
+Run when Eglot starts or stops managing the buffer."
+  (when (bound-and-true-p eglot--managed-mode)
+    (setq-local eldoc-documentation-functions
+                (cl-substitute #'coq-eglot--hover-eldoc-function
+                               #'eglot-hover-eldoc-function
+                               eldoc-documentation-functions))))
+
+;;; Mode
+
+(defvar-keymap coq-eglot-mode-map
+  :doc "Keymap of the Eglot backend of Coq, same keys as Proof General."
+  "C-c C-n" #'coq-eglot-assert-next-command
+  "C-c C-u" #'coq-eglot-undo-last-command
+  "C-c RET" #'coq-eglot-goto-point
+  "C-c C-<return>" #'coq-eglot-goto-point
+  "C-c C-b" #'coq-eglot-process-buffer
+  "C-c C-r" #'coq-eglot-retract-buffer
+  "C-c C-c" #'coq-eglot-interrupt
+  "C-c C-x" #'coq-eglot-exit
+  "C-c C-p" #'coq-eglot-show-goals
+  "C-c C-." #'coq-eglot-goto-end-of-locked)
+
+(define-minor-mode coq-eglot-mode
+  "Interaction with Coq through a language server, like Proof General.
+
+\\{coq-eglot-mode-map}"
+  :lighter " Coq-LSP"
+  (if coq-eglot-mode
+      (progn
+        (unless coq-eglot-use-flymake
+          (setq-local eglot-stay-out-of (cons 'flymake eglot-stay-out-of)))
+        (setq-local eglot-ignored-server-capabilities
+                    (append coq-eglot-ignored-capabilities
+                            eglot-ignored-server-capabilities))
+        (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
+        (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
+        (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
+        (add-hook 'post-command-hook #'coq-eglot--post-command nil t)
+        (coq-eglot--update-overlays))
+    (setq coq-eglot-lsp-progress-function nil)
+    (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
+    (remove-hook 'after-change-functions #'coq-eglot--after-change t)
+    (remove-hook 'post-command-hook #'coq-eglot--post-command t)
+    (coq-eglot--cancel)
+    (coq-eglot--set-position nil nil)
+    (coq-eglot--clear-error)))
 
 (defun coq-eglot-setup ()
   "Set up the current `coq-mode' buffer for the Eglot backend."
-  (message "coq-eglot: the Eglot backend is not implemented yet."))
+  (coq-eglot-mode 1)
+  (eglot-ensure))
 
 (provide 'coq-eglot)
 
