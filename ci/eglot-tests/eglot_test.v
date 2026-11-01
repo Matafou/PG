@@ -15,6 +15,14 @@ Proof.
   - exact I. (* marker subproof *)
 Qed.
 
+Lemma hyps : forall n m : nat, n = m -> m = n.
+Proof.
+  intros n m H. (* marker hyps *)
+  symmetry. (* marker hyps next *)
+Abort.
+
+
+
 Lemma bad : 1 = 2.
 Proof. (* marker before error *)
   rewrite unknown_lemma. (* marker error *)

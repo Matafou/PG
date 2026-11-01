@@ -445,6 +445,128 @@ their default width, like in Proof General."
       (coq-eglot-layout-windows)
       (should (eq (window-buffer (selected-window)) (get-buffer "*goals*"))))))
 
+(defun hyp-overlay (name property)
+  "Overlay with PROPERTY on the line of hypothesis NAME in the goals."
+  (with-current-buffer "*goals*"
+    (goto-char (point-min))
+    (should (re-search-forward (format "^  %s :" name) nil t))
+    (seq-find (lambda (ov) (overlay-get ov property))
+              (overlays-in (line-beginning-position) (line-end-position)))))
+
+(ert-deftest coq-eglot-highlight-and-fold-hyps ()
+  "Hypotheses can be highlighted and folded, they stay so in the next
+goals, like in Proof General."
+  (with-test-file
+    (unwind-protect
+        (progn
+          (goto-marker "hyps")
+          (run #'coq-eglot-goto-point)
+          (with-current-buffer "*goals*"
+            (should (eq (key-binding "h") #'coq-eglot-toggle-highlight-hyp))
+            (should (eq (key-binding "f") #'coq-eglot-toggle-fold-hyp))
+            (goto-char (point-min))
+            (search-forward "H :")
+            (coq-eglot-toggle-highlight-hyp)
+            (coq-eglot-toggle-fold-hyp))
+          (should (hyp-overlay "H" 'face))
+          (should (equal (overlay-get (hyp-overlay "H" 'display) 'display)
+                         " : ..."))
+          ;; the type is still there, for copy
+          (should (string-match-p "H : n = m" (buffer-text "*goals*")))
+          (run #'coq-eglot-assert-next-command)
+          (should (string-match-p "n = m\\'" (buffer-text "*goals*")))
+          (should (hyp-overlay "H" 'face))
+          (should (hyp-overlay "H" 'display))
+          (should-not (hyp-overlay "n, m" 'face))
+          ;; from the script, on the name of the hypothesis
+          (goto-marker "hyps")
+          (search-backward "H")
+          (coq-eglot-toggle-highlight-hyp)
+          (should-not (hyp-overlay "H" 'face))
+          ;; n and m are on the same line
+          (search-backward "m")
+          (coq-eglot-toggle-highlight-hyp)
+          (should (hyp-overlay "n, m" 'face))
+          (should (equal (sort (copy-sequence coq-eglot--highlighted-hyps)
+                               #'string<)
+                         '("m" "n")))
+          (coq-eglot-unfold-hyps)
+          (should-not (hyp-overlay "H" 'display))
+          (goto-char (point-min))
+          (should-error (coq-eglot-toggle-highlight-hyp) :type 'user-error))
+      (coq-eglot-unhighlight-hyps)
+      (coq-eglot-unfold-hyps))))
+
+(ert-deftest coq-eglot-search-highlights-hyps ()
+  "Search highlights the hypotheses it finds, like in Proof General."
+  (with-test-file
+    (unwind-protect
+        (progn
+          (goto-marker "hyps")
+          (run #'coq-eglot-goto-point)
+          (should (string-match-p "^H: n = m" (query #'coq-eglot-Search "n")))
+          (should (equal coq-eglot--highlighted-hyps '("H")))
+          (should (hyp-overlay "H" 'face)))
+      (coq-eglot-unhighlight-hyps))))
+
+(ert-deftest coq-eglot-query-at-mouse ()
+  "Control click prints, shift click shows About, control shift click
+checks, like in Proof General."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (switch-to-buffer (current-buffer))
+    (goto-marker "definition")
+    (search-backward "double")
+    (let ((click (lambda (type)
+                   (list type (list (selected-window) (point) '(0 . 0) 0)))))
+      (should (string-match-p "\\`double = fun"
+                              (query #'coq-eglot-query-at-mouse
+                                     (funcall click 'C-down-mouse-1))))
+      (should (string-match-p "\\`double : nat -> nat"
+                              (query #'coq-eglot-query-at-mouse
+                                     (funcall click 'S-down-mouse-1))))
+      (should (string-match-p "\\`double\n     : nat -> nat"
+                              (query #'coq-eglot-query-at-mouse
+                                     (funcall click 'C-S-down-mouse-1))))
+      ;; with meta, with Printing All
+      (should (string-match-p "Nat.add n n"
+                              (query #'coq-eglot-query-at-mouse
+                                     (funcall click 'C-M-down-mouse-1)))))))
+
+(defun type-dot ()
+  "Type \".\" in the current buffer."
+  (let ((last-command-event ?.))
+    (call-interactively #'coq-eglot-terminator-insert)))
+
+(ert-deftest coq-eglot-double-hit ()
+  "With `proof-double-hit-enable', hitting \".\" twice quickly processes up
+to it, like in Proof General."
+  (with-test-file
+    (should (eq (key-binding ".") #'coq-eglot-terminator-insert))
+    (goto-marker "hyps next")
+    (delete-char -1)
+    (let ((proof-double-hit-enable nil))
+      (type-dot)
+      (type-dot)
+      (wait-for-coq)
+      (should (looking-back "symmetry\\.\\." (line-beginning-position)))
+      (should (= (coq-eglot-position) (point-min)))
+      (delete-char -2))
+    (let ((proof-double-hit-enable t))
+      ;; too slow
+      (type-dot)
+      (sleep-for (* 2 proof-double-hit-delay))
+      (type-dot)
+      (wait-for-coq)
+      (should (looking-back "symmetry\\.\\." (line-beginning-position)))
+      (delete-char -2)
+      (type-dot)
+      (type-dot)
+      (wait-for-coq)
+      (should (looking-back "symmetry\\." (line-beginning-position)))
+      (should (position-at-marker-p "hyps next")))))
+
 (defun locked-face ()
   "Face of the processed part of the current buffer.
 The face of inactive buffers is simplified to its name."

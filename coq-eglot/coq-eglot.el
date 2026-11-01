@@ -51,6 +51,7 @@
 (require 'color)
 (require 'coq-eglot-lsp)
 (require 'coq-eglot-compile)
+(require 'pg-double-hit)
 
 (defvar coq-eglot-mode)                 ; defined below
 
@@ -471,12 +472,18 @@ order of `coq-eglot-window-priorities', the last one gets what remains."
                                   (window-total-height (car window-height))))))))))))
 
 (defun coq-eglot--format-hyp (hyp)
-  "Format hypothesis HYP of a goal."
-  (let ((names (mapconcat #'identity (plist-get hyp :names) ", "))
+  "Format hypothesis HYP of a goal.
+The text has the property `coq-eglot-hyp', the list of its names, and
+the part after the names the property `coq-eglot-hyp-body', to
+highlight and fold it, see `coq-eglot-toggle-highlight-hyp'."
+  (let ((names (append (plist-get hyp :names) nil))
         (def (plist-get hyp :def)))
-    (concat "  " names
-            (if def (concat " := " def) "")
-            " : " (plist-get hyp :ty))))
+    (propertize
+     (concat "  " (mapconcat #'identity names ", ")
+             (propertize (concat (if def (concat " := " def) "")
+                                 " : " (plist-get hyp :ty))
+                         'coq-eglot-hyp-body t))
+     'coq-eglot-hyp names)))
 
 (defun coq-eglot--format-hyps (goal)
   "Format the hypotheses of GOAL, one per line."
@@ -557,7 +564,8 @@ See `coq-eglot-split-goals'."
         (coq-eglot--set-mode-line coq-eglot-goals-buffer-name nil)
         (coq-eglot--set-buffer-text coq-eglot-conclusion-buffer-name
                                     #'coq-eglot-goals-mode 1 (cdr parts))
-        (coq-eglot--set-separator coq-eglot-conclusion-buffer-name)))))
+        (coq-eglot--set-separator coq-eglot-conclusion-buffer-name)))
+    (coq-eglot--decorate-hyps)))
 
 (defun coq-eglot--set-separator (name)
   "Draw a line at the top of the windows of buffer NAME.
@@ -592,6 +600,128 @@ See `coq-eglot-split-goals'."
         (kill-buffer buffer))))
   (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals))
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
+
+;;; Hypotheses
+
+(defvar coq-highlighted-hyps-bg "gray"
+  "Background color of the highlighted hypotheses.
+Shared with the Proof General backend.")
+
+(defvar coq-highlight-hyps-cited-in-response t
+  "If non-nil, a Search highlights the hypotheses it finds.
+Shared with the Proof General backend.")
+
+(defvar coq-eglot--highlighted-hyps nil
+  "Names of the highlighted hypotheses.
+They stay highlighted in the next goals, like in Proof General.")
+
+(defvar coq-eglot--folded-hyps nil
+  "Names of the folded hypotheses, their type is hidden.
+They stay folded in the next goals, like in Proof General.")
+
+(defun coq-eglot--hyp-regions ()
+  "List the hypotheses of the goals buffer, as (NAMES START END).
+START and END delimit the part after the names."
+  (let ((buffer (get-buffer coq-eglot-goals-buffer-name))
+        regions)
+    (when buffer
+      (with-current-buffer buffer
+        (let ((pos (point-min)))
+          (while (setq pos (text-property-not-all pos (point-max)
+                                                  'coq-eglot-hyp nil))
+            (let ((end (next-single-property-change pos 'coq-eglot-hyp
+                                                    nil (point-max))))
+              (push (list (get-text-property pos 'coq-eglot-hyp)
+                          (text-property-any pos end 'coq-eglot-hyp-body t)
+                          end)
+                    regions)
+              (setq pos end))))))
+    (nreverse regions)))
+
+(defun coq-eglot--decorate-hyps ()
+  "Highlight and fold the hypotheses of the goals buffer.
+See `coq-eglot--highlighted-hyps' and `coq-eglot--folded-hyps'."
+  (let ((buffer (get-buffer coq-eglot-goals-buffer-name)))
+    (when buffer
+      (with-current-buffer buffer
+        (remove-overlays (point-min) (point-max) 'coq-eglot-hyp t)
+        (pcase-dolist (`(,names ,start ,end) (coq-eglot--hyp-regions))
+          (when (seq-intersection names coq-eglot--highlighted-hyps)
+            (let ((ov (make-overlay (save-excursion
+                                      (goto-char start) (line-beginning-position))
+                                    end)))
+              (overlay-put ov 'coq-eglot-hyp t)
+              (overlay-put ov 'face `(:background ,coq-highlighted-hyps-bg))))
+          (when (seq-intersection names coq-eglot--folded-hyps)
+            (let ((ov (make-overlay start end)))
+              (overlay-put ov 'coq-eglot-hyp t)
+              (overlay-put ov 'display " : ...")
+              (overlay-put ov 'help-echo "Folded, see `coq-eglot-toggle-fold-hyp'"))))))))
+
+(defun coq-eglot--hyp-at-point ()
+  "Names of the hypothesis at point, or nil.
+In the goals buffer, the one under point.  Elsewhere, the identifier at
+point, if it is a hypothesis of the goals buffer."
+  (if (equal (buffer-name) coq-eglot-goals-buffer-name)
+      (or (get-text-property (point) 'coq-eglot-hyp)
+          (and (> (point) (point-min))
+               (get-text-property (1- (point)) 'coq-eglot-hyp)))
+    (let ((id (coq-eglot--id-at-point)))
+      (when id
+        (seq-some (lambda (region) (and (member id (car region)) (car region)))
+                  (coq-eglot--hyp-regions))))))
+
+(defun coq-eglot--toggle-hyp (var verb)
+  "Toggle the hypothesis at point in the names of VAR, for VERB."
+  (let ((names (or (coq-eglot--hyp-at-point)
+                   (user-error "Coq: no hypothesis at point"))))
+    (set var (if (seq-intersection names (symbol-value var))
+                 (seq-difference (symbol-value var) names)
+               (append names (symbol-value var))))
+    (coq-eglot--decorate-hyps)
+    (message "Coq: %s %s" (string-join names ", ")
+             (if (seq-intersection names (symbol-value var)) verb
+               (concat "un" verb)))))
+
+(defun coq-eglot-toggle-highlight-hyp ()
+  "Toggle the highlighting of the hypothesis at point.
+In the goals buffer, the hypothesis under point, elsewhere the one
+named by the identifier at point.  It stays highlighted in the next
+goals.  See `coq-highlighted-hyps-bg'."
+  (interactive)
+  (coq-eglot--toggle-hyp 'coq-eglot--highlighted-hyps "highlighted"))
+
+(defun coq-eglot-unhighlight-hyps ()
+  "Remove the highlighting of all the hypotheses."
+  (interactive)
+  (setq coq-eglot--highlighted-hyps nil)
+  (coq-eglot--decorate-hyps))
+
+(defun coq-eglot-toggle-fold-hyp ()
+  "Toggle the folding of the hypothesis at point: hide its type.
+See `coq-eglot-toggle-highlight-hyp' for the hypothesis at point."
+  (interactive)
+  (coq-eglot--toggle-hyp 'coq-eglot--folded-hyps "folded"))
+
+(defun coq-eglot-unfold-hyps ()
+  "Unfold all the hypotheses."
+  (interactive)
+  (setq coq-eglot--folded-hyps nil)
+  (coq-eglot--decorate-hyps))
+
+(defun coq-eglot--highlight-cited-hyps (messages)
+  "Highlight the hypotheses cited in MESSAGES, the answer of a Search.
+See `coq-highlight-hyps-cited-in-response'."
+  (when coq-highlight-hyps-cited-in-response
+    (let ((cited (mapcan (lambda (line)
+                           (when (string-match "\\`\\([^ :]+\\):" line)
+                             (list (match-string 1 line))))
+                         (split-string (string-join messages "\n") "\n"))))
+      (setq coq-eglot--highlighted-hyps
+            (seq-filter (lambda (name) (member name cited))
+                        (mapcan (lambda (region) (copy-sequence (car region)))
+                                (coq-eglot--hyp-regions))))
+      (coq-eglot--decorate-hyps))))
 
 (defun coq-eglot--show-response (text)
   "Display TEXT in the response buffer."
@@ -1091,12 +1221,13 @@ The default is the region if active, or the identifier at point."
     (read-string (format-prompt prompt guess) nil
                  'coq-eglot--query-history guess)))
 
-(defun coq-eglot-query (command &optional flags)
+(defun coq-eglot-query (command &optional flags then)
   "Run Coq COMMAND at the proof position and display its messages.
 COMMAND does not change the document, nor the proof position.  The
 final dot may be omitted.  FLAGS are Coq commands run just before,
 like \"Set Printing All\", for this query only.  Interactively, they
-come from the prefix argument, see `coq-eglot--query-flags'."
+come from the prefix argument, see `coq-eglot--query-flags'.  If
+non-nil, THEN is called with the messages after they are displayed."
   (interactive
    (let ((flags (coq-eglot--query-flags current-prefix-arg)))
      (list (read-string (format-prompt (coq-eglot--query-prompt
@@ -1105,10 +1236,10 @@ come from the prefix argument, see `coq-eglot--query-flags'."
                         nil 'coq-eglot--query-history)
            flags)))
   (coq-eglot--with-script
-    (coq-eglot--query command flags)))
+    (coq-eglot--query command flags then)))
 
-(defun coq-eglot--query (command flags)
-  "Run Coq COMMAND after FLAGS, see `coq-eglot-query'."
+(defun coq-eglot--query (command flags then)
+  "Run Coq COMMAND after FLAGS, then THEN, see `coq-eglot-query'."
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
@@ -1121,12 +1252,14 @@ come from the prefix argument, see `coq-eglot--query-flags'."
    (1- (coq-eglot-position)) command
    (lambda (messages)
      (coq-eglot--show-response (mapconcat #'identity messages "\n"))
-     (unless messages (message "Coq: no output")))
+     (unless messages (message "Coq: no output"))
+     (when then (funcall then messages)))
    (lambda (err)
      (coq-eglot--show-error (or (plist-get err :message) (format "%S" err))))))
 
-(defmacro coq-eglot--define-query (name command prompt)
-  "Define query NAME running Coq COMMAND on an argument read with PROMPT."
+(defmacro coq-eglot--define-query (name command prompt &optional then)
+  "Define query NAME running Coq COMMAND on an argument read with PROMPT.
+THEN is called with the messages, see `coq-eglot-query'."
   `(defun ,name (arg &optional flags)
      ,(format "Run %s ARG at the proof position.
 With \\[universal-argument], with Printing All.  With \\[universal-argument] \
@@ -1138,7 +1271,7 @@ the commands setting them." command)
         (list (coq-eglot--read-query-argument
                (coq-eglot--query-prompt ,prompt flags))
               flags)))
-     (coq-eglot-query (concat ,command " " arg) flags)))
+     (coq-eglot-query (concat ,command " " arg) flags ,then)))
 
 (defun coq-eglot--call-with-prefix (command arg)
   "Call COMMAND interactively with prefix argument ARG, for menus."
@@ -1148,10 +1281,53 @@ the commands setting them." command)
 (coq-eglot--define-query coq-eglot-About "About" "About")
 (coq-eglot--define-query coq-eglot-Check "Check" "Check")
 (coq-eglot--define-query coq-eglot-Search "Search"
-                         "Search (ex: \"eq_\" eq -bool)")
+                         "Search (ex: \"eq_\" eq -bool)"
+                         #'coq-eglot--highlight-cited-hyps)
 (coq-eglot--define-query coq-eglot-SearchPattern "SearchPattern"
                          "SearchPattern (parenthesis mandatory), ex: (?X1 + _ = _ + ?X1)")
 (coq-eglot--define-query coq-eglot-Print "Print" "Print")
+
+;;; Mouse queries
+
+(defcustom coq-remap-mouse-1 nil
+  "Whether control and shift mouse-1 run queries on the identifier clicked.
+See `coq-eglot-query-at-mouse'.  This overrides the global bindings of
+these keys (buffers and faces menus), hence nil by default.  Shared
+with the Proof General backend, read when the backend is loaded."
+  :type 'boolean
+  :group 'coq-eglot)
+
+(defun coq-eglot-query-at-mouse (event)
+  "Run a query on the identifier clicked with EVENT, like in Proof General.
+Control: Print, shift: About, control shift: Check.  With meta also,
+with Printing All.  In the script buffer and in the goals and response
+buffers."
+  (interactive "e")
+  (let* ((position (event-start event))
+         (modifiers (event-modifiers event))
+         (control (memq 'control modifiers))
+         (shift (memq 'shift modifiers))
+         (command (cond ((and control shift) "Check")
+                        (shift "About")
+                        (t "Print"))))
+    (with-current-buffer (window-buffer (posn-window position))
+      (let ((id (save-excursion
+                  (goto-char (posn-point position))
+                  (coq-eglot--id-at-point))))
+        (unless id (user-error "Coq: no identifier here"))
+        (coq-eglot-query (concat command " " id)
+                         (when (memq 'meta modifiers)
+                           (coq-eglot--query-flags '(4))))))))
+
+;;; Double hit
+
+(defun coq-eglot-terminator-insert (&optional count)
+  "Insert \".\", or process up to it on a double hit.
+See `proof-double-hit-enable'.  With COUNT, insert COUNT dots."
+  (interactive "P")
+  (proof-double-hit-insert #'coq-eglot-goto-point count))
+
+(put 'coq-eglot-terminator-insert 'delete-selection t)
 
 ;;; Hover
 
@@ -1191,7 +1367,20 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-a C-c" #'coq-eglot-Check
   "C-c C-a C-o" #'coq-eglot-SearchPattern
   "C-c C-a C-p" #'coq-eglot-Print
-  "C-c C-v" #'coq-eglot-query)
+  "C-c C-v" #'coq-eglot-query
+  "." #'coq-eglot-terminator-insert)
+
+(when coq-remap-mouse-1
+  (dolist (modifiers '("C-" "S-" "C-S-" "C-M-" "M-S-"))
+    (keymap-set coq-eglot-mode-map (concat modifiers "<down-mouse-1>")
+                #'coq-eglot-query-at-mouse)
+    (keymap-set coq-eglot-mode-map (concat modifiers "<mouse-1>") #'ignore)))
+
+;; like in Proof General, in the goals buffer only
+(keymap-set coq-eglot-goals-mode-map "h" #'coq-eglot-toggle-highlight-hyp)
+(keymap-set coq-eglot-goals-mode-map "H" #'coq-eglot-unhighlight-hyps)
+(keymap-set coq-eglot-goals-mode-map "f" #'coq-eglot-toggle-fold-hyp)
+(keymap-set coq-eglot-goals-mode-map "F" #'coq-eglot-unfold-hyps)
 
 (easy-menu-define coq-eglot-menu coq-eglot-mode-map
   "Menu of the Eglot backend of Coq."
@@ -1209,6 +1398,13 @@ Run when Eglot starts or stops managing the buffer."
      :style toggle :selected coq-eglot-split-goals]
     ["Compile Before Require" coq-compile-before-require-toggle
      :style toggle :selected coq-compile-before-require]
+    ["Double Hit Electric Terminator" proof-double-hit-toggle
+     :style toggle :selected proof-double-hit-enable]
+    ("Hypotheses"
+     ["Toggle Highlighting" coq-eglot-toggle-highlight-hyp]
+     ["Unhighlight All" coq-eglot-unhighlight-hyps]
+     ["Toggle Folding" coq-eglot-toggle-fold-hyp]
+     ["Unfold All" coq-eglot-unfold-hyps])
     ("Queries"
      ["About..." coq-eglot-About]
      ["Check..." coq-eglot-Check]
