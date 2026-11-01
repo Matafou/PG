@@ -174,9 +174,9 @@ start."
      :style toggle
      :selected proof-electric-terminator-enable
      :help "Automatically send commands when terminator typed"]
-    ["Double Hit Electric Terminator" coq-double-hit-toggle
+    ["Double Hit Electric Terminator" proof-double-hit-toggle
      :style toggle
-     :selected coq-double-hit-enable
+     :selected proof-double-hit-enable
      :help "Automatically send commands when terminator is typed twice quickly."]
     ("Auto Compilation"
      ["Compile Before Require"

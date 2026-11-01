@@ -35,6 +35,7 @@
 ;; (if t (require 'coq nil 'noerror))
 (require 'coq-smie)
 (require 'coq-syntax)                   ;For font-lock-keywords
+(require 'pg-double-hit)
 
 (defgroup coq-mode ()
   "Major mode to edit Coq code."
@@ -86,6 +87,15 @@ With then 2025 new CLI \\+`rocq', this command only return \\+`rocq'."
 Obsolete, use `coq-backend' instead."
   :type 'boolean)
 (make-obsolete-variable 'coq-use-pg 'coq-backend "4.6")
+
+;; The double hit is generic, see pg-double-hit.el.  Here for both
+;; backends.
+(define-obsolete-variable-alias 'coq-double-hit-enable
+  'proof-double-hit-enable "4.6")
+(define-obsolete-variable-alias 'coq-double-hit-delay
+  'proof-double-hit-delay "4.6")
+(define-obsolete-function-alias 'coq-double-hit-toggle
+  #'proof-double-hit-toggle "4.6")
 
 (defcustom coq-backend (if (with-no-warnings coq-use-pg) 'pg nil)
   "Backend used by `coq-mode' to interact with Coq.
