@@ -202,6 +202,25 @@ current one."
       (coq-eglot--update-overlays)
       (coq-eglot--goals-at-position-async))))
 
+(defun coq-eglot--script-buffer ()
+  "Return the script buffer a command of the backend acts on.
+The current buffer in a script buffer, the active script buffer in the
+goals and response buffers, like in Proof General."
+  (cond
+   (coq-eglot-mode (current-buffer))
+   ((and (derived-mode-p 'coq-eglot-output-mode)
+         (buffer-live-p coq-eglot--active-buffer))
+    coq-eglot--active-buffer)
+   (t (user-error "Coq: no script buffer"))))
+
+(defmacro coq-eglot--with-script (&rest body)
+  "Run BODY in the script buffer of the command, made active.
+See `coq-eglot--script-buffer'."
+  (declare (indent 0) (debug t))
+  `(with-current-buffer (coq-eglot--script-buffer)
+     (coq-eglot--activate)
+     ,@body))
+
 (defun coq-eglot--forget-active ()
   "Forget the current buffer if it is the active script buffer."
   (when (coq-eglot--active-p)
@@ -327,11 +346,18 @@ error."
   "Buffer of the conclusion, see `coq-eglot-split-goals'.")
 (defvar coq-eglot-response-buffer-name "*response*")
 
-(define-derived-mode coq-eglot-goals-mode special-mode "Coq Goals"
+(define-derived-mode coq-eglot-output-mode nil "Coq Output"
+  "Parent mode of the goals and response buffers of the Eglot backend.
+Read-only, with the keys of the script buffer, but not those of
+`special-mode': like in Proof General, \"q\" does not close the
+window."
+  (setq buffer-read-only t))
+
+(define-derived-mode coq-eglot-goals-mode coq-eglot-output-mode "Coq Goals"
   "Major mode for the goals of the Eglot backend of Coq."
   (setq-local font-lock-defaults '(coq-goals-font-lock-keywords)))
 
-(define-derived-mode coq-eglot-response-mode special-mode "Coq Response"
+(define-derived-mode coq-eglot-response-mode coq-eglot-output-mode "Coq Response"
   "Major mode for the messages of the Eglot backend of Coq."
   (setq-local font-lock-defaults '(coq-response-font-lock-keywords)))
 
@@ -345,6 +371,32 @@ error."
                        display-buffer-in-side-window)
                       (side . right) (slot . ,slot) (window-width . 0.5)))
     buffer))
+
+(defun coq-eglot-layout-windows ()
+  "Display the goals and response windows again, like in Proof General.
+Their side windows come back if closed, with their default sizes."
+  (interactive)
+  (let ((selected (current-buffer))
+        (outputs (list coq-eglot-goals-buffer-name
+                       coq-eglot-conclusion-buffer-name
+                       coq-eglot-response-buffer-name)))
+    (coq-eglot--with-script
+      ;; displayed again from scratch: default sizes
+      (dolist (window (window-list nil 'no-minibuffer))
+        (when (and (window-parameter window 'window-side)
+                   (member (buffer-name (window-buffer window)) outputs))
+          (delete-window window)))
+      (coq-eglot--display-buffer coq-eglot-goals-buffer-name
+                                 #'coq-eglot-goals-mode 0)
+      (when coq-eglot-split-goals
+        (coq-eglot--display-buffer coq-eglot-conclusion-buffer-name
+                                   #'coq-eglot-goals-mode 1))
+      (coq-eglot--display-buffer coq-eglot-response-buffer-name
+                                 #'coq-eglot-response-mode 2)
+      (when coq-eglot-resize-windows-function
+        (funcall coq-eglot-resize-windows-function)))
+    (let ((window (get-buffer-window selected)))
+      (when window (select-window window)))))
 
 (defun coq-eglot--set-buffer-text (name mode slot text)
   "Replace the content of buffer NAME (in MODE, window SLOT) by TEXT.
@@ -786,46 +838,46 @@ A sentence ending exactly at POS stays processed.  Display the goals."
 (defun coq-eglot-assert-next-command ()
   "Process the next sentence."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--check-busy)
-  (coq-eglot--next))
+  (coq-eglot--with-script
+    (coq-eglot--check-busy)
+    (coq-eglot--next)))
 
 (defun coq-eglot-undo-last-command ()
   "Move the proof position back one sentence."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--check-busy)
-  (when coq-eglot--ends
-    (let* ((range (plist-get (cdar coq-eglot--ends) :range))
-           (start (if range (car (coq-eglot-lsp-range range))
-                    (1- (coq-eglot-position)))))
-      (coq-eglot--retract start))))
+  (coq-eglot--with-script
+    (coq-eglot--check-busy)
+    (when coq-eglot--ends
+      (let* ((range (plist-get (cdar coq-eglot--ends) :range))
+             (start (if range (car (coq-eglot-lsp-range range))
+                      (1- (coq-eglot-position)))))
+        (coq-eglot--retract start)))))
 
 (defun coq-eglot-goto-point ()
   "Move the proof position to the sentence at point.
 Process the sentences up to the one containing point, or move back to
 the end of the last sentence before point."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--check-busy)
-  (if (< (point) (coq-eglot-position))
-      (coq-eglot--retract (point))
-    (coq-eglot--advance (point))))
+  (coq-eglot--with-script
+    (coq-eglot--check-busy)
+    (if (< (point) (coq-eglot-position))
+        (coq-eglot--retract (point))
+      (coq-eglot--advance (point)))))
 
 (defun coq-eglot-process-buffer ()
   "Process the whole buffer."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--check-busy)
-  (coq-eglot--advance (point-max)))
+  (coq-eglot--with-script
+    (coq-eglot--check-busy)
+    (coq-eglot--advance (point-max))))
 
 (defun coq-eglot-retract-buffer ()
   "Move the proof position to the beginning of the buffer."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--check-busy)
-  (coq-eglot--set-position nil nil)
-  (coq-eglot--goals-at-position))
+  (coq-eglot--with-script
+    (coq-eglot--check-busy)
+    (coq-eglot--set-position nil nil)
+    (coq-eglot--goals-at-position)))
 
 (defun coq-eglot--cancel ()
   "Cancel the running check and all pending requests, display nothing.
@@ -852,58 +904,62 @@ answer since the last interruption, because it is finishing a
 computation that cannot be interrupted, restart it: see
 `coq-eglot-restart-server'."
   (interactive)
-  (coq-eglot--activate)
-  (cond
-   (coq-eglot--running
-    (coq-eglot--cancel)
-    (coq-eglot--wait-interruption)
-    (coq-eglot--goals-at-position-async)
-    (message "Coq: interrupted (%s again to restart the server if it stays busy)"
-             (substitute-command-keys "\\[coq-eglot-interrupt]")))
-   (coq-eglot--interrupting (coq-eglot-restart-server))
-   (t (message "Coq: nothing to interrupt"))))
+  (coq-eglot--with-script
+    (cond
+     (coq-eglot--running
+      (coq-eglot--cancel)
+      (coq-eglot--wait-interruption)
+      (coq-eglot--goals-at-position-async)
+      (message "Coq: interrupted (%s again to restart the server if it stays busy)"
+               (substitute-command-keys "\\[coq-eglot-interrupt]")))
+     (coq-eglot--interrupting (coq-eglot-restart-server))
+     (t (message "Coq: nothing to interrupt")))))
 
 (defun coq-eglot-restart-server ()
   "Restart the server, even if it is busy.
 The proof position and the kept goals stay: the text did not change.
 The new server checks again the processed part when needed."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--cancel)
-  (setq coq-eglot--interrupting nil)
-  (coq-eglot-lsp-restart)
-  (coq-eglot--goals-at-position-async)
-  (message "Coq: server restarted"))
+  (coq-eglot--with-script
+    (coq-eglot--cancel)
+    (setq coq-eglot--interrupting nil)
+    (coq-eglot-lsp-restart)
+    (coq-eglot--goals-at-position-async)
+    (message "Coq: server restarted")))
 
 (defun coq-eglot-exit ()
   "Stop the server, like `proof-shell-exit' in Proof General.
 The proof position goes back to the beginning in all the buffers the
 server managed.  The next command starts a new server."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--cancel)
-  (dolist (buffer (or (coq-eglot-lsp-shutdown) (list (current-buffer))))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when coq-eglot-mode
-          (setq coq-eglot--interrupting nil)
-          (coq-eglot--set-position nil nil)
-          (coq-eglot--clear-error)))))
-  (coq-eglot--show-goals nil)
-  (coq-eglot--show-response "")
-  (message "Coq: server stopped"))
+  (coq-eglot--with-script
+    (coq-eglot--cancel)
+    (dolist (buffer (or (coq-eglot-lsp-shutdown) (list (current-buffer))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when coq-eglot-mode
+            (setq coq-eglot--interrupting nil)
+            (coq-eglot--set-position nil nil)
+            (coq-eglot--clear-error)))))
+    (coq-eglot--show-goals nil)
+    (coq-eglot--show-response "")
+    (message "Coq: server stopped")))
 
 (defun coq-eglot-show-goals ()
   "Ask the server the goals at the proof position and display them."
   (interactive)
-  (coq-eglot--activate)
-  (coq-eglot--check-busy)
-  (coq-eglot--goals-at-position t))
+  (coq-eglot--with-script
+    (coq-eglot--check-busy)
+    (coq-eglot--goals-at-position t)))
 
 (defun coq-eglot-goto-end-of-locked ()
-  "Move point to the proof position."
+  "Move point to the proof position.
+In the goals and response buffers, go to the script buffer first."
   (interactive)
-  (goto-char (coq-eglot-position)))
+  (let ((buffer (coq-eglot--script-buffer)))
+    (unless (eq buffer (current-buffer))
+      (pop-to-buffer buffer))
+    (goto-char (coq-eglot-position))))
 
 ;;; Edition before the proof position
 
@@ -1048,7 +1104,11 @@ come from the prefix argument, see `coq-eglot--query-flags'."
                                        nil)
                         nil 'coq-eglot--query-history)
            flags)))
-  (coq-eglot--activate)
+  (coq-eglot--with-script
+    (coq-eglot--query command flags)))
+
+(defun coq-eglot--query (command flags)
+  "Run Coq COMMAND after FLAGS, see `coq-eglot-query'."
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
@@ -1089,6 +1149,9 @@ the commands setting them." command)
 (coq-eglot--define-query coq-eglot-Check "Check" "Check")
 (coq-eglot--define-query coq-eglot-Search "Search"
                          "Search (ex: \"eq_\" eq -bool)")
+(coq-eglot--define-query coq-eglot-SearchPattern "SearchPattern"
+                         "SearchPattern (parenthesis mandatory), ex: (?X1 + _ = _ + ?X1)")
+(coq-eglot--define-query coq-eglot-Print "Print" "Print")
 
 ;;; Hover
 
@@ -1121,10 +1184,13 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-c" #'coq-eglot-interrupt
   "C-c C-x" #'coq-eglot-exit
   "C-c C-p" #'coq-eglot-show-goals
+  "C-c C-l" #'coq-eglot-layout-windows
   "C-c C-." #'coq-eglot-goto-end-of-locked
   "C-c C-a C-a" #'coq-eglot-Search
   "C-c C-a C-b" #'coq-eglot-About
   "C-c C-a C-c" #'coq-eglot-Check
+  "C-c C-a C-o" #'coq-eglot-SearchPattern
+  "C-c C-a C-p" #'coq-eglot-Print
   "C-c C-v" #'coq-eglot-query)
 
 (easy-menu-define coq-eglot-menu coq-eglot-mode-map
@@ -1138,6 +1204,7 @@ Run when Eglot starts or stops managing the buffer."
     ["Goto End of Locked" coq-eglot-goto-end-of-locked]
     "---"
     ["Show Goals" coq-eglot-show-goals]
+    ["Layout Windows" coq-eglot-layout-windows]
     ["Conclusion Apart" coq-eglot-toggle-split-goals
      :style toggle :selected coq-eglot-split-goals]
     ["Compile Before Require" coq-compile-before-require-toggle
@@ -1146,6 +1213,8 @@ Run when Eglot starts or stops managing the buffer."
      ["About..." coq-eglot-About]
      ["Check..." coq-eglot-Check]
      ["Search..." coq-eglot-Search]
+     ["SearchPattern..." coq-eglot-SearchPattern]
+     ["Print..." coq-eglot-Print]
      ["Other Command..." coq-eglot-query]
      "---"
      ["About with Printing All..."
@@ -1158,12 +1227,18 @@ Run when Eglot starts or stops managing the buffer."
       ["About..." (coq-eglot--call-with-prefix #'coq-eglot-About '(16))]
       ["Check..." (coq-eglot--call-with-prefix #'coq-eglot-Check '(16))]
       ["Search..." (coq-eglot--call-with-prefix #'coq-eglot-Search '(16))]
+      ["SearchPattern..."
+       (coq-eglot--call-with-prefix #'coq-eglot-SearchPattern '(16))]
+      ["Print..." (coq-eglot--call-with-prefix #'coq-eglot-Print '(16))]
       ["Other Command..."
        (coq-eglot--call-with-prefix #'coq-eglot-query '(16))]))
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
     ["Exit Server" coq-eglot-exit]))
+
+;; the same keys in the goals and response buffers, like Proof General
+(set-keymap-parent coq-eglot-output-mode-map coq-eglot-mode-map)
 
 (defun coq-eglot--lighter ()
   "Mode line indicator of `coq-eglot-mode'.

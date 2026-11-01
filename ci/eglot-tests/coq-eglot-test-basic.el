@@ -267,6 +267,60 @@ Like in Proof General, \\[universal-argument] means Printing All."
     (should (string-match-p "^l: forall n : nat, double n = n \\+ n /\\\\ True"
                             (query #'coq-eglot-Search "double")))))
 
+(ert-deftest coq-eglot-print-and-search-pattern ()
+  "Print and SearchPattern, on C-c C-a C-p and C-c C-a C-o like in
+Proof General."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (should (string-match-p "\\`double = fun n : nat => n \\+ n"
+                            (query #'coq-eglot-Print "double")))
+    (should (string-match-p "^l: forall n : nat, double n = n \\+ n /\\\\ True"
+                            (query #'coq-eglot-SearchPattern
+                                   "(double _ = _ /\\ _)")))
+    (should (eq (key-binding (kbd "C-c C-a C-p")) #'coq-eglot-Print))
+    (should (eq (key-binding (kbd "C-c C-a C-o")) #'coq-eglot-SearchPattern))))
+
+(ert-deftest coq-eglot-commands-from-output-buffers ()
+  "The keys of the script buffer work in the goals and response
+buffers, on the active script buffer, like in Proof General."
+  (with-test-file
+    (goto-marker "definition")
+    (run #'coq-eglot-goto-point)
+    (let ((script (current-buffer)))
+      (with-current-buffer "*goals*"
+        (should (eq (key-binding (kbd "C-c C-n"))
+                    #'coq-eglot-assert-next-command))
+        ;; not the keys of special-mode: q does not close the window
+        (should-not (eq (key-binding "q") #'quit-window))
+        (should-not (eq (key-binding "g") #'revert-buffer))
+        (should buffer-read-only)
+        (coq-eglot-assert-next-command))
+      (wait-for-coq)
+      (should (position-at-marker-p "statement"))
+      (with-current-buffer "*goals*"
+        (coq-eglot-undo-last-command))
+      (wait-for-coq)
+      (should (position-at-marker-p "definition"))
+      ;; queries read their argument in the output buffer
+      (with-current-buffer "*response*"
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "double"))
+        (goto-char (point-min))
+        (should (string-match-p "\\`double : nat -> nat"
+                                (query-interactively #'coq-eglot-About nil
+                                                     "double"))))
+      (with-current-buffer "*goals*"
+        (coq-eglot-goto-end-of-locked)
+        (should (eq (current-buffer) script))
+        (should (= (point) (coq-eglot-position))))))
+  ;; no active script buffer: nothing to act on
+  (with-temp-buffer
+    (coq-eglot-goals-mode)
+    (let ((coq-eglot--active-buffer nil))
+      (should-error (coq-eglot-assert-next-command) :type 'user-error))))
+
 (defun face-of (buffer text)
   "Face of the first occurrence of TEXT in BUFFER, after fontification."
   (with-current-buffer buffer
@@ -366,6 +420,30 @@ the remaining height."
         (when buffer
           (mapc #'delete-window (get-buffer-window-list buffer nil t))
           (kill-buffer buffer))))))
+
+(ert-deftest coq-eglot-layout-windows ()
+  "C-c C-l displays the closed goals and response windows again, with
+their default width, like in Proof General."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (let ((script (current-buffer)))
+      (switch-to-buffer script)
+      (delete-window (get-buffer-window "*goals*"))
+      (let ((response (get-buffer-window "*response*")))
+        (window-resize response (- 10 (window-total-width response)) t))
+      (should (eq (key-binding (kbd "C-c C-l")) #'coq-eglot-layout-windows))
+      (coq-eglot-layout-windows)
+      (should (get-buffer-window "*goals*"))
+      (should (eq (window-buffer (selected-window)) script))
+      ;; half of the frame
+      (should (< (abs (- (window-total-width (get-buffer-window "*response*"))
+                         (/ (frame-width) 2)))
+                 3))
+      ;; from the goals buffer, the selected window stays there
+      (select-window (get-buffer-window "*goals*"))
+      (coq-eglot-layout-windows)
+      (should (eq (window-buffer (selected-window)) (get-buffer "*goals*"))))))
 
 (defun locked-face ()
   "Face of the processed part of the current buffer.

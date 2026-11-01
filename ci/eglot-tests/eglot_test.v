@@ -7,7 +7,7 @@
 
 Definition double (n : nat) := n + n. (* marker definition *)
 
-Lemma l : forall n, double n = n + n /\ True.
+Lemma l : forall n, double n = n + n /\ True. (* marker statement *)
 Proof.
   intros n. split. (* marker split *)
   - idtac "hello". (* marker hello *)
