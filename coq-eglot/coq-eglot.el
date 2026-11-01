@@ -1021,11 +1021,43 @@ for a cancelled request."
                             (coq-eglot--failed-request err)))))))
 
 (defun coq-eglot--stop ()
-  "Mark the running check as finished."
-  (when coq-eglot--running
-    (set-marker (plist-get coq-eglot--running :target) nil)
-    (setq coq-eglot--running nil))
-  (coq-eglot--update-overlays))
+  "Mark the running check as finished.
+Return the position the user asked to go to meanwhile, if any, see
+`coq-eglot--queue'."
+  (let ((then nil))
+    (when coq-eglot--running
+      (set-marker (plist-get coq-eglot--running :target) nil)
+      (let ((marker (plist-get coq-eglot--running :then)))
+        (when marker
+          (setq then (marker-position marker))
+          (set-marker marker nil)))
+      (setq coq-eglot--running nil))
+    (coq-eglot--update-overlays)
+    then))
+
+(defun coq-eglot--queue (target)
+  "Extend the running check up to the sentence before TARGET.
+Like the queue of Proof General: the part being checked grows at once,
+the check of the rest starts when the running one is finished, unless
+it fails.  The running request is not replaced: cancelling it could
+interrupt Coq.  Signal an error if TARGET is not after the part being
+checked: moving back while checking is not possible."
+  (let ((end (plist-get coq-eglot--running :target)))
+    (when (<= target end)
+      (coq-eglot--check-busy))
+    (set-marker end (max target
+                         (coq-eglot--guess-end
+                          (1- (coq-eglot--skip-backward target)))))
+    (let ((then (plist-get coq-eglot--running :then)))
+      (if then
+          (set-marker then target)
+        (plist-put coq-eglot--running :then (copy-marker target))))
+    (coq-eglot--update-overlays)))
+
+(defun coq-eglot--continue (then)
+  "Process up to THEN, the position asked during the last check, if any."
+  (when then
+    (coq-eglot--advance then)))
 
 (defun coq-eglot--fail (start end text answer)
   "The sentence between START and END failed with error TEXT.
@@ -1107,8 +1139,8 @@ Compile first the libraries it requires, if any."
 (defun coq-eglot--next-done (answer)
   "Handle ANSWER of the server for the sentence after the proof position."
   (let* ((range (plist-get answer :range))
-         (bounds (and range (coq-eglot-lsp-range range))))
-    (coq-eglot--stop)
+         (bounds (and range (coq-eglot-lsp-range range)))
+         (then (coq-eglot--stop)))
     (cond
      ((null bounds) nil)
      ((plist-get answer :error)
@@ -1116,7 +1148,8 @@ Compile first the libraries it requires, if any."
                        nil))
      (t
       (coq-eglot--set-position (cdr bounds) answer)
-      (coq-eglot--show-answer answer)))))
+      (coq-eglot--show-answer answer)
+      (coq-eglot--continue then)))))
 
 (defun coq-eglot--advance (target)
   "Process the sentences up to the one containing the character before TARGET.
@@ -1153,8 +1186,8 @@ failed, or nil.  It is reported after the check."
 Stop at the first error, or ask the goals after the last sentence.
 FAILED is the start of a Require sentence after LAST whose compilation
 failed, reported if there was no error before."
-  (coq-eglot--stop)
-  (let ((error (coq-eglot-lsp-error-range start (1+ last))))
+  (let ((then (coq-eglot--stop))
+        (error (coq-eglot-lsp-error-range start (1+ last))))
     (if error
         ;; the sentence that failed and its error message
         (let* ((answer (coq-eglot-lsp-goals (car error)))
@@ -1167,8 +1200,9 @@ failed, reported if there was no error before."
         (when range
           (coq-eglot--set-position (cdr (coq-eglot-lsp-range range)) answer)
           (coq-eglot--show-answer answer))
-        (when failed
-          (coq-eglot--compilation-failed failed))))))
+        (if failed
+            (coq-eglot--compilation-failed failed)
+          (coq-eglot--continue then))))))
 
 ;;; Moving back
 
@@ -1183,11 +1217,18 @@ A sentence ending exactly at POS stays processed.  Display the goals."
 ;;; Commands
 
 (defun coq-eglot-assert-next-command ()
-  "Process the next sentence."
+  "Process the next sentence.
+During a check, the sentence after the part being checked, see
+`coq-eglot--queue'."
   (interactive)
   (coq-eglot--with-script
-    (coq-eglot--check-busy)
-    (coq-eglot--next)))
+    (if (not coq-eglot--running)
+        (coq-eglot--next)
+      ;; the sentence after the part being checked
+      (let ((start (coq-eglot--skip-forward
+                    (plist-get coq-eglot--running :target))))
+        (when (< start (point-max))
+          (coq-eglot--queue (coq-eglot--guess-end start)))))))
 
 (defun coq-eglot-undo-last-command ()
   "Move the proof position back one sentence."
@@ -1203,20 +1244,22 @@ A sentence ending exactly at POS stays processed.  Display the goals."
 (defun coq-eglot-goto-point ()
   "Move the proof position to the sentence at point.
 Process the sentences up to the one containing point, or move back to
-the end of the last sentence before point."
+the end of the last sentence before point.  During a check, only
+forward, after the part being checked, see `coq-eglot--queue'."
   (interactive)
   (coq-eglot--with-script
-    (coq-eglot--check-busy)
-    (if (< (point) (coq-eglot-position))
-        (coq-eglot--retract (point))
-      (coq-eglot--advance (point)))))
+    (cond
+     (coq-eglot--running (coq-eglot--queue (point)))
+     ((< (point) (coq-eglot-position)) (coq-eglot--retract (point)))
+     (t (coq-eglot--advance (point))))))
 
 (defun coq-eglot-process-buffer ()
-  "Process the whole buffer."
+  "Process the whole buffer, also during a check, see `coq-eglot--queue'."
   (interactive)
   (coq-eglot--with-script
-    (coq-eglot--check-busy)
-    (coq-eglot--advance (point-max))))
+    (if coq-eglot--running
+        (coq-eglot--queue (point-max))
+      (coq-eglot--advance (point-max)))))
 
 (defun coq-eglot-retract-buffer ()
   "Move the proof position to the beginning of the buffer."

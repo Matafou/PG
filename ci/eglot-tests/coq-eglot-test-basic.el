@@ -875,6 +875,42 @@ edited sentence and the goals are displayed when the server is ready."
                             (buffer-substring (point-min) (coq-eglot-position))))
     (should (string-match-p "\\`1 goal" (buffer-text "*goals*")))))
 
+(ert-deftest coq-eglot-queue ()
+  "Moving forward during a check extends it, like the queue of Proof
+General: the rest is checked after, unless the check fails."
+  (with-test-file
+    (goto-marker "definition")
+    (coq-eglot-goto-point)
+    (should coq-eglot--running)
+    (coq-eglot-assert-next-command)
+    ;; the part being checked grows at once
+    (should (>= (plist-get coq-eglot--running :target)
+                (save-excursion (goto-marker "statement") (point))))
+    (wait-for-coq)
+    (should (position-at-marker-p "statement"))
+    ;; up to point
+    (coq-eglot-assert-next-command)
+    (goto-marker "split")
+    (coq-eglot-goto-point)
+    (wait-for-coq)
+    (should (position-at-marker-p "split"))
+    (should (string-match-p "n : nat" (buffer-text "*goals*")))
+    ;; moving back during a check is not possible, the check goes on
+    (let ((before (coq-eglot-position)))
+      (coq-eglot-assert-next-command)
+      (goto-marker "definition")
+      (should-error (coq-eglot-goto-point) :type 'user-error)
+      (wait-for-coq)
+      (should (> (coq-eglot-position) before)))
+    ;; an error drops the rest
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (coq-eglot-assert-next-command)
+    (coq-eglot-process-buffer)
+    (wait-for-coq)
+    (should (position-at-marker-p "before error"))
+    (should (string-match-p "unknown_lemma" (buffer-text "*response*")))))
+
 (ert-deftest coq-eglot-interrupt ()
   "Interrupting a check leaves the proof position where the server was.
 The next command works."
