@@ -342,6 +342,10 @@ Set to t if you want this feature, but note that it is deprecated."
                (cl-every 'stringp (cdr entry))
                (equal (length entry) 3))
           (and (listp entry)
+               (eq (car entry) 'package)
+               (cl-every 'stringp (cdr entry))
+               (equal (length entry) 2))
+          (and (listp entry)
                (eq (car entry) 'ocamlimport)
                (cl-every 'stringp (cdr entry))
                (equal (length entry) 2))
@@ -362,6 +366,8 @@ forms of include options (`-I' `-Q' and `-R').  An element can be
 
   - A list of the form `(\\='ocamlimport dir)', specifying (in 8.5) a
     directory to be added to Ocaml path (`-I').
+  - A list of the form `(\\='package name)', specifying (since 9.3) a
+    ocamlfind package with Rocq files.
   - A list of the form `(\\='rec dir path)' (where dir and path are
     strings) specifying a directory to be recursively mapped to the
     logical path `path' (`-R dir path').
@@ -395,6 +401,10 @@ not the same (-I is for Coq path)."
                                (const recnoimport)
                                (string :tag "directory")
                                (string :tag "log path"))
+                         (list :tag
+                               "ocamlfind package for Rocq"
+                               (const package)
+                               (string :tag "name"))
                          (list :tag
                                "compatibility for of -I (-I ... -as ... in coq<=8.4)"
                                (const nonrec)
@@ -445,6 +455,8 @@ request compatibility handling of flags."
        (list "-Q" (expand-file-name dir) ""))
       (`(ocamlimport ,dir)
        (list "-I" (expand-file-name dir)))
+      (`(package ,name)
+       (list "-package" name))
       (`(recnoimport ,dir ,alias)
        (list "-Q" (expand-file-name dir) alias))
       ((or `(rec ,dir ,alias) `(,dir ,alias))
@@ -699,6 +711,7 @@ the next double quote; there is no escape character."
   '(("-R" . 2)
     ("-Q" . 2)
     ("-I" . 1)
+    ("-package" . 1)
     ("-arg" . 1)
     ("-opt" . 0)
     ("-byte" . 0)))
@@ -747,6 +760,8 @@ coqtop.  But -arg \"\\='a b\\='\" means to pass a and b together."
   (pcase option
     (`("-I" ,path)
      (list 'ocamlimport (expand-file-name path base-directory)))
+    (`("-package" ,name)
+     (list 'package name))
     (`("-R" ,path ,alias)
      (list 'rec (expand-file-name path base-directory) alias))
     (`("-Q" ,path ,alias)
@@ -846,21 +861,33 @@ Does nothing if `coq-use-project-file' is nil."
 ;; different options). We first detect executables (taking
 ;; proof-prog-name-ask into account), then elaborate the
 ;; proof-prog-args. Note: we don't support proof-prog-name-guess
+(defun coq--user-set-p (symbol)
+  "Return non-nil if the user set option SYMBOL with customize."
+  (or (get symbol 'saved-value) (get symbol 'customized-value)))
+
 (add-hook 'proof-shell-before-process-hook
           (lambda ()
-            ;; detect executables unless explicitely set by hand. In
-            ;; this case we try to find coqdep and coqc in the same
-            ;; directory
-            (if (and proof-prog-name-ask proof-prog-name)
+            ;; detect executables unless explicitely set by hand,
+            ;; with proof-prog-name-ask or by customizing them. When
+            ;; the prover is set by hand, we try to find coqdep and
+            ;; coqc in the same directory
+            (if (and (or proof-prog-name-ask (coq--user-set-p 'coq-prog-name))
+                     proof-prog-name)
                 ;; let us find other executables in the exact same
                 ;; place. TODO: go back to default exec-path if not found?
-                (let ((exec-path (list (file-name-directory proof-prog-name))))
-                  (setq coq-compiler (executable-find (coq-detect-coqc)))
-                  (setq coq-dependency-analyzer (executable-find (coq-detect-coqdep))))
+                (let ((exec-path (if (file-name-directory proof-prog-name)
+                                     (list (file-name-directory proof-prog-name))
+                                   exec-path)))
+                  (unless (coq--user-set-p 'coq-compiler)
+                    (setq coq-compiler (executable-find (coq-detect-coqc))))
+                  (unless (coq--user-set-p 'coq-dependency-analyzer)
+                    (setq coq-dependency-analyzer (executable-find (coq-detect-coqdep)))))
               ;; default: detect everything from the current exec-path
               (setq proof-prog-name (coq-autodetect-progname))
-              (setq coq-compiler (coq-detect-coqc))
-              (setq coq-dependency-analyzer (coq-detect-coqdep)))
+              (unless (coq--user-set-p 'coq-compiler)
+                (setq coq-compiler (coq-detect-coqc)))
+              (unless (coq--user-set-p 'coq-dependency-analyzer)
+                (setq coq-dependency-analyzer (coq-detect-coqdep))))
             (when coq-debug
               (message "coq-proof-prog-name: %S" proof-prog-name)
               (message "coq-dependency-analyzer: %S"  coq-dependency-analyzer)

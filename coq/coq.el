@@ -1784,16 +1784,6 @@ at `proof-assistant-settings-cmds' evaluation time.")
 
 
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;
-;; Holes mode switch
-;; TODO: have this plugged agian when we have abbreviation without holes
-;; For now holes are always enabled.
-;(defpacustom use-editing-holes t
-;  "Enable holes for editing."
-;  :type 'boolean)
-
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;   Configuring proof and pbp mode and setting up various utilities  ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2046,7 +2036,6 @@ shortly before `proof-assert-command-hook', respectively,
    proof-shell-restart-cmd coq-shell-restart-cmd
    pg-subterm-anns-use-stack t)
 
-  ;; (holes-mode 1)  da: does the shell really need holes mode on?
   (setq proof-shell-font-lock-keywords 'coq-font-lock-keywords-1)
 
   ;; prooftree config
@@ -2839,13 +2828,10 @@ Goals that are marked as \"only printing\" are ignored."
              ;; NOTE: Adding braces would be great, but it messes up indentation.
              (format-selector (lambda (name) (format "[%s]: #." name)))
              (goal-selectors (cl-mapcar format-selector goal-names))
-             (snippet (string-join goal-selectors "\n"))
-             (snippet (coq-insert-template snippet)))
-        (message "%s" goal-names)
+             (snippet (string-join goal-selectors "\n")))
         (if (equal goal-selectors nil)
             (error "Couldn't find any named goals")
-          (let ((start (point)))
-            (if coq-use-yasnippet (yas-expand-snippet snippet) (insert snippet))))))))
+          (coq-insert-template snippet))))))
 
 (defun coq-insert-match ()
   "Insert a match expression from a type name by Show Match.
