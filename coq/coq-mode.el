@@ -37,6 +37,7 @@
 (require 'coq-syntax)                   ;For font-lock-keywords
 (require 'pg-double-hit)
 (require 'coq-queries)                  ; common to all backends
+(require 'coq-templates)                ; abbrevs and yasnippets, idem
 
 (defgroup coq-mode ()
   "Major mode to edit Coq code."
@@ -180,6 +181,10 @@ and `proof-double-hit-enable'.  Bind another key to this command in
     (define-key map (kbd "C-c C-a C-l") #'coq-LocateConstant)
     (define-key map (kbd "C-c C-a C-n") #'coq-LocateNotation)
     (define-key map (kbd "C-c C-a h") #'coq-PrintHint)
+    ;; Insertions built from a query, see `coq-query-result-function'.
+    (define-key map (kbd "C-c C-a C-i") #'coq-insert-intros)
+    (define-key map (kbd "C-c C-a C-m") #'coq-insert-match)
+    (define-key map (kbd "C-c C-a C-g") #'coq-insert-named-goal-selectors)
     map)
   "Keymap for `coq-mode'.")
 
@@ -316,6 +321,9 @@ Near here means PT is either inside or just aside of a comment."
 
   ;; we can cope with nested comments
   (set (make-local-variable 'comment-quote-nested) nil)
+
+  ;; abbrevs and yasnippet templates, in all backends
+  (coq-templates-setup)
 
   ;; Setup the interface to Coq.
   (pcase coq-backend
