@@ -36,6 +36,7 @@
 (require 'coq-smie)
 (require 'coq-syntax)                   ;For font-lock-keywords
 (require 'pg-double-hit)
+(require 'coq-queries)                  ; common to all backends
 
 (defgroup coq-mode ()
   "Major mode to edit Coq code."
@@ -88,15 +89,6 @@ Obsolete, use `coq-backend' instead."
   :type 'boolean)
 (make-obsolete-variable 'coq-use-pg 'coq-backend "4.6")
 
-;; The double hit is generic, see pg-double-hit.el.  Here for both
-;; backends.
-(define-obsolete-variable-alias 'coq-double-hit-enable
-  'proof-double-hit-enable "4.6")
-(define-obsolete-variable-alias 'coq-double-hit-delay
-  'proof-double-hit-delay "4.6")
-(define-obsolete-function-alias 'coq-double-hit-toggle
-  #'proof-double-hit-toggle "4.6")
-
 (defcustom coq-backend (if (with-no-warnings coq-use-pg) 'pg nil)
   "Backend used by `coq-mode' to interact with Coq.
 - `pg': the Proof General backend, running Coq in a shell.
@@ -124,6 +116,34 @@ has no effect until Emacs is restarted."
   (require 'coq-eglot)
   (coq-eglot-setup))
 
+;; The double hit is generic, see pg-double-hit.el.  Here for both
+;; backends.
+(define-obsolete-variable-alias 'coq-double-hit-enable
+  'proof-double-hit-enable "4.6")
+(define-obsolete-variable-alias 'coq-double-hit-delay
+  'proof-double-hit-delay "4.6")
+(define-obsolete-function-alias 'coq-double-hit-toggle
+  #'proof-double-hit-toggle "4.6")
+
+(defvar-local coq-terminator-insert-function nil
+  "Function called by `coq-terminator-insert' with the prefix argument.
+Each backend sets it.  If nil, the terminator is just inserted.")
+
+(defun coq-terminator-insert (&optional count)
+  "Insert the key typed, COUNT times, it is supposed to be a terminator.
+What happens next depends on the backend, typically the electric
+terminator and the double hit, see `proof-electric-terminator-enable'
+and `proof-double-hit-enable'.  Bind another key to this command in
+`coq-mode-map' to use it in all backends.  On a double hit of that key,
+\".\" replaces it, for instance:
+  (define-key coq-mode-map (kbd \";\") #\='coq-terminator-insert)"
+  (interactive "P")
+  (if coq-terminator-insert-function
+      (funcall coq-terminator-insert-function count)
+    (self-insert-command (prefix-numeric-value count))))
+
+(put 'coq-terminator-insert 'delete-selection t)
+
 ;; prettify is in emacs > 24.4
 (defvar prettify-symbols-alist)
 
@@ -148,8 +168,23 @@ has no effect until Emacs is restarted."
 
 (defvar coq-mode-map
   (let ((map (make-sparse-keymap)))
+    ;; In all backends, see `coq-terminator-insert-function'.
+    (define-key map (kbd ".") #'coq-terminator-insert)
+    ;; Queries, in all backends, see `coq-query-function'.
+    (define-key map (kbd "C-c C-a C-a") #'coq-Search)
+    (define-key map (kbd "C-c C-a C-b") #'coq-About)
+    (define-key map (kbd "C-c C-a C-c") #'coq-Check)
+    (define-key map (kbd "C-c C-a C-o") #'coq-SearchIsos)
+    (define-key map (kbd "C-c C-a C-p") #'coq-Print)
+    (define-key map (kbd "C-c C-a C-q") #'coq-query)
+    (define-key map (kbd "C-c C-a C-l") #'coq-LocateConstant)
+    (define-key map (kbd "C-c C-a C-n") #'coq-LocateNotation)
+    (define-key map (kbd "C-c C-a h") #'coq-PrintHint)
     map)
   "Keymap for `coq-mode'.")
+
+;; The queries at mouse click, in all backends, see `coq-remap-mouse-1'.
+(coq-mouse-query-add-keymap coq-mode-map)
 
 (defvar coq-mode-syntax-table
   (let ((st (make-syntax-table)))
