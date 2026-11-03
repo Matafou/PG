@@ -3,8 +3,7 @@
  * width of their window.
  *)
 
-Lemma long_goal : forall (aaaaaaaa bbbbbbbbb : nat) (Hab : aaaaaaaa = aaaaaaaa)
-  (cccccccccc dddddddddd : nat)
+Lemma long_goal : forall (aaaaaaaa bbbbbbbbb cccccccccc dddddddddd : nat)
   (Hyp_with_long_name : aaaaaaaa + bbbbbbbbb + cccccccccc =
                         dddddddddd + aaaaaaaa + bbbbbbbbb + cccccccccc),
   aaaaaaaa + bbbbbbbbb * cccccccccc + dddddddddd =

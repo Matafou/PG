@@ -729,29 +729,43 @@ Without blanks at the end of its lines, see `coq-eglot--trim-lines'."
   (string-replace "\n" (concat "\n" indentation)
                   (coq-eglot--trim-lines text)))
 
+(defun coq-eglot--fill-names (names width)
+  "Join NAMES with commas, in lines of at most WIDTH characters.
+The lines after the first one are indented by 2, like Coq does.  Room
+is left for the comma or the colon after them."
+  (let ((lines nil) (line nil))
+    (dolist (name names)
+      (let ((candidate (if line (concat line ", " name) name)))
+        (if (or (null line) (<= (+ 2 (length candidate)) width))
+            (setq line candidate)
+          (push (concat line ",") lines)
+          (setq line name))))
+    (mapconcat #'identity (nreverse (cons line lines)) "\n  ")))
+
 (defun coq-eglot--format-hyp (hyp)
   "Format hypothesis HYP of a goal.
-Like Coq does: if it does not fit on one line, its type goes below its
-names, indented.  The text has the property `coq-eglot-hyp', the list
-of its names, and the part after the names the property
-`coq-eglot-hyp-body', to highlight and fold it, see
+Like Coq does: if it does not fit on one line, its names are on several
+lines, and its type goes below them, indented.  The text has the
+property `coq-eglot-hyp', the list of its names, and the part after the
+names the property `coq-eglot-hyp-body', to highlight and fold it, see
 `coq-eglot-toggle-highlight-hyp'."
   (let* ((names (append (plist-get hyp :names) nil))
-         (names-text (mapconcat #'identity names ", "))
+         ;; the lines must fit in the window, or in Coq's default width
+         (width (if coq-eglot--displayed-width
+                    (+ coq-eglot--displayed-width
+                       coq-eglot--hyp-indentation
+                       coq-eglot--printing-width-margin)
+                  78))
+         (names-text (coq-eglot--fill-names names (- width 2)))
+         (last-line (car (last (split-string names-text "\n"))))
          (def (and (plist-get hyp :def)
                    (coq-eglot--trim-lines (plist-get hyp :def))))
          (ty (coq-eglot--trim-lines (plist-get hyp :ty)))
          (one-line (concat (if def (concat " := " def) "") " : " ty))
          (body
-          ;; the server printed TY alone, without the names: the line
-          ;; must fit in the window, or in Coq's default width
+          ;; the server printed TY alone, without the names
           (if (and (not (string-search "\n" one-line))
-                   (<= (+ 2 (length names-text) (length one-line))
-                       (if coq-eglot--displayed-width
-                           (+ coq-eglot--displayed-width
-                              coq-eglot--hyp-indentation
-                              coq-eglot--printing-width-margin)
-                         78)))
+                   (<= (+ 2 (length last-line) (length one-line)) width))
               one-line
             (concat (if def
                         (concat " :=\n    " (coq-eglot--indent def "    ")

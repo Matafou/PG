@@ -1665,13 +1665,20 @@ window, for this query only."
 
 (ert-deftest coq-eglot-format-hyp ()
   "A hypothesis is formatted like Coq does: on one line if it fits,
-otherwise the type below the names."
+otherwise the names on several lines and the type below them."
   (let ((coq-eglot--displayed-width 21))  ; lines of 28 characters
     (should (equal (coq-eglot--format-hyp '(:names ["n" "m"] :ty "nat"))
                    "  n, m : nat"))
     (should (equal (coq-eglot--format-hyp
                     '(:names ["aaaaaaaa" "bbbbbbbb" "cccccccc"] :ty "nat"))
-                   "  aaaaaaaa, bbbbbbbb, cccccccc :\n    nat"))
+                   "  aaaaaaaa, bbbbbbbb,\n  cccccccc : nat"))
+    ;; room for the comma and the colon
+    (should (equal (coq-eglot--format-hyp
+                    '(:names ["aaaaaaaa" "bbbbbbbb" "ccccccc"] :ty "nat"))
+                   "  aaaaaaaa, bbbbbbbb,\n  ccccccc : nat"))
+    (should (equal (coq-eglot--format-hyp
+                    '(:names ["aaaaaaaaaaaa" "bbbbbbbbbbb"] :ty "nat"))
+                   "  aaaaaaaaaaaa,\n  bbbbbbbbbbb : nat"))
     (should (equal (coq-eglot--format-hyp
                     '(:names ["H"] :ty "aaaaaaaa + bbbbbbbb =\ncccccccc"))
                    "  H :\n    aaaaaaaa + bbbbbbbb =\n    cccccccc"))
