@@ -91,23 +91,6 @@ See `coq-eglot-split-goals'.  The default inherits from `shadow', which
 themes make visible on their background."
   :group 'coq-eglot)
 
-(defcustom coq-eglot-resize-windows-function
-  #'coq-eglot-resize-windows-by-priority
-  "Function adjusting the heights of the goals and response windows.
-Called without argument when their content changes.  If nil, the
-heights are the ones Emacs chooses."
-  :type '(choice (const :tag "Do not resize" nil)
-                 (function-item coq-eglot-resize-windows-by-priority)
-                 function)
-  :group 'coq-eglot)
-
-(defcustom coq-eglot-window-priorities '(conclusion goals response)
-  "Order in which the windows get the height they need.
-Used by `coq-eglot-resize-windows-by-priority'.  The goals window holds
-the whole goals, or only the hypotheses if `coq-eglot-split-goals'."
-  :type '(repeat (choice (const conclusion) (const goals) (const response)))
-  :group 'coq-eglot)
-
 (defcustom coq-eglot-split-goals nil
   "If non-nil, display the conclusion apart from the hypotheses.
 The hypotheses of the first goal stay in the goals buffer, its
@@ -518,8 +501,7 @@ They come back if closed, with their default sizes, see
       (when coq-eglot-split-goals
         (coq-eglot--display-buffer coq-eglot-conclusion-buffer-name
                                    #'coq-eglot-goals-mode))
-      (when coq-eglot-resize-windows-function
-        (funcall coq-eglot-resize-windows-function))
+      (coq-eglot--resize-windows)
       (coq-eglot--scroll-goals))
     (let ((window (get-buffer-window selected)))
       (when window (select-window window)))))
@@ -534,7 +516,7 @@ For the menu: OPTION is `proof-three-window-enable' or
 (defun coq-eglot--set-buffer-text (name mode text)
   "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
 Then adjust the heights of the windows, see
-`coq-eglot-resize-windows-function'.  Do nothing if called from a script
+`coq-optimise-resp-windows-enable'.  Do nothing if called from a script
 buffer that is not active: only the active one displays its state."
   (when (or (not coq-eglot-mode) (coq-eglot--active-p))
     (coq-eglot--set-buffer-text-1 name mode text)))
@@ -556,14 +538,13 @@ When the goals and the messages share a window (see
     ;; before resizing: folded, the other goals take one line
     (when (derived-mode-p 'coq-eglot-goals-mode)
       (coq-goals-fold-other-goals)))
-  (when coq-eglot-resize-windows-function
-    (funcall coq-eglot-resize-windows-function)))
+  (coq-eglot--resize-windows))
 
 (defun coq-eglot--allocate-heights (total needs minimum)
   "Share TOTAL lines between windows needing NEEDS lines.
 NEEDS lists the heights the windows need, by priority.  Each window
 gets at least MINIMUM lines, then by priority what it needs if there is
-enough left.  The last one gets what remains.  Return the list of
+enough left.  The first one gets what remains.  Return the list of
 heights in the same order, or nil if TOTAL is too small."
   (let ((rest (- total (* minimum (length needs)))))
     (when (and needs (>= rest 0))
@@ -572,7 +553,7 @@ heights in the same order, or nil if TOTAL is too small."
                                  (setq rest (- rest extra))
                                  (+ minimum extra)))
                              needs)))
-        (setcar (last heights) (+ (car (last heights)) rest))
+        (setcar heights (+ (car heights) rest))
         heights))))
 
 (defun coq-eglot--window-need (window)
@@ -581,20 +562,27 @@ heights in the same order, or nil if TOTAL is too small."
      (with-current-buffer (window-buffer window)
        (count-screen-lines (point-min) (point-max) nil window))))
 
+(defun coq-eglot--resize-windows ()
+  "Adjust the heights of the windows if `coq-optimise-resp-windows-enable'."
+  (when coq-optimise-resp-windows-enable
+    (coq-eglot-resize-windows-by-priority)))
+
 (defun coq-eglot-resize-windows-by-priority ()
   "Give the windows the height they need, by priority.
 The goals, conclusion and response windows displayed one above the
-other share their height: each one gets the height it needs in the
-order of `coq-eglot-window-priorities', the last one gets what remains.
-In three columns (see `proof-three-window-mode-policy'), only the
-windows of the same column.  The script window keeps its height."
+other share their height: each one gets the height it needs, the
+conclusion first, then the goals, then the response.  The first one
+gets what remains: the conclusion if `coq-eglot-split-goals', the
+hypotheses never get more than they need; the goals otherwise.  In
+three columns (see `proof-three-window-mode-policy'), only the windows
+of the same column.  The script window keeps its height."
   (let* ((names `((goals . ,coq-eglot-goals-buffer-name)
                   (conclusion . ,coq-eglot-conclusion-buffer-name)
                   (response . ,coq-eglot-response-buffer-name)))
          (windows (delq nil (mapcar (lambda (role)
                                       (get-buffer-window
                                        (cdr (assq role names))))
-                                    coq-eglot-window-priorities))))
+                                    '(conclusion goals response)))))
     (pcase-dolist (`(,_parent . ,column) (seq-group-by #'window-parent windows))
       (when (and (cdr column) (window-combined-p (car column)))
         (coq-eglot--resize-column column)))))
@@ -949,8 +937,7 @@ It stays there when scrolling.  Its color comes from the face
       ;; truncated to the width of the window
       (setq header-line-format
             (propertize (make-string 512 ?─) 'face 'coq-eglot-goals-separator))
-      (when coq-eglot-resize-windows-function
-        (funcall coq-eglot-resize-windows-function)))))
+      (coq-eglot--resize-windows))))
 
 (defun coq-eglot--set-mode-line (name visible)
   "Show the mode line of buffer NAME if VISIBLE, hide it otherwise."

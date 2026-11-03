@@ -109,11 +109,6 @@ These are appended at the end of `coq-shell-init-cmd'."
   :type '(repeat string)
   :group 'coq)
 
-(defcustom coq-optimise-resp-windows-enable t
-  "If non-nil (default) resize vertically response window after each command."
-  :type 'boolean
-  :group 'coq)
-
 ;; Default coq is only Private_ and _subproof
 (defcustom coq-search-blacklist-string ; add this? \"_ind\" \"_rect\" \"_rec\"
  "\"Private_\" \"_subproof\""

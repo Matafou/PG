@@ -54,6 +54,17 @@ at the width of the response window."
   :safe 'booleanp
   :group 'coq)
 
+(defcustom coq-optimise-resp-windows-enable t
+  "If non-nil (default), resize the goals and response windows to their content.
+After each command, the response window gets the height of its content,
+the goals window the rest, when they are one above the other.
+
+With Proof General, only in three windows mode.  With Eglot, when the
+conclusion is apart (see `coq-eglot-split-goals'), the hypotheses get
+the height they need too, the conclusion window gets the rest."
+  :type 'boolean
+  :group 'coq)
+
 (defface coq-other-goals-face '((t :inherit shadow))
   "Face of the line giving the number of the other goals.
 See `coq-fold-other-goals'."

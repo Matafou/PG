@@ -460,9 +460,9 @@ buffers, on the active script buffer, like in Proof General."
         (setq coq-eglot-split-goals nil)))))
 
 (ert-deftest coq-eglot-allocate-heights ()
-  "Windows get the height they need by priority, the last one the rest."
+  "Windows get the height they need by priority, the first one the rest."
   ;; enough for everybody
-  (should (equal (coq-eglot--allocate-heights 30 '(5 6 4) 4) '(5 6 19)))
+  (should (equal (coq-eglot--allocate-heights 30 '(5 6 4) 4) '(20 6 4)))
   ;; the first one takes what it needs, the others their minimum
   (should (equal (coq-eglot--allocate-heights 30 '(40 6 4) 4) '(22 4 4)))
   (should (equal (coq-eglot--allocate-heights 30 '(10 40 4) 4) '(10 16 4)))
@@ -470,8 +470,37 @@ buffers, on the active script buffer, like in Proof General."
   (should-not (coq-eglot--allocate-heights 10 '(5 6 4) 4)))
 
 (ert-deftest coq-eglot-resize-windows ()
-  "With split goals, the conclusion gets its height first, the response
-the remaining height."
+  "The response window gets the height it needs, the goals window the
+rest, like with `coq-optimise-resp-windows-enable' in Proof General."
+  (with-test-file
+    (with-layout t 'hybrid
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (query #'coq-eglot-run-query "Check double")
+      (let ((goals (get-buffer-window "*goals*"))
+            (response (get-buffer-window "*response*")))
+        (should (and goals response))
+        (should (= (window-total-height response)
+                   (max window-min-height (coq-eglot--window-need response))))
+        (should (> (window-total-height goals) (coq-eglot--window-need goals)))))))
+
+(ert-deftest coq-eglot-resize-windows-off ()
+  "Without `coq-optimise-resp-windows-enable', the heights of the windows
+do not change."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((coq-optimise-resp-windows-enable nil)
+            (calls 0))
+        (cl-letf (((symbol-function 'coq-eglot-resize-windows-by-priority)
+                   (lambda () (setq calls (1+ calls)))))
+          (goto-marker "split")
+          (run #'coq-eglot-goto-point)
+          (query #'coq-eglot-run-query "Check double"))
+        (should (= calls 0))))))
+
+(ert-deftest coq-eglot-resize-windows-split ()
+  "With split goals, the conclusion gets its height first, and the rest,
+the hypotheses and the response window the height they need."
   (with-test-file
     (unwind-protect
         (progn
@@ -482,13 +511,17 @@ the remaining height."
                 (conclusion (get-buffer-window "*conclusion*"))
                 (response (get-buffer-window "*response*")))
             (should (and goals conclusion response))
-            ;; the height it needs, the other goal folded (batch mode
-            ;; ignores the display property in this computation)
-            (should (= (window-total-height conclusion)
-                       (coq-eglot--window-need conclusion)))
-            ;; 3 lines and a mode line, the minimal height
-            (should (= (window-total-height goals) window-min-height))
-            (should (> (window-total-height response) window-min-height))))
+            ;; at least the height it needs, the other goal folded
+            ;; (batch mode ignores the display property in this
+            ;; computation)
+            (should (>= (window-total-height conclusion)
+                        (coq-eglot--window-need conclusion)))
+            ;; the hypotheses: never more than they need
+            (should (= (window-total-height goals)
+                       (max window-min-height (coq-eglot--window-need goals))))
+            (should (= (window-total-height response)
+                       (max window-min-height
+                            (coq-eglot--window-need response))))))
       (setq coq-eglot-split-goals nil)
       (let ((buffer (get-buffer "*conclusion*")))
         (when buffer
