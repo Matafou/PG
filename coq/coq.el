@@ -63,6 +63,7 @@
 (require 'pg-double-hit)                ; double hit electric terminator
 
 (defvar prettify-symbols-alist)
+(declare-function yas-expand-snippet "yasnippet")
 
 
 ;; ----- coq-shell configuration options

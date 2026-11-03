@@ -33,6 +33,7 @@
 (defvar coq-one-command-per-line)
 (declare-function coq-highlight-hyps-cited-in-response "coq")
 (declare-function coq-terminator-insert "coq-mode")
+(declare-function yas-expand-snippet "yasnippet")
 
 (defvar-local coq-query-function nil
   "Function running a query, set by each Coq backend.
