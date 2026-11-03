@@ -264,6 +264,61 @@ Like in Proof General, \\[universal-argument] means Printing All."
     (should (string-match-p "\\`0 = 0"
                             (query #'coq-run-query "Check 0 = 0")))))
 
+(ert-deftest coq-eglot-query-flags-by-name ()
+  "With \\[universal-argument] \\[universal-argument], the printing flags
+are chosen by name, like in Proof General."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (cl-letf (((symbol-function 'completing-read-multiple)
+               (lambda (&rest _) '("Implicit" "No Notations"))))
+      (should (string-match-p "\\`@eq nat 0 0"
+                              (query-interactively #'coq-Check '(16)
+                                                   "0 = 0"))))))
+
+(ert-deftest coq-eglot-query-result ()
+  "`coq-query-result' returns the answer of a query, nil on an error."
+  (with-test-file
+    (should (eq coq-query-result-function #'coq-eglot-query-result))
+    (should-not (coq-query-result "Check 0"))
+    (goto-marker "definition")
+    (run #'coq-eglot-goto-point)
+    (should (string-match-p "double\\s-*:\\s-*nat -> nat"
+                            (coq-query-result "Check double")))
+    (should-not (coq-query-result "Check unknown_identifier"))
+    ;; nothing displayed
+    (should-not (string-match-p "nat -> nat" (buffer-text "*response*")))))
+
+(ert-deftest coq-eglot-insert-intros ()
+  "`coq-insert-intros' inserts the names given by Show Intros, like in
+Proof General."
+  (with-test-file
+    (goto-marker "statement")
+    (run #'coq-eglot-goto-point)
+    (should (eq (key-binding (kbd "C-c C-a C-i")) #'coq-insert-intros))
+    (let ((position (coq-eglot-position))
+          (proof-double-hit-enable nil))
+      (coq-insert-intros)
+      (should (looking-back "intros n\\." (line-beginning-position)))
+      ;; inserted after the proof position, which does not move
+      (should (= (coq-eglot-position) position)))))
+
+(ert-deftest coq-eglot-insert-match ()
+  "`coq-insert-match' inserts the match given by Show Match, like in Proof
+General."
+  (with-test-file
+    (goto-marker "definition")
+    (run #'coq-eglot-goto-point)
+    (forward-line 1)
+    (let ((coq-use-yasnippet nil)
+          (start (point)))
+      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "nat")))
+        (coq-insert-match))
+      (let ((text (buffer-substring start (point-max))))
+        (should (string-match-p "match\\s-+with" text))
+        (should (string-match-p "| O =>" text))
+        (should (string-match-p "| S [[:alnum:]_]+ =>" text))))))
+
 (ert-deftest coq-eglot-search ()
   "Search finds the lemmas proved before the proof position."
   (with-test-file

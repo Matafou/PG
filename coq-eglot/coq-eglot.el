@@ -356,7 +356,8 @@ Read-only, with the keys of the script buffer, but not those of
 window.  Queries run on the active script buffer."
   :syntax-table coq-mode-syntax-table   ; for `coq-id-at-point'
   (setq buffer-read-only t)
-  (setq coq-query-function #'coq-eglot-run-query))
+  (setq coq-query-function #'coq-eglot-run-query)
+  (setq coq-query-result-function #'coq-eglot-query-result))
 
 (define-derived-mode coq-eglot-goals-mode coq-eglot-output-mode "Coq Goals"
   "Major mode for the goals of the Eglot backend of Coq."
@@ -1459,6 +1460,23 @@ for the Eglot backend."
          (coq-eglot--highlight-cited-hyps messages))
        (when then (funcall then))))))
 
+(defun coq-eglot-query-result (command)
+  "Run Coq COMMAND at the proof position and return its answer.
+Wait for it, display nothing.  Return nil if Coq answers an error, or
+outside of the processed part.  This is `coq-query-result-function'
+for the Eglot backend, used by the insertions built from a query, like
+`coq-insert-intros'."
+  (coq-eglot--with-script
+    (when (> (coq-eglot-position) (point-min))
+      (condition-case nil
+          (string-join (coq-eglot-lsp-query
+                        (1- (coq-eglot-position))
+                        (if (string-match-p "\\.[ \t\n]*\\'" command)
+                            command
+                          (concat command ".")))
+                       "\n")
+        (jsonrpc-error nil)))))
+
 (defun coq-eglot-query (command &optional flags)
   "Run Coq COMMAND at the proof position, read in the minibuffer.
 With \\[universal-argument], with Printing All.  FLAGS are the commands
@@ -1610,6 +1628,11 @@ Run when Eglot starts or stops managing the buffer."
      ["About with Printing All..." coq-About-with-all]
      ["Check with Printing All..." coq-Check-show-all]
      ["Print with Printing All..." coq-Print-with-all])
+    ("Insert"
+     ["Intros (smart)" coq-insert-intros
+      :help "Insert \"intros h1 .. hn.\" where hi are the default names given by Coq."]
+     ["Match (smart)" coq-insert-match]
+     ["Named Goal Selectors" coq-insert-named-goal-selectors])
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
@@ -1650,6 +1673,7 @@ Warn if processed Require sentences load outdated libraries."
         (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
         (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)
         (setq coq-query-function #'coq-eglot-run-query)
+        (setq coq-query-result-function #'coq-eglot-query-result)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
@@ -1659,6 +1683,7 @@ Warn if processed Require sentences load outdated libraries."
     (setq coq-eglot-lsp-progress-function nil)
     (kill-local-variable 'coq-terminator-insert-function)
     (kill-local-variable 'coq-query-function)
+    (kill-local-variable 'coq-query-result-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)

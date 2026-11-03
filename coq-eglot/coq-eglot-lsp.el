@@ -350,6 +350,18 @@ COMMAND, a list of strings.  See `coq-eglot-lsp-async-request'."
                       (plist-get answer :feedback))))
    on-error))
 
+(defun coq-eglot-lsp-query (pos command)
+  "Run Coq COMMAND in the state at POS and return its messages.
+Like `coq-eglot-lsp-query-async', but wait for the answer.  Return a
+list of strings, or signal an error if COMMAND fails."
+  (mapcar (lambda (feedback) (aref feedback 1))
+          (plist-get (coq-eglot-lsp-request
+                      :petanque/run_at_point
+                      (list :textDocument (eglot--VersionedTextDocumentIdentifier)
+                            :position (coq-eglot-lsp-position pos)
+                            :command command))
+                     :feedback)))
+
 ;;; Notifications
 
 (defun coq-eglot-lsp--uri-to-path (uri)
