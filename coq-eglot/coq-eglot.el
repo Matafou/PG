@@ -370,55 +370,174 @@ window.  Queries run on the active script buffer."
   "Major mode for the messages of the Eglot backend of Coq."
   (setq-local font-lock-defaults '(coq-response-font-lock-keywords)))
 
-(defun coq-eglot--display-buffer (name mode slot)
-  "Return buffer NAME in MODE, displayed in the right side window SLOT."
+(defun coq-eglot--output-buffer (name mode)
+  "Return buffer NAME, in MODE."
   (let ((buffer (get-buffer-create name)))
     (with-current-buffer buffer
       (unless (eq major-mode mode) (funcall mode)))
-    (display-buffer buffer
-                    `((display-buffer-reuse-window
-                       display-buffer-in-side-window)
-                      (side . right) (slot . ,slot) (window-width . 0.5)))
+    buffer))
+
+(defun coq-eglot--output-window-p (window)
+  "Non-nil if WINDOW displays the goals, the conclusion or the messages."
+  (member (buffer-name (window-buffer window))
+          (list coq-eglot-goals-buffer-name coq-eglot-conclusion-buffer-name
+                coq-eglot-response-buffer-name)))
+
+(defun coq-eglot--three-windows-p ()
+  "Non-nil if the goals and the messages have windows of their own.
+Like in Proof General: if `proof-three-window-enable' is non-nil and the
+frame is high enough."
+  (and proof-three-window-enable
+       (> (frame-height) (* 4 window-min-height))))
+
+(defun coq-eglot--main-window ()
+  "The window of the script, next to which the output windows go."
+  (or (and coq-eglot--active-buffer
+           (get-buffer-window coq-eglot--active-buffer))
+      (seq-find (lambda (window) (not (coq-eglot--output-window-p window)))
+                (window-list nil 'no-minibuffer))
+      (selected-window)))
+
+(defun coq-eglot--show-in (window buffer)
+  "Display BUFFER in WINDOW, a window of its own in three windows mode."
+  (set-window-buffer window buffer)
+  (set-window-dedicated-p window (coq-eglot--three-windows-p))
+  window)
+
+(defun coq-eglot--display-three ()
+  "Display the goals and the messages in windows of their own.
+The windows missing are created like in Proof General, see
+`proof-three-window-mode-policy': below the script (vertical), on its
+right (hybrid) or in three columns (horizontal).  With the conclusion
+apart, its window is below the goals window."
+  (let* ((policy (proof-guess-3win-display-policy
+                  proof-three-window-mode-policy))
+         (columns (eq policy 'horizontal))
+         (goals (coq-eglot--output-buffer coq-eglot-goals-buffer-name
+                                          #'coq-eglot-goals-mode))
+         (conclusion (and coq-eglot-split-goals
+                          (coq-eglot--output-buffer
+                           coq-eglot-conclusion-buffer-name
+                           #'coq-eglot-goals-mode)))
+         (response (coq-eglot--output-buffer coq-eglot-response-buffer-name
+                                             #'coq-eglot-response-mode))
+         (goals-window (get-buffer-window goals))
+         (response-window (get-buffer-window response)))
+    (unless goals-window
+      (setq goals-window
+            (coq-eglot--show-in
+             (if response-window
+                 ;; the goals come before the messages
+                 (split-window response-window nil (if columns 'left 'above))
+               (let ((main (coq-eglot--main-window)))
+                 (pcase policy
+                   ('vertical (split-window main nil 'below))
+                   ;; a third of the width for each column
+                   ('horizontal (split-window main (/ (window-total-width main) 3)
+                                              'right))
+                   (_ (split-window main nil 'right)))))
+             goals)))
+    ;; in columns, the messages before the conclusion: full height
+    (when (and columns (not response-window))
+      (setq response-window
+            (coq-eglot--show-in (split-window goals-window nil 'right)
+                                response)))
+    (when (and conclusion (not (get-buffer-window conclusion)))
+      (coq-eglot--show-in
+       ;; between the goals and the messages, from the higher one
+       (if (and response-window (not columns)
+                (> (window-total-height response-window)
+                   (window-total-height goals-window)))
+           (split-window response-window nil 'above)
+         (split-window goals-window nil 'below))
+       conclusion))
+    (unless response-window
+      (coq-eglot--show-in
+       (split-window (or (and conclusion (get-buffer-window conclusion))
+                         goals-window)
+                     nil 'below)
+       response))))
+
+(defun coq-eglot--display-two (buffer)
+  "Display BUFFER in the window of the goals or the messages.
+Like in Proof General when `proof-three-window-enable' is nil: they
+share one window.  With the conclusion apart, its window is below the
+goals window."
+  (let ((shared (seq-find (lambda (window)
+                            (and (coq-eglot--output-window-p window)
+                                 (not (equal (buffer-name (window-buffer window))
+                                             coq-eglot-conclusion-buffer-name))))
+                          (window-list nil 'no-minibuffer)))
+        (goals-window (get-buffer-window coq-eglot-goals-buffer-name)))
+    (cond
+     ((and (equal (buffer-name buffer) coq-eglot-conclusion-buffer-name)
+           goals-window)
+      (coq-eglot--show-in (split-window goals-window nil 'below) buffer))
+     (shared (coq-eglot--show-in shared buffer))
+     (t (coq-eglot--show-in
+         (split-window (coq-eglot--main-window) nil
+                       (if (eq (proof-guess-3win-display-policy 'smart)
+                               'vertical)
+                           'below 'right))
+         buffer)))))
+
+(defun coq-eglot--display-buffer (name mode)
+  "Return buffer NAME in MODE, displayed like in Proof General.
+See `proof-three-window-enable' and `proof-three-window-mode-policy'.
+If the windows cannot be split, let `display-buffer' choose."
+  (let ((buffer (coq-eglot--output-buffer name mode)))
+    (unless (get-buffer-window buffer)
+      (condition-case nil
+          (if (coq-eglot--three-windows-p)
+              (coq-eglot--display-three)
+            (coq-eglot--display-two buffer))
+        (error (display-buffer buffer))))
     buffer))
 
 (defun coq-eglot-layout-windows ()
   "Display the goals and response windows again, like in Proof General.
-Their side windows come back if closed, with their default sizes."
+They come back if closed, with their default sizes, see
+`proof-three-window-enable' and `proof-three-window-mode-policy'."
   (interactive)
-  (let ((selected (current-buffer))
-        (outputs (list coq-eglot-goals-buffer-name
-                       coq-eglot-conclusion-buffer-name
-                       coq-eglot-response-buffer-name)))
+  (let ((selected (current-buffer)))
     (coq-eglot--with-script
       ;; displayed again from scratch: default sizes
       (dolist (window (window-list nil 'no-minibuffer))
-        (when (and (window-parameter window 'window-side)
-                   (member (buffer-name (window-buffer window)) outputs))
+        (when (and (coq-eglot--output-window-p window)
+                   (not (frame-root-window-p window)))
           (delete-window window)))
       (coq-eglot--display-buffer coq-eglot-goals-buffer-name
-                                 #'coq-eglot-goals-mode 0)
+                                 #'coq-eglot-goals-mode)
+      (when (coq-eglot--three-windows-p)
+        (coq-eglot--display-buffer coq-eglot-response-buffer-name
+                                   #'coq-eglot-response-mode))
       (when coq-eglot-split-goals
         (coq-eglot--display-buffer coq-eglot-conclusion-buffer-name
-                                   #'coq-eglot-goals-mode 1))
-      (coq-eglot--display-buffer coq-eglot-response-buffer-name
-                                 #'coq-eglot-response-mode 2)
+                                   #'coq-eglot-goals-mode))
       (when coq-eglot-resize-windows-function
         (funcall coq-eglot-resize-windows-function))
       (coq-eglot--scroll-goals))
     (let ((window (get-buffer-window selected)))
       (when window (select-window window)))))
 
-(defun coq-eglot--set-buffer-text (name mode slot text)
-  "Replace the content of buffer NAME (in MODE, window SLOT) by TEXT.
+(defun coq-eglot--set-buffer-text (name mode text)
+  "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
 Then adjust the heights of the windows, see
 `coq-eglot-resize-windows-function'.  Do nothing if called from a script
 buffer that is not active: only the active one displays its state."
   (when (or (not coq-eglot-mode) (coq-eglot--active-p))
-    (coq-eglot--set-buffer-text-1 name mode slot text)))
+    (coq-eglot--set-buffer-text-1 name mode text)))
 
-(defun coq-eglot--set-buffer-text-1 (name mode slot text)
-  "Replace the content of buffer NAME (in MODE, window SLOT) by TEXT."
-  (with-current-buffer (coq-eglot--display-buffer name mode slot)
+(defun coq-eglot--set-buffer-text-1 (name mode text)
+  "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
+When the goals and the messages share a window (see
+`proof-three-window-enable'), no messages do not hide the goals."
+  (with-current-buffer
+      (if (or (coq-eglot--three-windows-p)
+              (not (equal name coq-eglot-response-buffer-name))
+              (not (string-empty-p text)))
+          (coq-eglot--display-buffer name mode)
+        (coq-eglot--output-buffer name mode))
     (let ((inhibit-read-only t))
       (erase-buffer)
       (insert text)
@@ -455,33 +574,39 @@ heights in the same order, or nil if TOTAL is too small."
   "Give the windows the height they need, by priority.
 The goals, conclusion and response windows displayed one above the
 other share their height: each one gets the height it needs in the
-order of `coq-eglot-window-priorities', the last one gets what remains."
+order of `coq-eglot-window-priorities', the last one gets what remains.
+In three columns (see `proof-three-window-mode-policy'), only the
+windows of the same column.  The script window keeps its height."
   (let* ((names `((goals . ,coq-eglot-goals-buffer-name)
                   (conclusion . ,coq-eglot-conclusion-buffer-name)
                   (response . ,coq-eglot-response-buffer-name)))
          (windows (delq nil (mapcar (lambda (role)
                                       (get-buffer-window
                                        (cdr (assq role names))))
-                                    coq-eglot-window-priorities)))
-         (parent (window-parent (car windows))))
-    (when (and (cdr windows)
-               (cl-every (lambda (window) (eq (window-parent window) parent))
-                         windows)
-               (window-combined-p (car windows)))
-      (let ((heights (coq-eglot--allocate-heights
-                      (apply #'+ (mapcar #'window-total-height windows))
-                      (mapcar #'coq-eglot--window-need windows)
-                      window-min-height)))
-        (when heights
-          ;; from top to bottom, the last one takes what remains
-          (let ((sorted (sort (cl-mapcar #'cons windows heights)
-                              (lambda (a b) (< (window-top-line (car a))
-                                               (window-top-line (car b)))))))
-            (dolist (window-height (butlast sorted))
-              (ignore-errors
-                (window-resize (car window-height)
-                               (- (cdr window-height)
-                                  (window-total-height (car window-height))))))))))))
+                                    coq-eglot-window-priorities))))
+    (pcase-dolist (`(,_parent . ,column) (seq-group-by #'window-parent windows))
+      (when (and (cdr column) (window-combined-p (car column)))
+        (coq-eglot--resize-column column)))))
+
+(defun coq-eglot--resize-column (windows)
+  "Give WINDOWS, one above the other, the height they need, by priority.
+See `coq-eglot-resize-windows-by-priority'."
+  (let ((heights (coq-eglot--allocate-heights
+                  (apply #'+ (mapcar #'window-total-height windows))
+                  (mapcar #'coq-eglot--window-need windows)
+                  window-min-height)))
+    (when heights
+      ;; from top to bottom, the last one takes what remains: only the
+      ;; edges between them move
+      (let ((sorted (sort (cl-mapcar #'cons windows heights)
+                          (lambda (a b) (< (window-top-line (car a))
+                                           (window-top-line (car b)))))))
+        (dolist (window-height (butlast sorted))
+          (ignore-errors
+            (adjust-window-trailing-edge
+             (car window-height)
+             (- (cdr window-height)
+                (window-total-height (car window-height))))))))))
 
 (defun coq-eglot--format-hyp (hyp)
   "Format hypothesis HYP of a goal.
@@ -608,17 +733,17 @@ See `coq-eglot-split-goals'."
     (if (not coq-eglot-split-goals)
         (progn
           (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
-                                      #'coq-eglot-goals-mode 0
+                                      #'coq-eglot-goals-mode
                                       (coq-eglot--format-goals goals))
           (coq-eglot--set-mode-line coq-eglot-goals-buffer-name t))
       ;; the windows separate the hypotheses from the conclusion
       (let ((parts (coq-eglot--format-goals-parts goals t)))
         (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
-                                    #'coq-eglot-goals-mode 0 (car parts))
+                                    #'coq-eglot-goals-mode (car parts))
         ;; the conclusion comes right below the hypotheses
         (coq-eglot--set-mode-line coq-eglot-goals-buffer-name nil)
         (coq-eglot--set-buffer-text coq-eglot-conclusion-buffer-name
-                                    #'coq-eglot-goals-mode 1 (cdr parts))
+                                    #'coq-eglot-goals-mode (cdr parts))
         (coq-eglot--set-separator coq-eglot-conclusion-buffer-name)))
     (coq-eglot--decorate-hyps)
     (coq-eglot--scroll-goals)))
@@ -818,7 +943,7 @@ See `coq-highlight-hyps-cited-in-response'."
 (defun coq-eglot--show-response (text)
   "Display TEXT in the response buffer."
   (coq-eglot--set-buffer-text coq-eglot-response-buffer-name
-                              #'coq-eglot-response-mode 2 text))
+                              #'coq-eglot-response-mode text))
 
 (defun coq-eglot--show-answer (answer)
   "Display the goals and the messages of ANSWER of the server."

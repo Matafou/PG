@@ -26,6 +26,10 @@
 (when (getenv "COQ_LSP")
   (setq coq-eglot-server-program (list (getenv "COQ_LSP"))))
 
+;; The frame of batch mode is narrow: the smart policy would choose the
+;; vertical layout.  The tests of the layouts bind it.
+(setq proof-three-window-mode-policy 'hybrid)
+
 
 ;;; utility functions
 
@@ -454,6 +458,133 @@ their default width, like in Proof General."
       (select-window (get-buffer-window "*goals*"))
       (coq-eglot-layout-windows)
       (should (eq (window-buffer (selected-window)) (get-buffer "*goals*"))))))
+
+;;; window layouts, like in Proof General
+
+(defmacro with-layout (three policy &rest body)
+  "Run BODY with `proof-three-window-enable' THREE and POLICY.
+From a frame showing only the current buffer, restored afterwards."
+  (declare (indent 2) (debug t))
+  `(let ((proof-three-window-enable ,three)
+         (proof-three-window-mode-policy ,policy))
+     (unwind-protect
+         (progn
+           (switch-to-buffer (current-buffer))
+           (delete-other-windows)
+           ,@body)
+       (delete-other-windows))))
+
+(defun windows-of (&rest names)
+  "Windows of the buffers NAMES, all displayed."
+  (mapcar (lambda (name) (or (get-buffer-window name)
+                             (ert-fail (format "%s not displayed" name))))
+          names))
+
+(defun output-windows ()
+  "Windows displaying the goals, the conclusion or the messages."
+  (seq-filter #'coq-eglot--output-window-p (window-list nil 'no-minibuffer)))
+
+(ert-deftest coq-eglot-layout-vertical ()
+  "Vertical policy: the goals and the messages below the script, in
+dedicated windows."
+  (with-test-file
+    (with-layout t 'vertical
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (pcase-let ((`(,script ,goals ,response)
+                   (windows-of (current-buffer) "*goals*" "*response*")))
+        (should (= (window-left-column script) (window-left-column goals)
+                   (window-left-column response)))
+        (should (< (window-top-line script) (window-top-line goals)
+                   (window-top-line response)))
+        (should (window-dedicated-p goals))
+        (should (window-dedicated-p response))))))
+
+(ert-deftest coq-eglot-layout-hybrid ()
+  "Hybrid policy: the goals above the messages, on the right of the
+script."
+  (with-test-file
+    (with-layout t 'hybrid
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (pcase-let ((`(,script ,goals ,response)
+                   (windows-of (current-buffer) "*goals*" "*response*")))
+        (should (< (window-left-column script) (window-left-column goals)))
+        (should (= (window-left-column goals) (window-left-column response)))
+        (should (< (window-top-line goals) (window-top-line response)))))))
+
+(ert-deftest coq-eglot-layout-horizontal ()
+  "Horizontal policy: three columns.  With the conclusion apart, it is
+below the goals, the messages keep the whole height."
+  (with-test-file
+    (with-layout t 'horizontal
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (pcase-let ((`(,script ,goals ,response)
+                   (windows-of (current-buffer) "*goals*" "*response*")))
+        (should (< (window-left-column script) (window-left-column goals)
+                   (window-left-column response)))
+        (should (= (window-top-line script) (window-top-line goals)
+                   (window-top-line response))))
+      (unwind-protect
+          (progn
+            (coq-eglot-toggle-split-goals)
+            (pcase-let ((`(,goals ,conclusion ,response)
+                         (windows-of "*goals*" "*conclusion*" "*response*")))
+              (should (= (window-left-column goals)
+                         (window-left-column conclusion)))
+              (should (< (window-top-line goals) (window-top-line conclusion)))
+              (should (= (window-top-line goals) (window-top-line response)))
+              (should (> (window-left-column response)
+                         (window-left-column conclusion)))))
+        (coq-eglot-toggle-split-goals)))))
+
+(ert-deftest coq-eglot-layout-two-windows ()
+  "Without `proof-three-window-enable', the goals and the messages share
+one window, not dedicated: the messages when there are some, the goals
+otherwise."
+  (with-test-file
+    (with-layout nil 'hybrid
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
+                             (output-windows))
+                     '("*goals*")))
+      (should-not (window-dedicated-p (car (output-windows))))
+      ;; the answer of a query
+      (query #'coq-run-query "About double")
+      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
+                             (output-windows))
+                     '("*response*")))
+      ;; a sentence printing a message
+      (goto-marker "hello")
+      (run #'coq-eglot-goto-point)
+      (should (equal (buffer-text "*response*") "hello"))
+      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
+                             (output-windows))
+                     '("*response*")))
+      ;; no message: the goals
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
+                             (output-windows))
+                     '("*goals*")))
+      ;; C-c C-l shows the goals only
+      (delete-other-windows)
+      (coq-eglot-layout-windows)
+      (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
+                             (output-windows))
+                     '("*goals*"))))))
+
+(ert-deftest coq-eglot-layout-policy ()
+  "The smart policy depends on the width of the frame, like in Proof
+General."
+  (let ((split-width-threshold 40))
+    (should (eq (proof-guess-3win-display-policy 'smart)
+                (if (>= (frame-width) 60) 'horizontal 'hybrid))))
+  (let ((split-width-threshold 1000))
+    (should (eq (proof-guess-3win-display-policy 'smart) 'vertical)))
+  (should (eq (proof-guess-3win-display-policy 'hybrid) 'hybrid)))
 
 (defun other-goals-overlay ()
   "The overlay of the goals after the first one in the current buffer."
