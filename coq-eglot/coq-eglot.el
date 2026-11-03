@@ -365,7 +365,10 @@ window.  Queries run on the active script buffer."
   ;; like in Proof General, see coq-goals.el and pg-goals-indicators.el
   (proof-goals-indicators-setup)
   (setq coq-goals-count-function #'coq-eglot--goals-count)
-  (setq mode-line-process '(:eval (coq-goals-mode-line))))
+  (setq mode-line-process '(:eval (coq-goals-mode-line)))
+  ;; the goals are printed at the width of their windows
+  (add-hook 'window-size-change-functions
+            #'coq-eglot--schedule-width-refresh nil t))
 
 (define-derived-mode coq-eglot-response-mode coq-eglot-output-mode "Coq Response"
   "Major mode for the messages of the Eglot backend of Coq."
@@ -616,18 +619,151 @@ See `coq-eglot-resize-windows-by-priority'."
              (- (cdr window-height)
                 (window-total-height (car window-height))))))))))
 
+;;; Printing width
+
+;; The server prints the goals and the answers of the queries.  The goals
+;; requests and the queries run Set Printing Width first: the server runs
+;; it on a copy of the state, nothing is checked again.  See
+;; `coq-auto-adapt-printing-width'.
+
+(defvar coq-eglot--displayed-goals nil
+  "Goals of the last answer displayed, to display them again.")
+
+(defvar coq-eglot--displayed-width nil
+  "Printing width of the goals displayed, or nil for Coq's default.
+See `coq-eglot--goals-printing-width'.")
+
+(defconst coq-eglot--hyp-indentation 4
+  "Indentation of the type of a hypothesis below its names.
+The widest indentation of the goals: they are printed this much
+narrower than their window.")
+
+(defconst coq-eglot--min-printing-width 20
+  "Smallest printing width asked to Coq.")
+
+(defun coq-eglot--buffer-windows-width (name)
+  "Number of characters of the narrowest window of buffer NAME, or nil."
+  (let ((buffer (get-buffer name)))
+    (when buffer
+      (let ((widths (mapcar #'window-max-chars-per-line
+                            (get-buffer-window-list buffer nil t))))
+        (and widths (apply #'min widths))))))
+
+(defun coq-eglot--printing-width (window-width indentation)
+  "Printing width for text indented by INDENTATION in WINDOW-WIDTH, or nil.
+Nil if WINDOW-WIDTH is nil or `coq-auto-adapt-printing-width' is nil."
+  (when (and coq-auto-adapt-printing-width window-width)
+    (max coq-eglot--min-printing-width (- window-width indentation))))
+
+(defun coq-eglot--goals-printing-width ()
+  "Printing width of the goals, from the width of their windows, or nil.
+Nil if they are not displayed: the windows will be created at their
+display, the goals are printed again then.  This is
+`coq-eglot-lsp-printing-width-function'."
+  (coq-eglot--printing-width
+   (let ((widths (delq nil (mapcar #'coq-eglot--buffer-windows-width
+                                   (if coq-eglot-split-goals
+                                       (list coq-eglot-goals-buffer-name
+                                             coq-eglot-conclusion-buffer-name)
+                                     (list coq-eglot-goals-buffer-name))))))
+     (and widths (apply #'min widths)))
+   coq-eglot--hyp-indentation))
+
+(setq coq-eglot-lsp-printing-width-function #'coq-eglot--goals-printing-width)
+
+(defun coq-eglot--query-printing-width ()
+  "Printing width of the answers of the queries, or nil.
+From the width of the response window, or of the goals window if the
+response is not displayed."
+  (coq-eglot--printing-width
+   (or (coq-eglot--buffer-windows-width coq-eglot-response-buffer-name)
+       (coq-eglot--buffer-windows-width coq-eglot-goals-buffer-name))
+   0))
+
+(defun coq-eglot--width-outdated-p (width)
+  "Non-nil if goals printed at WIDTH should be printed again.
+That is if the goals windows are displayed with another width."
+  (let ((current (coq-eglot--goals-printing-width)))
+    (and current (not (eql current width)))))
+
+(defvar coq-eglot--width-timer nil
+  "Timer of `coq-eglot--refresh-width'.")
+
+(defun coq-eglot--schedule-width-refresh (&rest _)
+  "Print the goals again soon if the width of their windows changed.
+In `window-size-change-functions' of the goals buffers: a timer, not
+to change the buffers during the redisplay, and to wait for the end of
+a resizing."
+  (when (timerp coq-eglot--width-timer)
+    (cancel-timer coq-eglot--width-timer))
+  (setq coq-eglot--width-timer
+        (run-at-time 0.1 nil #'coq-eglot--refresh-width)))
+
+(defun coq-eglot--refresh-width ()
+  "Print the goals again if the width of their windows changed.
+Not during a check: the goals of each sentence are asked when it is
+checked, at the current width."
+  (setq coq-eglot--width-timer nil)
+  (let ((script coq-eglot--active-buffer))
+    (when (and coq-eglot--displayed-goals
+               (coq-eglot--width-outdated-p coq-eglot--displayed-width)
+               (buffer-live-p script))
+      (with-current-buffer script
+        (let ((last (car coq-eglot--ends)))
+          (when (and last (not coq-eglot--running))
+            (coq-eglot-lsp-goals-async
+             (1- (car last))
+             (lambda (answer)
+               (when (and (eq (car coq-eglot--ends) last)
+                          (coq-eglot--active-p))
+                 (setcdr last answer)
+                 (coq-eglot--show-goals answer)))
+             #'ignore)))))))
+
+(defun coq-eglot--indent (text indentation)
+  "TEXT with INDENTATION, a string, at the beginning of its lines but the first."
+  (string-replace "\n" (concat "\n" indentation) text))
+
+(defun coq-eglot--fill-names (names width)
+  "Join NAMES with commas, in lines of at most WIDTH characters.
+The lines after the first one are indented by 2, like Coq does."
+  (let ((lines nil) (line nil))
+    (dolist (name names)
+      (let ((candidate (if line (concat line ", " name) name)))
+        (if (or (null line) (<= (length candidate) width))
+            (setq line candidate)
+          (push (concat line ",") lines)
+          (setq line name))))
+    (mapconcat #'identity (nreverse (cons line lines)) "\n  ")))
+
 (defun coq-eglot--format-hyp (hyp)
   "Format hypothesis HYP of a goal.
-The text has the property `coq-eglot-hyp', the list of its names, and
-the part after the names the property `coq-eglot-hyp-body', to
-highlight and fold it, see `coq-eglot-toggle-highlight-hyp'."
-  (let ((names (append (plist-get hyp :names) nil))
-        (def (plist-get hyp :def)))
+Like Coq does: if it does not fit on one line, its names are on several
+lines, and its type goes below them, indented.  The text has the
+property `coq-eglot-hyp', the list of its names, and the part after the
+names the property `coq-eglot-hyp-body', to highlight and fold it, see
+`coq-eglot-toggle-highlight-hyp'."
+  (let* ((names (append (plist-get hyp :names) nil))
+         ;; the line must fit in the window, or in Coq's default width
+         (width (if coq-eglot--displayed-width
+                    (+ coq-eglot--displayed-width coq-eglot--hyp-indentation)
+                  78))
+         (names-text (coq-eglot--fill-names names (- width 2)))
+         (last-line (car (last (split-string names-text "\n"))))
+         (def (plist-get hyp :def))
+         (ty (plist-get hyp :ty))
+         (one-line (concat (if def (concat " := " def) "") " : " ty))
+         (body
+          ;; the server printed TY alone, without the names
+          (if (and (not (string-search "\n" one-line))
+                   (<= (+ 2 (length last-line) (length one-line)) width))
+              one-line
+            (concat (if def
+                        (concat " :=\n    " (coq-eglot--indent def "    ")
+                                "\n    : " (coq-eglot--indent ty "      "))
+                      (concat " :\n    " (coq-eglot--indent ty "    ")))))))
     (propertize
-     (concat "  " (mapconcat #'identity names ", ")
-             (propertize (concat (if def (concat " := " def) "")
-                                 " : " (plist-get hyp :ty))
-                         'coq-eglot-hyp-body t))
+     (concat "  " names-text (propertize body 'coq-eglot-hyp-body t))
      'coq-eglot-hyp names)))
 
 (defun coq-eglot--format-hyps (goal)
@@ -638,7 +774,7 @@ highlight and fold it, see `coq-eglot-toggle-highlight-hyp'."
 (defun coq-eglot--format-conclusion (goal &optional no-separator)
   "Format the conclusion of GOAL, below the separator unless NO-SEPARATOR."
   (concat (if no-separator "" "  ============================\n")
-          "  " (plist-get goal :ty) "\n"))
+          "  " (coq-eglot--indent (plist-get goal :ty) "  ") "\n"))
 
 (defun coq-eglot--unfocused-p (goals)
   "Non-nil if GOALS has unfocused goals."
@@ -652,9 +788,6 @@ highlight and fold it, see `coq-eglot-toggle-highlight-hyp'."
                 (seq-reduce (lambda (count side) (+ count (length side)))
                             level count))
               (plist-get goals :stack) 0))
-
-(defvar coq-eglot--displayed-goals nil
-  "Goals of the last answer displayed, to display them again.")
 
 (defun coq-eglot--unfocused-goals (goals)
   "The unfocused goals of GOALS, the innermost level first."
@@ -675,7 +808,8 @@ Printing Unfocused."
   (let ((i (1- first)))
     (mapconcat (lambda (goal)
                  (setq i (1+ i))
-                 (format "\ngoal %d is:\n %s\n" i (plist-get goal :ty)))
+                 (format "\ngoal %d is:\n %s\n" i
+                         (coq-eglot--indent (plist-get goal :ty) " ")))
                goals "")))
 
 (defun coq-eglot--format-other-goals (goals)
@@ -738,6 +872,7 @@ Return the empty string if GOALS is nil (outside of proofs)."
 See `coq-eglot-split-goals'."
   (let ((goals (plist-get answer :goals)))
     (setq coq-eglot--displayed-goals goals)
+    (setq coq-eglot--displayed-width (plist-get answer :printing-width))
     (if (not coq-eglot-split-goals)
         (progn
           (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
@@ -754,7 +889,9 @@ See `coq-eglot-split-goals'."
                                     #'coq-eglot-goals-mode (cdr parts))
         (coq-eglot--set-separator coq-eglot-conclusion-buffer-name)))
     (coq-eglot--decorate-hyps)
-    (coq-eglot--scroll-goals)))
+    (coq-eglot--scroll-goals)
+    ;; the windows may have been created or resized meanwhile
+    (coq-eglot--schedule-width-refresh)))
 
 (defun coq-eglot--goals-buffer ()
   "The goals buffer holding the goals after the first one, or nil.
@@ -823,7 +960,8 @@ See `coq-eglot-split-goals'."
       (when buffer
         (mapc #'delete-window (get-buffer-window-list buffer nil t))
         (kill-buffer buffer))))
-  (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals))
+  (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals
+                               :printing-width coq-eglot--displayed-width))
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
 
 ;;; Hypotheses
@@ -972,7 +1110,9 @@ server otherwise, or if ASK is non-nil."
   (if (null coq-eglot--ends)
       (progn (coq-eglot--show-goals nil)
              (coq-eglot--show-response ""))
-    (when (or ask (null (cdar coq-eglot--ends)))
+    (when (or ask (null (cdar coq-eglot--ends))
+              (coq-eglot--width-outdated-p
+               (plist-get (cdar coq-eglot--ends) :printing-width)))
       (setcdr (car coq-eglot--ends)
               (coq-eglot-lsp-goals (1- (coq-eglot-position)))))
     (coq-eglot--show-answer (cdar coq-eglot--ends))))
@@ -988,7 +1128,9 @@ server may still be finishing an interrupted sentence."
    ((null coq-eglot--ends)
     (coq-eglot--show-goals nil)
     (coq-eglot--show-response ""))
-   ((cdar coq-eglot--ends)
+   ((and (cdar coq-eglot--ends)
+         (not (coq-eglot--width-outdated-p
+               (plist-get (cdar coq-eglot--ends) :printing-width))))
     (coq-eglot--show-answer (cdar coq-eglot--ends)))
    (t
     (let ((last (car coq-eglot--ends)))
@@ -1498,7 +1640,9 @@ THEN is called with the messages."
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
     (setq command (concat command ".")))
   ;; the server runs all the sentences on a copy of the state
-  (setq command (concat (mapconcat (lambda (flag) (concat flag ". ")) flags "")
+  (setq command (concat (let ((width (coq-eglot--query-printing-width)))
+                          (if width (format "Set Printing Width %d. " width) ""))
+                        (mapconcat (lambda (flag) (concat flag ". ")) flags "")
                         command))
   ;; in the last processed sentence: the state after it
   (coq-eglot-lsp-query-async

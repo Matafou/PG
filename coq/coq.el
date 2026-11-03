@@ -958,17 +958,14 @@ This function is called from `proof-shell-exec-loop' via
      (coq--show-proof-stepwise-cmds))))
 
 ;; This does not Set Printing Width, it rather tells pg to do that before each
-;; command (if necessary)
-(defpacustom auto-adapt-printing-width t
-  "If non-nil, adapt automatically printing width of goals window.
-Each time the user sends a bunch of commands to Coq, check if the
-width of the goals window changed, and adapt coq printing width.
-WARNING: If several windows are displaying the goals buffer, one
-is chosen arbitrarily.  WARNING 2: when backtracking the printing
-width is synchronized by coq (?!)."
-  :type 'boolean
-  :safe 'booleanp
-  :group 'coq)
+;; command (if necessary).  The option `coq-auto-adapt-printing-width' is
+;; common to all backends, see coq-goals.el.  Here only its entry in the
+;; settings menu, as `defpacustom' would do.
+(unless (assq 'auto-adapt-printing-width proof-assistant-settings)
+  (push (list 'auto-adapt-printing-width nil 'boolean
+              (documentation-property 'coq-auto-adapt-printing-width
+                                      'variable-documentation t))
+        proof-assistant-settings))
 
 (defvar coq-shell-current-line-width nil
   "Current line width of the Coq printing width.

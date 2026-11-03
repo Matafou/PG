@@ -298,23 +298,52 @@ different servers may share libraries.  Ignored before coq-lsp 0.2.5."
   (dolist (server (coq-eglot-lsp--servers))
     (jsonrpc-notify server :coq/workspace_update (make-hash-table))))
 
-(defun coq-eglot-lsp--goals-params (pos)
-  "Parameters of a goals request at buffer position POS."
-  (list :textDocument (eglot--VersionedTextDocumentIdentifier)
-        :position (coq-eglot-lsp-position pos)
-        :pp_format "Str"))
+(defvar coq-eglot-lsp-printing-width-function nil
+  "Function giving the printing width of the goals, or nil.
+Called without argument in the script buffer before each goals request.
+If it returns a number N, the goals are printed with Set Printing Width
+N, otherwise with Coq's default width.  The answer gives the width with
+the key :printing-width.")
+
+(defun coq-eglot-lsp--printing-width ()
+  "Printing width of the next goals request, or nil.
+See `coq-eglot-lsp-printing-width-function'."
+  (and coq-eglot-lsp-printing-width-function
+       (funcall coq-eglot-lsp-printing-width-function)))
+
+(defun coq-eglot-lsp--goals-params (pos &optional width)
+  "Parameters of a goals request at buffer position POS.
+With Set Printing Width WIDTH if non-nil: the server runs it on a copy
+of the state after the sentence, it changes nothing else."
+  (append (list :textDocument (eglot--VersionedTextDocumentIdentifier)
+                :position (coq-eglot-lsp-position pos)
+                :pp_format "Str")
+          (and width
+               (list :command (format "Set Printing Width %d." width)))))
+
+(defun coq-eglot-lsp--with-width (answer width)
+  "ANSWER of a goals request printed at WIDTH, with key :printing-width."
+  (if answer (plist-put answer :printing-width width) answer))
 
 (defun coq-eglot-lsp-goals (pos)
   "Ask the goals after the sentence at buffer position POS.
 Return the answer of the server as a plist with keys :range, :goals,
-:messages and :error."
-  (coq-eglot-lsp-request :proof/goals (coq-eglot-lsp--goals-params pos)))
+:messages and :error, and :printing-width, see
+`coq-eglot-lsp-printing-width-function'."
+  (let ((width (coq-eglot-lsp--printing-width)))
+    (coq-eglot-lsp--with-width
+     (coq-eglot-lsp-request :proof/goals (coq-eglot-lsp--goals-params pos width))
+     width)))
 
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
 See `coq-eglot-lsp-goals' and `coq-eglot-lsp-async-request'."
-  (coq-eglot-lsp-async-request :proof/goals (coq-eglot-lsp--goals-params pos)
-                               on-success on-error))
+  (let ((width (coq-eglot-lsp--printing-width)))
+    (coq-eglot-lsp-async-request
+     :proof/goals (coq-eglot-lsp--goals-params pos width)
+     (lambda (answer)
+       (funcall on-success (coq-eglot-lsp--with-width answer width)))
+     on-error)))
 
 (defun coq-eglot-lsp-ping (on-answer)
   "Send a cheap request, call ON-ANSWER when the server answers it.

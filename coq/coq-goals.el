@@ -38,6 +38,22 @@ them when clicked, see `coq-toggle-other-goals'."
   :type 'boolean
   :group 'coq)
 
+(defcustom coq-auto-adapt-printing-width t
+  "If non-nil, adapt the printing width of Coq to the goals window.
+With Proof General, each time the user sends a bunch of commands to
+Coq, check if the width of the goals window changed, and set Coq
+printing width (Set Printing Width).  If several windows display the
+goals buffer, one is chosen arbitrarily.  When backtracking, Coq
+restores the printing width of the state it goes back to: the width is
+adapted again at the next command.
+
+With Eglot, the goals are printed at the width of their window, and
+printed again when it changes.  The answers of the queries are printed
+at the width of the response window."
+  :type 'boolean
+  :safe 'booleanp
+  :group 'coq)
+
 (defface coq-other-goals-face '((t :inherit shadow))
   "Face of the line giving the number of the other goals.
 See `coq-fold-other-goals'."

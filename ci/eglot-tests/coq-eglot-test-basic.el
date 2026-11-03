@@ -30,6 +30,11 @@
 ;; vertical layout.  The tests of the layouts bind it.
 (setq proof-three-window-mode-policy 'hybrid)
 
+;; Its windows are narrow too: Coq would print the goals and the answers
+;; of the queries on several lines.  The tests of the printing width
+;; bind it.
+(setq coq-auto-adapt-printing-width nil)
+
 
 ;;; utility functions
 
@@ -1538,6 +1543,136 @@ When one of them loads the new version, the other stays marked."
           (with-current-buffer library (set-buffer-modified-p nil))
           (kill-buffer library))
         (with-temp-file source (insert contents))))))
+
+;;; printing width
+
+(defmacro with-width-file (&rest body)
+  "Run BODY in eglot_width.v, adapting the printing width, in the
+hybrid layout."
+  (declare (indent 0) (debug t))
+  `(with-file "eglot_width.v"
+     (with-layout t 'hybrid
+       (let ((coq-auto-adapt-printing-width t))
+         ,@body))))
+
+(defun lines-fit-p (name)
+  "Non-nil if the lines of buffer NAME fit in its window."
+  (let ((width (window-max-chars-per-line (get-buffer-window name))))
+    (seq-every-p (lambda (line) (<= (string-width line) width))
+                 (split-string (buffer-text name) "\n"))))
+
+(defun shrink-goals-window (columns)
+  "Make the goals window COLUMNS narrower, print its goals again.
+Batch mode has no redisplay to run `window-size-change-functions'."
+  (let ((width coq-eglot--displayed-width))
+    (with-selected-window (get-buffer-window "*goals*")
+      (shrink-window-horizontally columns))
+    (coq-eglot--refresh-width)
+    (wait-until (lambda () (not (eql coq-eglot--displayed-width width))) 10)))
+
+(ert-deftest coq-eglot-printing-width-goals ()
+  "The goals are printed at the width of their window, and again when it
+changes, like with `coq-auto-adapt-printing-width' in Proof General."
+  (with-width-file
+    (goto-marker "intros")
+    (run #'coq-eglot-goto-point)
+    ;; printed again once displayed
+    (wait-until (lambda () coq-eglot--displayed-width) 10)
+    (should (= coq-eglot--displayed-width
+               (- (window-max-chars-per-line (get-buffer-window "*goals*"))
+                  coq-eglot--hyp-indentation)))
+    (should (string-match-p "Hyp_with_long_name :\n    aaaaaaaa"
+                            (buffer-text "*goals*")))
+    (should (lines-fit-p "*goals*"))
+    (let ((width coq-eglot--displayed-width))
+      (shrink-goals-window 8)
+      (should (= coq-eglot--displayed-width (- width 8)))
+      (should (lines-fit-p "*goals*")))
+    ;; the answer kept for the proof position is printed again
+    (let ((width coq-eglot--displayed-width))
+      (with-selected-window (get-buffer-window "*goals*")
+        (enlarge-window-horizontally 4))
+      (coq-eglot--goals-at-position)
+      (should (= coq-eglot--displayed-width (+ width 4))))))
+
+(ert-deftest coq-eglot-printing-width-split-goals ()
+  "With the conclusion apart, the goals are printed at the width of the
+narrowest of the goals and conclusion windows."
+  (with-width-file
+    (let ((coq-eglot-split-goals t))
+      (goto-marker "intros")
+      (run #'coq-eglot-goto-point)
+      (wait-until (lambda () coq-eglot--displayed-width) 10)
+      (should (lines-fit-p "*goals*"))
+      (should (lines-fit-p "*conclusion*"))
+      (should (= coq-eglot--displayed-width
+                 (- (min (window-max-chars-per-line (get-buffer-window "*goals*"))
+                         (window-max-chars-per-line
+                          (get-buffer-window "*conclusion*")))
+                    coq-eglot--hyp-indentation))))))
+
+(ert-deftest coq-eglot-printing-width-off ()
+  "Without `coq-auto-adapt-printing-width', the goals are printed at the
+default width of Coq."
+  (with-width-file
+    (let ((coq-auto-adapt-printing-width nil))
+      (goto-marker "intros")
+      (run #'coq-eglot-goto-point)
+      (should (string-match-p "1 goal" (buffer-text "*goals*")))
+      (should-not coq-eglot--displayed-width)
+      (should-not (coq-eglot--goals-printing-width))
+      (should-not (coq-eglot--query-printing-width)))))
+
+(ert-deftest coq-eglot-printing-width-query ()
+  "The answers of the queries are printed at the width of the response
+window, for this query only."
+  (with-width-file
+    (goto-marker "intros")
+    (run #'coq-eglot-goto-point)
+    (let ((answer (query #'coq-eglot-run-query "Check Hyp_with_long_name")))
+      (should (string-match-p "\\`Hyp_with_long_name\n" answer))
+      (should (lines-fit-p "*response*")))
+    (should (string-match-p
+             (format "\\b%d\\b" (window-max-chars-per-line
+                                 (get-buffer-window "*response*")))
+             (query #'coq-eglot-run-query "Test Printing Width")))
+    ;; for this query only: nothing leaks in the state of the server
+    (let ((coq-auto-adapt-printing-width nil))
+      (should (string-match-p "\\b78\\b" (query #'coq-eglot-run-query
+                                                "Test Printing Width")))
+      (coq-eglot--goals-at-position t)
+      (should (string-match-p "^  aaaaaaaa \\+ bbbbbbbbb \\* cccccccccc \\+ dddddddddd =$"
+                              (buffer-text "*goals*"))))))
+
+(ert-deftest coq-eglot-format-hyp ()
+  "A hypothesis is formatted like Coq does: on one line if it fits,
+otherwise the names on several lines and the type below them."
+  (let ((coq-eglot--displayed-width 24))  ; lines of 28 characters
+    (should (equal (coq-eglot--format-hyp '(:names ["n" "m"] :ty "nat"))
+                   "  n, m : nat"))
+    (should (equal (coq-eglot--format-hyp
+                    '(:names ["aaaaaaaa" "bbbbbbbb" "cccccccc"] :ty "nat"))
+                   "  aaaaaaaa, bbbbbbbb,\n  cccccccc : nat"))
+    (should (equal (coq-eglot--format-hyp
+                    '(:names ["H"] :ty "aaaaaaaa + bbbbbbbb =\ncccccccc"))
+                   "  H :\n    aaaaaaaa + bbbbbbbb =\n    cccccccc"))
+    (should (equal (coq-eglot--format-hyp
+                    '(:names ["Hyp_name"] :ty "aaaaaaaa = bbbbbbbb"))
+                   "  Hyp_name :\n    aaaaaaaa = bbbbbbbb"))
+    (should (equal (coq-eglot--format-hyp
+                    '(:names ["x"] :def "aaaaaaaa +\nbbbbbbbb" :ty "nat"))
+                   "  x :=\n    aaaaaaaa +\n    bbbbbbbb\n    : nat"))
+    ;; the properties for highlighting and folding
+    (let ((text (coq-eglot--format-hyp '(:names ["H"] :ty "a =\nb"))))
+      (should (equal (get-text-property 2 'coq-eglot-hyp text) '("H")))
+      (should-not (get-text-property 2 'coq-eglot-hyp-body text))
+      (should (get-text-property 3 'coq-eglot-hyp-body text))
+      (should (get-text-property (1- (length text)) 'coq-eglot-hyp-body text)))))
+
+(ert-deftest coq-eglot-format-conclusion-indented ()
+  "The lines of a conclusion are indented, like in Coq."
+  (should (equal (coq-eglot--format-conclusion '(:ty "a =\nb") t)
+                 "  a =\n  b\n")))
 
 (provide 'coq-eglot-test-basic)
 
