@@ -1559,6 +1559,9 @@ Run when Eglot starts or stops managing the buffer."
                                    (not proof-three-window-enable))
       :style toggle :selected proof-three-window-enable
       :help "Goals and messages in windows of their own"]
+     ["Conclusion Apart" coq-eglot-toggle-split-goals
+      :style toggle :selected coq-eglot-split-goals
+      :help "The conclusion in a window of its own, below the hypotheses"]
      ("3 Windows mode layout"
       ["smart"
        (coq-eglot-set-layout-option 'proof-three-window-mode-policy 'smart)
@@ -1581,8 +1584,6 @@ Run when Eglot starts or stops managing the buffer."
        :style radio :selected (eq proof-three-window-mode-policy 'vertical)
        :active proof-three-window-enable
        :help "One column mode"]))
-    ["Conclusion Apart" coq-eglot-toggle-split-goals
-     :style toggle :selected coq-eglot-split-goals]
     ["Fold Other Goals" coq-toggle-other-goals
      :style toggle :selected coq-fold-other-goals]
     ["Compile Before Require" coq-compile-before-require-toggle
