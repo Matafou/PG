@@ -358,7 +358,13 @@ buffers, on the active script buffer, like in Proof General."
             (should (equal (buffer-text "*goals*") "2 goals\n\n  n : nat"))
             ;; no separator: the windows separate
             (should (equal (buffer-text "*conclusion*")
-                           "double n = n + n\n\n▸ 1 more goal"))
+                           "double n = n + n\n\ngoal 2 is:\n True"))
+            ;; the other goals are folded there
+            (should (equal (with-current-buffer "*conclusion*"
+                             (substring-no-properties
+                              (overlay-get (other-goals-overlay) 'display)))
+                           "▸ 1 more goal"))
+            (should (eq (coq-eglot--goals-buffer) (get-buffer "*conclusion*")))
             ;; both are displayed, each in its window
             (should (get-buffer-window "*goals*" t))
             (should (get-buffer-window "*conclusion*" t))
@@ -412,9 +418,10 @@ the remaining height."
                 (conclusion (get-buffer-window "*conclusion*"))
                 (response (get-buffer-window "*response*")))
             (should (and goals conclusion response))
-            ;; the separator line, 3 lines (the other goal folded)
-            ;; and a mode line
-            (should (= (window-total-height conclusion) 5))
+            ;; the height it needs, the other goal folded (batch mode
+            ;; ignores the display property in this computation)
+            (should (= (window-total-height conclusion)
+                       (coq-eglot--window-need conclusion)))
             ;; 3 lines and a mode line, the minimal height
             (should (= (window-total-height goals) window-min-height))
             (should (> (window-total-height response) window-min-height))))
@@ -448,50 +455,37 @@ their default width, like in Proof General."
       (coq-eglot-layout-windows)
       (should (eq (window-buffer (selected-window)) (get-buffer "*goals*"))))))
 
-(defun more-indicators (buffer)
-  "Texts of the indicators of BUFFER, telling it continues above or below."
-  (with-current-buffer buffer
-    (mapcar (lambda (ov) (or (overlay-get ov 'display)
-                             (overlay-get ov 'before-string)))
-            (sort (seq-filter (lambda (ov) (overlay-get ov 'coq-eglot-more))
-                              (overlays-in (point-min) (point-max)))
-                  (lambda (a b) (< (overlay-start a) (overlay-start b)))))))
+(defun other-goals-overlay ()
+  "The overlay of the goals after the first one in the current buffer."
+  (seq-find (lambda (ov) (overlay-get ov 'coq-other-goals))
+            (overlays-in (point-min) (point-max))))
+
+(defun window-last-position (window)
+  "Position after the last line displayed in WINDOW."
+  (save-excursion
+    (goto-char (window-start window))
+    (vertical-motion (window-body-height window) window)
+    (point)))
 
 (ert-deftest coq-eglot-goals-show-last-hyps ()
   "When the goals do not fit, the last hypotheses and the conclusion are
-displayed, with an indicator of what is hidden."
+displayed, with arrows in the fringe, like in Proof General."
   (with-test-file
     (goto-marker "many")
     (run #'coq-eglot-goto-point)
     (let ((window (get-buffer-window "*goals*")))
       (should window)
       (with-current-buffer "*goals*"
+        (should (equal indicate-buffer-boundaries '((up . left) (down . left))))
         (should (> (window-start window) (point-min)))
         ;; the conclusion is visible
         (should (string-match-p "True\\'" (buffer-text "*goals*")))
-        (should (>= (save-excursion
-                      (goto-char (window-start window))
-                      (vertical-motion (window-body-height window) window)
-                      (point))
-                    (1- (point-max))))
-        (let ((indicators (more-indicators "*goals*")))
-          (should (= (length indicators) 1))
-          (should (string-match-p "\\`▲ [0-9]+ hypotheses above"
-                                  (car indicators))))
-        ;; scrolled to the top: the rest is below
-        (set-window-start window (point-min))
-        (coq-eglot--goals-scrolled window (point-min))
-        (should (equal (more-indicators "*goals*") '("▼ more below")))
-        ;; scrolling stops at the end, with an empty line after it
-        (let ((max (coq-eglot--max-window-start window)))
+        (should (>= (window-last-position window) (1- (point-max))))
+        ;; scrolling stops at the end
+        (let ((max (proof-goals--max-window-start window)))
           (should (> max (point-min)))
-          (coq-eglot--goals-scrolled window (1- (point-max)))
-          (should (= (window-start window) max))
-          (should (= (save-excursion
-                       (goto-char max)
-                       (vertical-motion (window-body-height window) window)
-                       (point))
-                     (point-max))))))
+          (proof-goals--scrolled window (1- (point-max)))
+          (should (= (window-start window) max)))))
     ;; the same with the conclusion apart
     (unwind-protect
         (progn
@@ -500,63 +494,89 @@ displayed, with an indicator of what is hidden."
             (with-current-buffer "*goals*"
               (should (> (window-start window) (point-min)))
               (should (string-match-p "H28 : 30 = 30\\'" (buffer-text "*goals*")))
-              (should (string-match-p "\\`▲"
-                                      (car (more-indicators "*goals*")))))))
+              (should (>= (window-last-position window) (1- (point-max)))))))
       (coq-eglot-toggle-split-goals))
-    ;; everything fits: no indicator, no scrolling
+    ;; everything fits: no scrolling
     (goto-marker "split")
     (run #'coq-eglot-goto-point)
-    (should-not (more-indicators "*goals*"))
     (let ((window (get-buffer-window "*goals*")))
       (with-current-buffer "*goals*"
-        (coq-eglot--goals-scrolled window (1- (point-max)))
+        (should (= (window-start window) (point-min)))
+        (proof-goals--scrolled window (1- (point-max)))
         (should (= (window-start window) (point-min)))))))
 
+(defvar coq-prefer-top-of-conclusion)     ; let-bound
+
+(defun separator-line ()
+  "Start of the line of the separator in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (search-forward "=====")
+    (line-beginning-position)))
+
 (ert-deftest coq-eglot-goals-show-goal-first ()
-  "When the goal does not fit with the hypotheses, its beginning and the
-separator are displayed, after the indicator of the hypotheses above."
+  "When the goal does not fit, with `coq-prefer-top-of-conclusion', its
+separator is on the first line, like in Proof General."
   (with-test-file
-    (goto-marker "long")
-    (run #'coq-eglot-goto-point)
-    (let ((window (get-buffer-window "*goals*")))
-      (with-current-buffer "*goals*"
-        (let ((separator (save-excursion
-                           (goto-char (point-min))
-                           (search-forward "=====")
-                           (line-beginning-position))))
-          ;; the separator is on the second line of the window
-          (should (= (save-excursion
-                       (goto-char (window-start window))
-                       (vertical-motion 1 window)
-                       (point))
-                     separator))
-          (should (equal (more-indicators "*goals*")
-                         '("▲ 10 hypotheses above" "▼ more below"))))))))
+    (let ((coq-prefer-top-of-conclusion t))
+      (goto-marker "long")
+      (run #'coq-eglot-goto-point)
+      (let ((window (get-buffer-window "*goals*")))
+        (with-current-buffer "*goals*"
+          (should (= (window-start window) (separator-line))))))
+    (let ((coq-prefer-top-of-conclusion nil))
+      (coq-eglot--scroll-goals)
+      (let ((window (get-buffer-window "*goals*")))
+        (with-current-buffer "*goals*"
+          (should (> (window-start window) (separator-line))))))))
 
 (ert-deftest coq-eglot-fold-other-goals ()
   "The goals after the first one are folded to their number, with the
-number of unfocused goals.  A click unfolds them."
+number of unfocused goals.  A click unfolds them.  The mode line gives
+the numbers of goals.  Like in Proof General."
   (with-test-file
     (unwind-protect
         (progn
           (goto-marker "split")
           (run #'coq-eglot-goto-point)
-          (should (string-match-p "double n = n \\+ n\n\n▸ 1 more goal\\'"
-                                  (buffer-text "*goals*")))
-          (should-not (string-match-p "goal 2 is" (buffer-text "*goals*")))
           (with-current-buffer "*goals*"
-            (goto-char (point-min))
-            (search-forward "▸")
-            (should (eq (key-binding (kbd "RET")) #'coq-eglot-toggle-other-goals))
-            (call-interactively (key-binding (kbd "RET"))))
-          (should (string-match-p "▾ 1 more goal\n\ngoal 2 is:\n True\\'"
-                                  (buffer-text "*goals*")))
-          (coq-eglot-toggle-other-goals)
+            (should (string-match-p "double n = n \\+ n\n\ngoal 2 is:\n True\\'"
+                                    (buffer-text "*goals*")))
+            (should (equal (substring-no-properties
+                            (overlay-get (other-goals-overlay) 'display))
+                           "▸ 1 more goal"))
+            (should (equal (coq-goals-mode-line) " 2+0"))
+            (goto-char (coq-goals-folded-start))
+            (should (eq (key-binding (kbd "RET")) #'coq-toggle-other-goals))
+            (call-interactively (key-binding (kbd "RET")))
+            (should-not coq-fold-other-goals)
+            (should (equal (substring-no-properties
+                            (overlay-get (other-goals-overlay) 'before-string))
+                           "▾ 1 more goal\n")))
+          (coq-toggle-other-goals)
           ;; in a bullet, the other goal is unfocused
           (goto-marker "hello")
           (run #'coq-eglot-goto-point)
-          (should (string-match-p "▸ 1 unfocused goal\\'" (buffer-text "*goals*"))))
-      (setq coq-eglot-fold-other-goals t))))
+          (with-current-buffer "*goals*"
+            (should (string-match-p "\\*\\*\\* Unfocused goals:\n\ngoal 2 is:\n True\\'"
+                                    (buffer-text "*goals*")))
+            (should (equal (substring-no-properties
+                            (overlay-get (other-goals-overlay) 'display))
+                           "▸ 1 unfocused goal"))
+            (should (equal (coq-goals-mode-line) " 1+1"))
+            (should (equal (get-text-property 1 'help-echo (coq-goals-mode-line))
+                           "Goals: 1 focused, 1 unfocused")))
+          ;; the bullet proved: no goal focused
+          (goto-marker "subproof")
+          (search-backward "-")
+          (run #'coq-eglot-goto-point)
+          (with-current-buffer "*goals*"
+            (should (string-match-p "\\`This subproof is complete"
+                                    (buffer-text "*goals*")))
+            (should (equal (coq-goals-mode-line) " 0+1"))
+            (should (= (window-start (get-buffer-window "*goals*"))
+                       (point-min)))))
+      (setq coq-fold-other-goals t))))
 
 (defun hyp-overlay (name property)
   "Overlay with PROPERTY on the line of hypothesis NAME in the goals."

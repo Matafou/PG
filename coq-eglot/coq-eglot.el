@@ -52,6 +52,8 @@
 (require 'coq-eglot-lsp)
 (require 'coq-eglot-compile)
 (require 'pg-double-hit)
+(require 'coq-goals)                    ; folding, number of goals
+(require 'pg-goals-indicators)          ; goals out of view
 
 (defvar coq-eglot-mode)                 ; defined below
 
@@ -87,23 +89,6 @@ effect when the server starts managing the buffer."
   "Face of the line between the hypotheses and the conclusion.
 See `coq-eglot-split-goals'.  The default inherits from `shadow', which
 themes make visible on their background."
-  :group 'coq-eglot)
-
-(defcustom coq-eglot-fold-other-goals t
-  "If non-nil, the goals other than the first one are folded.
-Only their number is displayed, with the number of unfocused goals, on
-a line that unfolds them when clicked, see
-`coq-eglot-toggle-other-goals'."
-  :type 'boolean
-  :group 'coq-eglot)
-
-(defface coq-eglot-other-goals '((t :inherit shadow))
-  "Face of the line giving the number of the other goals.
-See `coq-eglot-fold-other-goals'."
-  :group 'coq-eglot)
-
-(defface coq-eglot-more-indicator '((t :inherit shadow))
-  "Face of the lines telling that the goals continue above or below."
   :group 'coq-eglot)
 
 (defcustom coq-eglot-resize-windows-function
@@ -376,9 +361,10 @@ window.  Queries run on the active script buffer."
 (define-derived-mode coq-eglot-goals-mode coq-eglot-output-mode "Coq Goals"
   "Major mode for the goals of the Eglot backend of Coq."
   (setq-local font-lock-defaults '(coq-goals-font-lock-keywords))
-  (add-hook 'window-scroll-functions #'coq-eglot--goals-scrolled nil t)
-  (add-hook 'window-size-change-functions #'coq-eglot--update-more-indicators
-            nil t))
+  ;; like in Proof General, see coq-goals.el and pg-goals-indicators.el
+  (proof-goals-indicators-setup)
+  (setq coq-goals-count-function #'coq-eglot--goals-count)
+  (setq mode-line-process '(:eval (coq-goals-mode-line))))
 
 (define-derived-mode coq-eglot-response-mode coq-eglot-output-mode "Coq Response"
   "Major mode for the messages of the Eglot backend of Coq."
@@ -436,7 +422,10 @@ buffer that is not active: only the active one displays its state."
     (let ((inhibit-read-only t))
       (erase-buffer)
       (insert text)
-      (goto-char (point-min))))
+      (goto-char (point-min)))
+    ;; before resizing: folded, the other goals take one line
+    (when (derived-mode-p 'coq-eglot-goals-mode)
+      (coq-goals-fold-other-goals)))
   (when coq-eglot-resize-windows-function
     (funcall coq-eglot-resize-windows-function)))
 
@@ -531,46 +520,43 @@ highlight and fold it, see `coq-eglot-toggle-highlight-hyp'."
                             level count))
               (plist-get goals :stack) 0))
 
-(defvar-keymap coq-eglot-other-goals-map
-  :doc "Keymap of the line giving the number of the other goals."
-  "<mouse-1>" #'coq-eglot-toggle-other-goals
-  "RET" #'coq-eglot-toggle-other-goals)
+(defvar coq-eglot--displayed-goals nil
+  "Goals of the last answer displayed, to display them again.")
+
+(defun coq-eglot--unfocused-goals (goals)
+  "The unfocused goals of GOALS, the innermost level first."
+  (seq-mapcat (lambda (level) (seq-mapcat #'identity level 'list))
+              (plist-get goals :stack) 'list))
+
+(defun coq-eglot--goals-count ()
+  "Numbers of the goals displayed, as (FOCUSED . UNFOCUSED), or nil.
+Nil outside of proofs.  This is `coq-goals-count-function' for the
+Eglot backend: the server gives the unfocused goals, whatever Set
+Printing Unfocused."
+  (when coq-eglot--displayed-goals
+    (cons (length (plist-get coq-eglot--displayed-goals :goals))
+          (coq-eglot--unfocused-count coq-eglot--displayed-goals))))
+
+(defun coq-eglot--format-goal-list (goals first)
+  "Format GOALS, numbered from FIRST, like Coq does for the other goals."
+  (let ((i (1- first)))
+    (mapconcat (lambda (goal)
+                 (setq i (1+ i))
+                 (format "\ngoal %d is:\n %s\n" i (plist-get goal :ty)))
+               goals "")))
 
 (defun coq-eglot--format-other-goals (goals)
   "Format the goals of GOALS after the first one.
-A line with their number and the number of unfocused goals, clickable,
-then the goals unless `coq-eglot-fold-other-goals'."
-  (let* ((focused (plist-get goals :goals))
-         (others (1- (length focused)))
-         (unfocused (coq-eglot--unfocused-count goals))
-         (plural (lambda (n) (if (= n 1) "" "s"))))
-    (if (and (= others 0) (= unfocused 0))
-        ""
-      (concat
-       "\n"
-       (propertize
-        (concat (if coq-eglot-fold-other-goals "▸ " "▾ ")
-                (string-join
-                 (delq nil
-                       (list (when (> others 0)
-                               (format "%d more goal%s" others
-                                       (funcall plural others)))
-                             (when (> unfocused 0)
-                               (format (if (> others 0) "%d unfocused"
-                                         "%d unfocused goal%s")
-                                       unfocused (funcall plural unfocused)))))
-                 ", "))
-        'font-lock-face 'coq-eglot-other-goals
-        'mouse-face 'highlight
-        'help-echo "mouse-1, RET: show or hide the other goals"
-        'keymap coq-eglot-other-goals-map)
-       "\n"
-       (if coq-eglot-fold-other-goals
-           ""
-         (mapconcat (lambda (i)
-                      (format "\ngoal %d is:\n %s\n" (1+ i)
-                              (plist-get (aref focused i) :ty)))
-                    (number-sequence 1 others) ""))))))
+Like Coq with Set Printing Unfocused: the unfocused goals come after a
+line \"*** Unfocused goals:\".  coq-goals.el folds them, see
+`coq-fold-other-goals'."
+  (let ((others (cdr (append (plist-get goals :goals) nil)))
+        (unfocused (coq-eglot--unfocused-goals goals)))
+    (concat (coq-eglot--format-goal-list others 2)
+            (when unfocused
+              (concat "\n*** Unfocused goals:\n"
+                      (coq-eglot--format-goal-list unfocused
+                                                   (+ 2 (length others))))))))
 
 (defun coq-eglot--format-goals-parts (goals &optional no-separator)
   "Format GOALS, as returned by the server, like Coq does.
@@ -588,12 +574,15 @@ the conclusion if NO-SEPARATOR."
          (concat (format "%d goal%s\n\n" n (if (= n 1) "" "s"))
                  (coq-eglot--format-hyps (aref focused 0)))
          (concat
-          (propertize (coq-eglot--format-conclusion (aref focused 0)
-                                                    no-separator)
-                      'coq-eglot-conclusion t)
+          (coq-eglot--format-conclusion (aref focused 0) no-separator)
           (coq-eglot--format-other-goals goals))))
        ((coq-eglot--unfocused-p goals)
-        (cons "" "This subproof is complete, but there are some unfocused goals.\n"))
+        (let ((unfocused (coq-eglot--unfocused-goals goals)))
+          (cons ""
+                (concat "This subproof is complete, but there are some unfocused goals.\n"
+                        (format "\n%d goal%s\n" (length unfocused)
+                                (if (cdr unfocused) "s" ""))
+                        (coq-eglot--format-goal-list unfocused 1)))))
        ((> (length (plist-get goals :given_up)) 0)
         (cons "" "No more goals, but there are some goals you gave up.\n"))
        ((> (length (plist-get goals :shelf)) 0)
@@ -610,9 +599,6 @@ Return the empty string if GOALS is nil (outside of proofs)."
   "Format MESSAGES of a sentence, as returned by the server."
   (mapconcat (lambda (m) (if (stringp m) m (plist-get m :text)))
              messages "\n"))
-
-(defvar coq-eglot--displayed-goals nil
-  "Goals of the last answer displayed, to display them again.")
 
 (defun coq-eglot--show-goals (answer)
   "Display the goals of ANSWER of the server.
@@ -637,151 +623,41 @@ See `coq-eglot-split-goals'."
     (coq-eglot--decorate-hyps)
     (coq-eglot--scroll-goals)))
 
-(defun coq-eglot-toggle-other-goals ()
-  "Fold or unfold the goals other than the first one.
-See `coq-eglot-fold-other-goals'."
-  (interactive)
-  (setq coq-eglot-fold-other-goals (not coq-eglot-fold-other-goals))
-  (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals)))
+(defun coq-eglot--goals-buffer ()
+  "The goals buffer holding the goals after the first one, or nil.
+The conclusion buffer if `coq-eglot-split-goals'.  This is
+`coq-goals-buffer-function' for the Eglot backend."
+  (get-buffer (if coq-eglot-split-goals coq-eglot-conclusion-buffer-name
+                coq-eglot-goals-buffer-name)))
 
-(defun coq-eglot--goals-anchor ()
-  "Position of the goals buffer to show at the bottom of its window.
-The end of the conclusion of the first goal, or the end of the buffer
-if the other goals are folded or the conclusion is apart."
-  (let ((start (text-property-any (point-min) (point-max)
-                                  'coq-eglot-conclusion t)))
-    (if (and start (not coq-eglot-fold-other-goals))
-        (next-single-property-change start 'coq-eglot-conclusion nil
-                                     (point-max))
-      (point-max))))
+(setq coq-goals-buffer-function #'coq-eglot--goals-buffer)
 
-(defun coq-eglot--goals-start (window anchor)
-  "Start of WINDOW showing ANCHOR at the bottom, but the goal first.
-If the goal does not fit with the last hypotheses, show the separator
-and the beginning of the goal, after one line for the indicator of the
-hypotheses above."
-  (save-excursion
-    (goto-char anchor)
-    (skip-chars-backward "\n")
-    (vertical-motion (- 1 (window-body-height window)) window)
-    (let ((start (point))
-          (separator (text-property-any (point-min) (point-max)
-                                        'coq-eglot-conclusion t)))
-      (if (and separator (> start separator))
-          (progn
-            (goto-char separator)
-            (vertical-motion -1 window)
-            (point))
-        start))))
-
-(defun coq-eglot--scroll-goals ()
-  "Show the last hypotheses and the conclusion in the goals window.
-The hypotheses near the conclusion matter most: if not everything fits,
-the beginning is hidden.  The conclusion window starts at the top."
-  (dolist (spec `((,coq-eglot-goals-buffer-name . coq-eglot--goals-anchor)
-                  (,coq-eglot-conclusion-buffer-name . nil)))
-    (let ((buffer (get-buffer (car spec))))
-      (when buffer
-        (dolist (window (get-buffer-window-list buffer nil t))
-          (with-current-buffer buffer
-            (let ((start (if (not (cdr spec))
-                             (point-min)
-                           (coq-eglot--goals-start window (funcall (cdr spec))))))
-              ;; forced: the redisplay moves point into the window
-              (set-window-start window start)
-              (coq-eglot--update-more-indicators window start))))))))
-
-(defvar coq-eglot-goals-scroll-margin 1
-  "Number of empty lines that scrolling can show after the goals.
-Scrolling further would only hide them.")
-
-(defun coq-eglot--max-window-start (window)
-  "Last start of WINDOW still showing the end of its buffer.
-With `coq-eglot-goals-scroll-margin' empty lines after it, but no
-scrolling at all if the whole buffer fits."
+(defun coq-eglot--hyps-window-start (window)
+  "Start of WINDOW showing the last hypotheses at its bottom.
+For the goals buffer when the conclusion is apart."
   (with-current-buffer (window-buffer window)
     (save-excursion
       (goto-char (point-max))
-      (skip-chars-backward "\n")
-      (let ((last (point)))
-        (goto-char (point-min))
-        (if (and (= (vertical-motion (window-body-height window) window)
-                    (window-body-height window))
-                 (<= (point) last))
-            (progn
-              (goto-char last)
-              (vertical-motion (- (1+ coq-eglot-goals-scroll-margin)
-                                  (window-body-height window))
-                               window)
-              (point))
-          (point-min))))))
+      (skip-chars-backward " \t\n")
+      (vertical-motion (- 1 (window-body-height window)) window)
+      (point))))
 
-(defun coq-eglot--goals-scrolled (window start)
-  "Keep the end of the goals in WINDOW, scrolled to START.
-Scrolling stops when the last line reaches the bottom, see
-`coq-eglot-goals-scroll-margin'.  Then update the indicators.  For
-`window-scroll-functions'."
-  (let ((max (coq-eglot--max-window-start window)))
-    (when (> start max)
-      (set-window-start window max)
-      (setq start max)))
-  (coq-eglot--update-more-indicators window start))
-
-(defun coq-eglot--update-all-more-indicators ()
-  "Update the indicators of all the windows of the goals.
-See `coq-eglot--update-more-indicators'."
-  (dolist (name (list coq-eglot-goals-buffer-name
-                      coq-eglot-conclusion-buffer-name))
-    (let ((buffer (get-buffer name)))
-      (when buffer
-        (mapc #'coq-eglot--update-more-indicators
-              (get-buffer-window-list buffer nil t))))))
-
-(defun coq-eglot--more-overlay (window start end text)
-  "Display TEXT instead of the text from START to END, in WINDOW only."
-  (let ((ov (make-overlay start end)))
-    (overlay-put ov 'coq-eglot-more window)
-    (overlay-put ov 'window window)
-    (overlay-put ov 'evaporate t)
-    (overlay-put ov (if (= start end) 'before-string 'display)
-                 (propertize text 'face 'coq-eglot-more-indicator))))
-
-(defun coq-eglot--update-more-indicators (window &optional start)
-  "Tell in WINDOW if the goals continue above or below.
-The first or the last line displayed is replaced by an indicator: the
-height does not change.  START is the start of WINDOW, if known.  For
-`window-scroll-functions' and `window-size-change-functions'."
-  ;; not `with-selected-window': it would move point to the window point
-  (when (window-live-p window)
-    (with-current-buffer (window-buffer window)
-      (remove-overlays (point-min) (point-max) 'coq-eglot-more window)
-      (let ((start (or start (window-start window)))
-            (height (window-body-height window)))
-        (when (>= height 3)
-          (save-excursion
-            (goto-char start)
-            (vertical-motion 1 window)
-            (let ((first-end (if (eq (char-before) ?\n) (1- (point)) (point))))
-              (when (> start (point-min))
-                (let ((hyps (seq-count (lambda (region)
-                                         (< (cadr region) first-end))
-                                       (coq-eglot--hyp-regions))))
-                  (coq-eglot--more-overlay
-                   window start first-end
-                   (if (and (> hyps 0)
-                            (equal (buffer-name) coq-eglot-goals-buffer-name))
-                       (format "▲ %d hypothes%s above" hyps
-                               (if (= hyps 1) "is" "es"))
-                     "▲ more above")))))
-            (goto-char start)
-            (vertical-motion (1- height) window)
-            (let ((last-start (point)))
-              (vertical-motion 1 window)
-              (unless (string-blank-p (buffer-substring (point) (point-max)))
-                (coq-eglot--more-overlay
-                 window last-start
-                 (if (eq (char-before) ?\n) (1- (point)) (point))
-                 "▼ more below")))))))))
+(defun coq-eglot--scroll-goals ()
+  "Show the first goal in the goals windows.
+Like in Proof General, see `coq-goals-show-first-goal'.  With the
+conclusion apart, the goals window shows the last hypotheses, the
+conclusion window starts at the top."
+  (let ((goals (get-buffer coq-eglot-goals-buffer-name))
+        (conclusion (get-buffer coq-eglot-conclusion-buffer-name)))
+    (when goals
+      (if (not coq-eglot-split-goals)
+          (coq-goals-show-first-goal goals)
+        (dolist (window (get-buffer-window-list goals nil t))
+          ;; forced: the redisplay moves point into the window
+          (set-window-start window (coq-eglot--hyps-window-start window)))))
+    (when (and conclusion coq-eglot-split-goals)
+      (dolist (window (get-buffer-window-list conclusion nil t))
+        (set-window-start window 1)))))
 
 (defun coq-eglot--set-separator (name)
   "Draw a line at the top of the windows of buffer NAME.
@@ -895,7 +771,6 @@ point, if it is a hypothesis of the goals buffer."
                  (seq-difference (symbol-value var) names)
                (append names (symbol-value var))))
     (coq-eglot--decorate-hyps)
-    (coq-eglot--update-all-more-indicators)
     (message "Coq: %s %s" (string-join names ", ")
              (if (seq-intersection names (symbol-value var)) verb
                (concat "un" verb)))))
@@ -912,8 +787,7 @@ goals.  See `coq-highlighted-hyps-bg'."
   "Remove the highlighting of all the hypotheses."
   (interactive)
   (setq coq-eglot--highlighted-hyps nil)
-  (coq-eglot--decorate-hyps)
-  (coq-eglot--update-all-more-indicators))
+  (coq-eglot--decorate-hyps))
 
 (defun coq-eglot-toggle-fold-hyp ()
   "Toggle the folding of the hypothesis at point: hide its type.
@@ -925,8 +799,7 @@ See `coq-eglot-toggle-highlight-hyp' for the hypothesis at point."
   "Unfold all the hypotheses."
   (interactive)
   (setq coq-eglot--folded-hyps nil)
-  (coq-eglot--decorate-hyps)
-  (coq-eglot--update-all-more-indicators))
+  (coq-eglot--decorate-hyps))
 
 (defun coq-eglot--highlight-cited-hyps (messages)
   "Highlight the hypotheses cited in MESSAGES, the answer of a Search.
@@ -1551,8 +1424,8 @@ Run when Eglot starts or stops managing the buffer."
     ["Layout Windows" coq-eglot-layout-windows]
     ["Conclusion Apart" coq-eglot-toggle-split-goals
      :style toggle :selected coq-eglot-split-goals]
-    ["Fold Other Goals" coq-eglot-toggle-other-goals
-     :style toggle :selected coq-eglot-fold-other-goals]
+    ["Fold Other Goals" coq-toggle-other-goals
+     :style toggle :selected coq-fold-other-goals]
     ["Compile Before Require" coq-compile-before-require-toggle
      :style toggle :selected coq-compile-before-require]
     ["Double Hit Electric Terminator" proof-double-hit-toggle
