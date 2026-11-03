@@ -520,6 +520,13 @@ They come back if closed, with their default sizes, see
     (let ((window (get-buffer-window selected)))
       (when window (select-window window)))))
 
+(defun coq-eglot-set-layout-option (option value)
+  "Set OPTION to VALUE, like customize does, and lay out the windows again.
+For the menu: OPTION is `proof-three-window-enable' or
+`proof-three-window-mode-policy', see `coq-eglot-layout-windows'."
+  (customize-set-variable option value)
+  (coq-eglot-layout-windows))
+
 (defun coq-eglot--set-buffer-text (name mode text)
   "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
 Then adjust the heights of the windows, see
@@ -1535,8 +1542,7 @@ Run when Eglot starts or stops managing the buffer."
 (keymap-set coq-eglot-goals-mode-map "f" #'coq-eglot-toggle-fold-hyp)
 (keymap-set coq-eglot-goals-mode-map "F" #'coq-eglot-unfold-hyps)
 
-(easy-menu-define coq-eglot-menu coq-eglot-mode-map
-  "Menu of the Eglot backend of Coq."
+(defvar coq-eglot--menu-spec
   '("Coq"
     ["Next Step" coq-eglot-assert-next-command]
     ["Undo Step" coq-eglot-undo-last-command]
@@ -1546,7 +1552,35 @@ Run when Eglot starts or stops managing the buffer."
     ["Goto End of Locked" coq-eglot-goto-end-of-locked]
     "---"
     ["Show Goals" coq-eglot-show-goals]
-    ["Layout Windows" coq-eglot-layout-windows]
+    ("Windows"
+     ["Layout Windows" coq-eglot-layout-windows]
+     ["Three Windows"
+      (coq-eglot-set-layout-option 'proof-three-window-enable
+                                   (not proof-three-window-enable))
+      :style toggle :selected proof-three-window-enable
+      :help "Goals and messages in windows of their own"]
+     ("3 Windows mode layout"
+      ["smart"
+       (coq-eglot-set-layout-option 'proof-three-window-mode-policy 'smart)
+       :style radio :selected (eq proof-three-window-mode-policy 'smart)
+       :active proof-three-window-enable
+       :help "Adapt to frame width (C-c C-l to refresh)"]
+      ["hybrid"
+       (coq-eglot-set-layout-option 'proof-three-window-mode-policy 'hybrid)
+       :style radio :selected (eq proof-three-window-mode-policy 'hybrid)
+       :active proof-three-window-enable
+       :help "Two column mode"]
+      ["horizontal"
+       (coq-eglot-set-layout-option 'proof-three-window-mode-policy
+                                    'horizontal)
+       :style radio :selected (eq proof-three-window-mode-policy 'horizontal)
+       :active proof-three-window-enable
+       :help "Three column mode"]
+      ["vertical"
+       (coq-eglot-set-layout-option 'proof-three-window-mode-policy 'vertical)
+       :style radio :selected (eq proof-three-window-mode-policy 'vertical)
+       :active proof-three-window-enable
+       :help "One column mode"]))
     ["Conclusion Apart" coq-eglot-toggle-split-goals
      :style toggle :selected coq-eglot-split-goals]
     ["Fold Other Goals" coq-toggle-other-goals
@@ -1578,7 +1612,12 @@ Run when Eglot starts or stops managing the buffer."
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
-    ["Exit Server" coq-eglot-exit]))
+    ["Exit Server" coq-eglot-exit])
+  "Menu of the Eglot backend of Coq, see `easy-menu-define'.")
+
+(easy-menu-define coq-eglot-menu coq-eglot-mode-map
+  "Menu of the Eglot backend of Coq."
+  coq-eglot--menu-spec)
 
 ;; the same keys in the goals and response buffers, like Proof General
 (set-keymap-parent coq-eglot-output-mode-map

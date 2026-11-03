@@ -576,6 +576,34 @@ otherwise."
                              (output-windows))
                      '("*goals*"))))))
 
+(ert-deftest coq-eglot-layout-menu ()
+  "The menu chooses the layout, like the Buffers menu of Proof General."
+  (with-test-file
+    (with-layout t 'hybrid
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (let ((items (mapcar (lambda (item) (and (vectorp item) (aref item 0)))
+                           (cdr (assoc "3 Windows mode layout"
+                                       (cdr (assoc "Windows"
+                                                   (cdr coq-eglot--menu-spec))))))))
+        (should (equal items '("smart" "hybrid" "horizontal" "vertical"))))
+      (unwind-protect
+          (progn
+            (coq-eglot-set-layout-option 'proof-three-window-mode-policy
+                                         'vertical)
+            (should (eq proof-three-window-mode-policy 'vertical))
+            (pcase-let ((`(,script ,goals)
+                         (windows-of (current-buffer) "*goals*")))
+              (should (= (window-left-column script)
+                         (window-left-column goals)))
+              (should (< (window-top-line script) (window-top-line goals))))
+            (coq-eglot-set-layout-option 'proof-three-window-enable nil)
+            (should (equal (mapcar (lambda (w) (buffer-name (window-buffer w)))
+                                   (output-windows))
+                           '("*goals*"))))
+        (customize-set-variable 'proof-three-window-enable t)
+        (customize-set-variable 'proof-three-window-mode-policy 'hybrid)))))
+
 (ert-deftest coq-eglot-layout-policy ()
   "The smart policy depends on the width of the frame, like in Proof
 General."
