@@ -648,13 +648,15 @@ checks, like in Proof General."
 (defun type-dot ()
   "Type \".\" in the current buffer."
   (let ((last-command-event ?.))
-    (call-interactively #'coq-eglot-terminator-insert)))
+    (call-interactively (key-binding "."))))
 
 (ert-deftest coq-eglot-double-hit ()
   "With `proof-double-hit-enable', hitting \".\" twice quickly processes up
-to it, like in Proof General."
+to it, like in Proof General.  The terminator command is common to all
+backends."
   (with-test-file
-    (should (eq (key-binding ".") #'coq-eglot-terminator-insert))
+    (should (eq (key-binding ".") #'coq-terminator-insert))
+    (should (eq coq-terminator-insert-function #'coq-eglot-terminator-insert))
     (goto-marker "hyps next")
     (delete-char -1)
     (let ((proof-double-hit-enable nil))
@@ -674,6 +676,15 @@ to it, like in Proof General."
       (delete-char -2)
       (type-dot)
       (type-dot)
+      (wait-for-coq)
+      (should (looking-back "symmetry\\." (line-beginning-position)))
+      (should (position-at-marker-p "hyps next"))
+      ;; another key bound to the terminator command gives "."
+      (run #'coq-eglot-retract-buffer)
+      (delete-char -1)
+      (let ((last-command-event ?\;))
+        (coq-terminator-insert)
+        (coq-terminator-insert))
       (wait-for-coq)
       (should (looking-back "symmetry\\." (line-beginning-position)))
       (should (position-at-marker-p "hyps next")))))

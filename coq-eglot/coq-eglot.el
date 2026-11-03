@@ -1582,12 +1582,11 @@ buffers."
 ;;; Double hit
 
 (defun coq-eglot-terminator-insert (&optional count)
-  "Insert \".\", or process up to it on a double hit.
-See `proof-double-hit-enable'.  With COUNT, insert COUNT dots."
-  (interactive "P")
-  (proof-double-hit-insert #'coq-eglot-goto-point count))
-
-(put 'coq-eglot-terminator-insert 'delete-selection t)
+  "Insert the key typed, COUNT times, or process up to it on a double hit.
+On a double hit, \".\" replaces the key.  See `proof-double-hit-enable'.
+This is `coq-terminator-insert-function' for the Eglot backend, the key
+is bound to `coq-terminator-insert'."
+  (proof-double-hit-insert #'coq-eglot-goto-point count "."))
 
 ;;; Hover
 
@@ -1627,8 +1626,7 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-a C-c" #'coq-eglot-Check
   "C-c C-a C-o" #'coq-eglot-SearchPattern
   "C-c C-a C-p" #'coq-eglot-Print
-  "C-c C-v" #'coq-eglot-query
-  "." #'coq-eglot-terminator-insert)
+  "C-c C-v" #'coq-eglot-query)
 
 (when coq-remap-mouse-1
   (dolist (modifiers '("C-" "S-" "C-S-" "C-M-" "M-S-"))
@@ -1719,6 +1717,7 @@ Warn if processed Require sentences load outdated libraries."
                     (append coq-eglot-ignored-capabilities
                             eglot-ignored-server-capabilities))
         (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
+        (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
@@ -1726,6 +1725,7 @@ Warn if processed Require sentences load outdated libraries."
         (add-hook 'kill-buffer-hook #'coq-eglot--forget-active nil t)
         (coq-eglot--update-overlays))
     (setq coq-eglot-lsp-progress-function nil)
+    (kill-local-variable 'coq-terminator-insert-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)
