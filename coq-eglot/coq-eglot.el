@@ -368,8 +368,10 @@ error."
   "Parent mode of the goals and response buffers of the Eglot backend.
 Read-only, with the keys of the script buffer, but not those of
 `special-mode': like in Proof General, \"q\" does not close the
-window."
-  (setq buffer-read-only t))
+window.  Queries run on the active script buffer."
+  :syntax-table coq-mode-syntax-table   ; for `coq-id-at-point'
+  (setq buffer-read-only t)
+  (setq coq-query-function #'coq-eglot-run-query))
 
 (define-derived-mode coq-eglot-goals-mode coq-eglot-output-mode "Coq Goals"
   "Major mode for the goals of the Eglot backend of Coq."
@@ -880,7 +882,7 @@ point, if it is a hypothesis of the goals buffer."
       (or (get-text-property (point) 'coq-eglot-hyp)
           (and (> (point) (point-min))
                (get-text-property (1- (point)) 'coq-eglot-hyp)))
-    (let ((id (coq-eglot--id-at-point)))
+    (let ((id (coq-id-at-point)))
       (when id
         (seq-some (lambda (region) (and (member id (car region)) (car region)))
                   (coq-eglot--hyp-regions))))))
@@ -1430,76 +1432,44 @@ meanwhile."
 
 ;;; Queries
 
+;; The query commands are common to all backends, see coq-queries.el.
+
 (defvar coq-eglot--query-history nil
-  "History of the arguments of queries.")
+  "History of the queries of `coq-eglot-query'.")
 
-(defcustom coq-eglot-query-flags
-  '(("All" . "Set Printing All")
-    ("Implicit" . "Set Printing Implicit")
-    ("Coercions" . "Set Printing Coercions")
-    ("Parentheses" . "Set Printing Parentheses")
-    ("No Notations" . "Unset Printing Notations")
-    ("Universes" . "Set Printing Universes"))
-  "Printing flags that a query can use, by name.
-With \\[universal-argument] \\[universal-argument], query commands ask
-which ones to use.  Each value is a Coq command run just before the
-query, for this query only."
-  :type '(alist :key-type (string :tag "Name")
-                :value-type (string :tag "Coq command"))
-  :group 'coq-eglot)
-
-(defun coq-eglot--query-flags (arg)
-  "Return the flag commands for a query with prefix argument ARG.
-None without prefix, Set Printing All with \\[universal-argument],
-otherwise ask among `coq-eglot-query-flags'."
-  (cond
-   ((null arg) nil)
-   ((equal arg '(4)) (list "Set Printing All"))
-   (t (mapcar (lambda (name) (cdr (assoc name coq-eglot-query-flags)))
-              (completing-read-multiple "Printing flags: "
-                                        coq-eglot-query-flags nil t)))))
-
-(defun coq-eglot--query-prompt (prompt flags)
-  "PROMPT for a query, mentioning FLAGS if any."
-  (if flags (format "%s [%s]" prompt (string-join flags ", ")) prompt))
-
-(defun coq-eglot--id-at-point ()
-  "Return the qualified identifier at point, or nil."
-  (save-excursion
-    (skip-chars-backward "[:alnum:]_'.")
-    (skip-chars-forward ".")
-    (when (looking-at "[[:alpha:]_][[:alnum:]_'.]*")
-      (string-trim-right (match-string-no-properties 0) "\\.+"))))
-
-(defun coq-eglot--read-query-argument (prompt)
-  "Read the argument of a query with PROMPT.
-The default is the region if active, or the identifier at point."
-  (let ((guess (if (use-region-p)
-                   (buffer-substring-no-properties (region-beginning)
-                                                   (region-end))
-                 (coq-eglot--id-at-point))))
-    (read-string (format-prompt prompt guess) nil
-                 'coq-eglot--query-history guess)))
-
-(defun coq-eglot-query (command &optional flags then)
+(defun coq-eglot-run-query (command &optional flags then)
   "Run Coq COMMAND at the proof position and display its messages.
 COMMAND does not change the document, nor the proof position.  The
 final dot may be omitted.  FLAGS are Coq commands run just before,
-like \"Set Printing All\", for this query only.  Interactively, they
-come from the prefix argument, see `coq-eglot--query-flags'.  If
-non-nil, THEN is called with the messages after they are displayed."
+like \"Set Printing All\", for this query only.  THEN is nil or a
+function called without argument once the messages are displayed.  A
+Search highlights the hypotheses it finds, see
+`coq-highlight-hyps-cited-in-response'.  This is `coq-query-function'
+for the Eglot backend."
+  (coq-eglot--with-script
+    (coq-eglot--query
+     command flags
+     (lambda (messages)
+       (when (string-prefix-p "Search " command)
+         (coq-eglot--highlight-cited-hyps messages))
+       (when then (funcall then))))))
+
+(defun coq-eglot-query (command &optional flags)
+  "Run Coq COMMAND at the proof position, read in the minibuffer.
+With \\[universal-argument], with Printing All.  FLAGS are the commands
+setting printing flags, see `coq-eglot-run-query'."
   (interactive
-   (let ((flags (coq-eglot--query-flags current-prefix-arg)))
-     (list (read-string (format-prompt (coq-eglot--query-prompt
-                                        "Coq command" flags)
+   (let ((flags (and current-prefix-arg '("Set Printing All"))))
+     (list (read-string (format-prompt (if flags "Coq command [Printing All]"
+                                         "Coq command")
                                        nil)
                         nil 'coq-eglot--query-history)
            flags)))
-  (coq-eglot--with-script
-    (coq-eglot--query command flags then)))
+  (coq-eglot-run-query command flags))
 
 (defun coq-eglot--query (command flags then)
-  "Run Coq COMMAND after FLAGS, then THEN, see `coq-eglot-query'."
+  "Run Coq COMMAND after FLAGS, then THEN, see `coq-eglot-run-query'.
+THEN is called with the messages."
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
@@ -1516,68 +1486,6 @@ non-nil, THEN is called with the messages after they are displayed."
      (when then (funcall then messages)))
    (lambda (err)
      (coq-eglot--show-error (or (plist-get err :message) (format "%S" err))))))
-
-(defmacro coq-eglot--define-query (name command prompt &optional then)
-  "Define query NAME running Coq COMMAND on an argument read with PROMPT.
-THEN is called with the messages, see `coq-eglot-query'."
-  `(defun ,name (arg &optional flags)
-     ,(format "Run %s ARG at the proof position.
-With \\[universal-argument], with Printing All.  With \\[universal-argument] \
-\\[universal-argument], ask
-which printing flags to use, see `coq-eglot-query-flags'.  FLAGS are
-the commands setting them." command)
-     (interactive
-      (let ((flags (coq-eglot--query-flags current-prefix-arg)))
-        (list (coq-eglot--read-query-argument
-               (coq-eglot--query-prompt ,prompt flags))
-              flags)))
-     (coq-eglot-query (concat ,command " " arg) flags ,then)))
-
-(defun coq-eglot--call-with-prefix (command arg)
-  "Call COMMAND interactively with prefix argument ARG, for menus."
-  (let ((current-prefix-arg arg))
-    (call-interactively command)))
-
-(coq-eglot--define-query coq-eglot-About "About" "About")
-(coq-eglot--define-query coq-eglot-Check "Check" "Check")
-(coq-eglot--define-query coq-eglot-Search "Search"
-                         "Search (ex: \"eq_\" eq -bool)"
-                         #'coq-eglot--highlight-cited-hyps)
-(coq-eglot--define-query coq-eglot-SearchPattern "SearchPattern"
-                         "SearchPattern (parenthesis mandatory), ex: (?X1 + _ = _ + ?X1)")
-(coq-eglot--define-query coq-eglot-Print "Print" "Print")
-
-;;; Mouse queries
-
-(defcustom coq-remap-mouse-1 nil
-  "Whether control and shift mouse-1 run queries on the identifier clicked.
-See `coq-eglot-query-at-mouse'.  This overrides the global bindings of
-these keys (buffers and faces menus), hence nil by default.  Shared
-with the Proof General backend, read when the backend is loaded."
-  :type 'boolean
-  :group 'coq-eglot)
-
-(defun coq-eglot-query-at-mouse (event)
-  "Run a query on the identifier clicked with EVENT, like in Proof General.
-Control: Print, shift: About, control shift: Check.  With meta also,
-with Printing All.  In the script buffer and in the goals and response
-buffers."
-  (interactive "e")
-  (let* ((position (event-start event))
-         (modifiers (event-modifiers event))
-         (control (memq 'control modifiers))
-         (shift (memq 'shift modifiers))
-         (command (cond ((and control shift) "Check")
-                        (shift "About")
-                        (t "Print"))))
-    (with-current-buffer (window-buffer (posn-window position))
-      (let ((id (save-excursion
-                  (goto-char (posn-point position))
-                  (coq-eglot--id-at-point))))
-        (unless id (user-error "Coq: no identifier here"))
-        (coq-eglot-query (concat command " " id)
-                         (when (memq 'meta modifiers)
-                           (coq-eglot--query-flags '(4))))))))
 
 ;;; Double hit
 
@@ -1621,18 +1529,7 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-p" #'coq-eglot-show-goals
   "C-c C-l" #'coq-eglot-layout-windows
   "C-c C-." #'coq-eglot-goto-end-of-locked
-  "C-c C-a C-a" #'coq-eglot-Search
-  "C-c C-a C-b" #'coq-eglot-About
-  "C-c C-a C-c" #'coq-eglot-Check
-  "C-c C-a C-o" #'coq-eglot-SearchPattern
-  "C-c C-a C-p" #'coq-eglot-Print
   "C-c C-v" #'coq-eglot-query)
-
-(when coq-remap-mouse-1
-  (dolist (modifiers '("C-" "S-" "C-S-" "C-M-" "M-S-"))
-    (keymap-set coq-eglot-mode-map (concat modifiers "<down-mouse-1>")
-                #'coq-eglot-query-at-mouse)
-    (keymap-set coq-eglot-mode-map (concat modifiers "<mouse-1>") #'ignore)))
 
 ;; like in Proof General, in the goals buffer only
 (keymap-set coq-eglot-goals-mode-map "h" #'coq-eglot-toggle-highlight-hyp)
@@ -1666,35 +1563,31 @@ Run when Eglot starts or stops managing the buffer."
      ["Toggle Folding" coq-eglot-toggle-fold-hyp]
      ["Unfold All" coq-eglot-unfold-hyps])
     ("Queries"
-     ["About..." coq-eglot-About]
-     ["Check..." coq-eglot-Check]
-     ["Search..." coq-eglot-Search]
-     ["SearchPattern..." coq-eglot-SearchPattern]
-     ["Print..." coq-eglot-Print]
+     ["About..." coq-About]
+     ["Check..." coq-Check]
+     ["Print..." coq-Print]
+     ["Search..." coq-Search]
+     ["SearchPattern..." coq-SearchIsos]
+     ["Locate..." coq-LocateConstant]
+     ["Locate Notation..." coq-LocateNotation]
+     ["Print Hint" coq-PrintHint]
+     ["Query..." coq-query]
      ["Other Command..." coq-eglot-query]
      "---"
-     ["About with Printing All..."
-      (coq-eglot--call-with-prefix #'coq-eglot-About '(4))
-      :keys "C-u C-c C-a C-b"]
-     ["Check with Printing All..."
-      (coq-eglot--call-with-prefix #'coq-eglot-Check '(4))
-      :keys "C-u C-c C-a C-c"]
-     ("With Printing Flags"
-      ["About..." (coq-eglot--call-with-prefix #'coq-eglot-About '(16))]
-      ["Check..." (coq-eglot--call-with-prefix #'coq-eglot-Check '(16))]
-      ["Search..." (coq-eglot--call-with-prefix #'coq-eglot-Search '(16))]
-      ["SearchPattern..."
-       (coq-eglot--call-with-prefix #'coq-eglot-SearchPattern '(16))]
-      ["Print..." (coq-eglot--call-with-prefix #'coq-eglot-Print '(16))]
-      ["Other Command..."
-       (coq-eglot--call-with-prefix #'coq-eglot-query '(16))]))
+     ["About with Printing All..." coq-About-with-all]
+     ["Check with Printing All..." coq-Check-show-all]
+     ["Print with Printing All..." coq-Print-with-all])
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
     ["Exit Server" coq-eglot-exit]))
 
 ;; the same keys in the goals and response buffers, like Proof General
-(set-keymap-parent coq-eglot-output-mode-map coq-eglot-mode-map)
+(set-keymap-parent coq-eglot-output-mode-map
+                   (make-composed-keymap coq-eglot-mode-map coq-mode-map))
+
+;; The queries at mouse click, see `coq-remap-mouse-1'.
+(coq-mouse-query-add-keymap coq-eglot-output-mode-map)
 
 (defun coq-eglot--lighter ()
   "Mode line indicator of `coq-eglot-mode'.
@@ -1718,6 +1611,7 @@ Warn if processed Require sentences load outdated libraries."
                             eglot-ignored-server-capabilities))
         (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
         (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)
+        (setq coq-query-function #'coq-eglot-run-query)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
@@ -1726,6 +1620,7 @@ Warn if processed Require sentences load outdated libraries."
         (coq-eglot--update-overlays))
     (setq coq-eglot-lsp-progress-function nil)
     (kill-local-variable 'coq-terminator-insert-function)
+    (kill-local-variable 'coq-query-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)

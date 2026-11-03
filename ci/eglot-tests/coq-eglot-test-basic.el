@@ -203,35 +203,36 @@ the error location with `proof-warning-face', and point moves there."
   (wait-until (lambda () (not (equal (buffer-text "*response*") ""))) 10)
   (buffer-text "*response*"))
 
+(defun query-interactively (command prefix argument)
+  "Run COMMAND with PREFIX as if typed, answering ARGUMENT.
+Return the text of the response buffer."
+  (cl-letf (((symbol-function 'read-string) (lambda (&rest _) argument)))
+    (let ((current-prefix-arg prefix))
+      (query #'call-interactively command))))
+
 (ert-deftest coq-eglot-queries ()
-  "Queries run in the state at the proof position."
+  "Queries run in the state at the proof position.  The query commands
+are common to all backends."
   (with-test-file
-    (should-error (coq-eglot-About "double") :type 'user-error)
+    (should (eq coq-query-function #'coq-eglot-run-query))
+    (should (eq (key-binding (kbd "C-c C-a C-b")) #'coq-About))
+    (should-error (coq-run-query "About double") :type 'user-error)
     (goto-marker "definition")
     (run #'coq-eglot-goto-point)
     (should (string-match-p "\\`double : nat -> nat"
-                            (query #'coq-eglot-About "double")))
+                            (query-interactively #'coq-About nil "double")))
     ;; the final dot may be omitted
-    (should (string-match-p ": nat\\'" (query #'coq-eglot-Check "double 2")))
+    (should (string-match-p ": nat\\'" (query #'coq-run-query "Check double 2")))
     (should (string-match-p ": nat\\'" (query #'coq-eglot-query "Check 0.")))
     ;; l is defined after the proof position
     (should (string-match-p "not a defined object"
-                            (query #'coq-eglot-About "l")))
+                            (query #'coq-run-query "About l")))
     ;; errors are displayed as such
-    (should (string-match-p "was not found" (query #'coq-eglot-Check "l")))
+    (should (string-match-p "was not found" (query #'coq-run-query "Check l")))
     (with-current-buffer "*response*"
       (should (eq (get-text-property (point-min) 'font-lock-face) 'error)))
     ;; the proof position does not move
     (should (position-at-marker-p "definition"))))
-
-(defun query-interactively (command prefix argument &optional flags)
-  "Run COMMAND with PREFIX as if typed, answering ARGUMENT and FLAGS.
-Return the text of the response buffer."
-  (cl-letf (((symbol-function 'read-string) (lambda (&rest _) argument))
-            ((symbol-function 'completing-read-multiple)
-             (lambda (&rest _) flags)))
-    (let ((current-prefix-arg prefix))
-      (query #'call-interactively command))))
 
 (ert-deftest coq-eglot-query-flags ()
   "Queries can use other printing flags, for this query only.
@@ -239,25 +240,25 @@ Like in Proof General, \\[universal-argument] means Printing All."
   (with-test-file
     (goto-marker "before error")
     (run #'coq-eglot-goto-point)
-    (should (equal (query-interactively #'coq-eglot-Check nil "double 2")
+    (should (equal (query-interactively #'coq-Check nil "double 2")
                    "double 2\n     : nat"))
     (should (string-match-p "\\`double (S (S O))"
-                            (query-interactively #'coq-eglot-Check '(4)
-                                                 "double 2")))
+                            (query-interactively #'coq-Check '(4) "double 2")))
     ;; not kept for the next query
     (should (string-match-p "\\`double 2"
-                            (query-interactively #'coq-eglot-Check nil
-                                                 "double 2")))
-    ;; with C-u C-u, flags are chosen by name
+                            (query-interactively #'coq-Check nil "double 2")))
     (should (string-match-p "\\`@id nat 0"
-                            (query-interactively #'coq-eglot-Check '(16)
-                                                 "id 0" '("Implicit"))))
+                            (query-interactively #'coq-Check-show-implicits nil
+                                                 "id 0")))
     (should (string-match-p "\\`@eq nat 0 0"
-                            (query-interactively #'coq-eglot-query '(16)
-                                                 "Check 0 = 0"
-                                                 '("Implicit" "No Notations"))))
+                            (query #'coq-run-query "Check 0 = 0"
+                                   '("Set Printing Implicit"
+                                     "Unset Printing Notations"))))
+    (should (string-match-p "\\`S (S O)"
+                            (query-interactively #'coq-eglot-query '(4)
+                                                 "Check 2")))
     (should (string-match-p "\\`0 = 0"
-                            (query #'coq-eglot-Check "0 = 0")))))
+                            (query #'coq-run-query "Check 0 = 0")))))
 
 (ert-deftest coq-eglot-search ()
   "Search finds the lemmas proved before the proof position."
@@ -265,7 +266,7 @@ Like in Proof General, \\[universal-argument] means Printing All."
     (goto-marker "before error")
     (run #'coq-eglot-goto-point)
     (should (string-match-p "^l: forall n : nat, double n = n \\+ n /\\\\ True"
-                            (query #'coq-eglot-Search "double")))))
+                            (query-interactively #'coq-Search nil "double")))))
 
 (ert-deftest coq-eglot-print-and-search-pattern ()
   "Print and SearchPattern, on C-c C-a C-p and C-c C-a C-o like in
@@ -274,12 +275,12 @@ Proof General."
     (goto-marker "before error")
     (run #'coq-eglot-goto-point)
     (should (string-match-p "\\`double = fun n : nat => n \\+ n"
-                            (query #'coq-eglot-Print "double")))
+                            (query-interactively #'coq-Print nil "double")))
     (should (string-match-p "^l: forall n : nat, double n = n \\+ n /\\\\ True"
-                            (query #'coq-eglot-SearchPattern
-                                   "(double _ = _ /\\ _)")))
-    (should (eq (key-binding (kbd "C-c C-a C-p")) #'coq-eglot-Print))
-    (should (eq (key-binding (kbd "C-c C-a C-o")) #'coq-eglot-SearchPattern))))
+                            (query-interactively #'coq-SearchIsos nil
+                                                 "(double _ = _ /\\ _)")))
+    (should (eq (key-binding (kbd "C-c C-a C-p")) #'coq-Print))
+    (should (eq (key-binding (kbd "C-c C-a C-o")) #'coq-SearchIsos))))
 
 (ert-deftest coq-eglot-commands-from-output-buffers ()
   "The keys of the script buffer work in the goals and response
@@ -309,8 +310,9 @@ buffers, on the active script buffer, like in Proof General."
           (insert "double"))
         (goto-char (point-min))
         (should (string-match-p "\\`double : nat -> nat"
-                                (query-interactively #'coq-eglot-About nil
-                                                     "double"))))
+                                (query-interactively #'coq-About nil
+                                                     "double")))
+        (should (eq (key-binding (kbd "C-c C-a C-b")) #'coq-About)))
       (with-current-buffer "*goals*"
         (coq-eglot-goto-end-of-locked)
         (should (eq (current-buffer) script))
@@ -337,9 +339,9 @@ buffers, on the active script buffer, like in Proof General."
     (goto-marker "split")
     (run #'coq-eglot-goto-point)
     (should (eq (face-of "*goals*" "n :") 'proof-declaration-name-face))
-    (query #'coq-eglot-About "double")
+    (query #'coq-run-query "About double")
     (should (eq (face-of "*response*" "double :") 'proof-declaration-name-face))
-    (query #'coq-eglot-Check "unknown_thing")
+    (query #'coq-run-query "Check unknown_thing")
     ;; fontification keeps the face of errors
     (should (eq (face-of "*response*" "The reference") 'error))))
 
@@ -615,7 +617,7 @@ goals, like in Proof General."
         (progn
           (goto-marker "hyps")
           (run #'coq-eglot-goto-point)
-          (should (string-match-p "^H: n = m" (query #'coq-eglot-Search "n")))
+          (should (string-match-p "^H: n = m" (query-interactively #'coq-Search nil "n")))
           (should (equal coq-eglot--highlighted-hyps '("H")))
           (should (hyp-overlay "H" 'face)))
       (coq-eglot-unhighlight-hyps))))
@@ -632,18 +634,29 @@ checks, like in Proof General."
     (let ((click (lambda (type)
                    (list type (list (selected-window) (point) '(0 . 0) 0)))))
       (should (string-match-p "\\`double = fun"
-                              (query #'coq-eglot-query-at-mouse
+                              (query #'coq-id-under-mouse-query
                                      (funcall click 'C-down-mouse-1))))
       (should (string-match-p "\\`double : nat -> nat"
-                              (query #'coq-eglot-query-at-mouse
+                              (query #'coq-id-under-mouse-query
                                      (funcall click 'S-down-mouse-1))))
       (should (string-match-p "\\`double\n     : nat -> nat"
-                              (query #'coq-eglot-query-at-mouse
+                              (query #'coq-id-under-mouse-query
                                      (funcall click 'C-S-down-mouse-1))))
       ;; with meta, with Printing All
       (should (string-match-p "Nat.add n n"
-                              (query #'coq-eglot-query-at-mouse
-                                     (funcall click 'C-M-down-mouse-1)))))))
+                              (query #'coq-id-under-mouse-query
+                                     (funcall click 'C-M-down-mouse-1))))
+      ;; also in the response buffer, if `coq-remap-mouse-1'
+      (let ((remap coq-remap-mouse-1))
+        (unwind-protect
+            (progn
+              (customize-set-variable 'coq-remap-mouse-1 t)
+              (with-current-buffer "*response*"
+                (should (eq (key-binding [C-down-mouse-1])
+                            #'coq-id-under-mouse-query)))
+              (should (eq (key-binding [C-down-mouse-1])
+                          #'coq-id-under-mouse-query)))
+          (customize-set-variable 'coq-remap-mouse-1 remap))))))
 
 (defun type-dot ()
   "Type \".\" in the current buffer."
@@ -753,15 +766,18 @@ its goals.  The processed part of the others is grayed."
                 'coq-eglot-inactive-locked-face))))
 
 (ert-deftest coq-eglot-id-at-point ()
-  "The default argument of queries is the qualified identifier at point."
+  "The default argument of queries is the qualified identifier at point,
+also in the goals and response buffers."
   (with-temp-buffer
-    (insert "Check Nat.add_comm. foo' x.")
+    (coq-eglot-response-mode)
+    (let ((inhibit-read-only t))
+      (insert "Check Nat.add_comm. foo' x."))
     (goto-char 10)
-    (should (equal (coq-eglot--id-at-point) "Nat.add_comm"))
+    (should (equal (coq-id-at-point) "Nat.add_comm"))
     (search-forward "foo")
-    (should (equal (coq-eglot--id-at-point) "foo'"))
-    (goto-char (point-max))
-    (should (equal (coq-eglot--id-at-point) "x"))))
+    (should (equal (coq-id-at-point) "foo'"))
+    (goto-char (1- (point-max)))
+    (should (equal (coq-id-at-point) "x"))))
 
 (ert-deftest coq-eglot-error-highlight-timeout ()
   "The highlighting of the error disappears after a while."
