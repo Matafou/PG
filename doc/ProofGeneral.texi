@@ -5826,10 +5826,15 @@ a Coq file, which helps to report a bug.  Its size is bounded by
 @code{coq-eglot-trace-max-size}.  @code{coq-eglot-show-trace} (menu
 @code{Coq -> Show Trace}) displays it.
 @item
-Only one frame is supported, and some options of Proof General are not
-honored yet, like @code{proof-shrink-windows-tofit}.  All the
-insertion commands and the menu @code{Coq -> INSERT} work, except
-@kbd{C-c C-a [} (@code{coq-insert-as-in-next-command}).
+The display options of Proof General are honored (menu @code{Coq ->
+Windows}): @code{proof-auto-raise-buffers},
+@code{proof-delete-empty-windows}, @code{proof-shrink-windows-tofit}
+and @code{proof-layout-windows-on-visit-file}.  @kbd{C-c C-o} displays
+the messages, the trace and the goals in turn.  Only one frame is
+supported: @code{proof-multiple-frames-enable} is ignored.
+@item
+All the insertion commands and the menu @code{Coq -> INSERT} work,
+except @kbd{C-c C-a [} (@code{coq-insert-as-in-next-command}).
 @end itemize
 
 The other options of this backend are in the customization group

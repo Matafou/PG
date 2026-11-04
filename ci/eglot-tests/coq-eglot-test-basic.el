@@ -763,6 +763,136 @@ General."
     (should (eq (proof-guess-3win-display-policy 'smart) 'vertical)))
   (should (eq (proof-guess-3win-display-policy 'hybrid) 'hybrid)))
 
+;;; other window options of Proof General
+
+(defvar coq-eglot-trace)                 ; let-bound
+(defvar coq-eglot--rotation)             ; let-bound
+
+(ert-deftest coq-eglot-auto-raise-off ()
+  "Without `proof-auto-raise-buffers', the goals and messages are not
+displayed, their buffers are updated."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((proof-auto-raise-buffers nil))
+        (goto-marker "split")
+        (run #'coq-eglot-goto-point)
+        (should-not (output-windows))
+        (should (string-match-p "double n = n \\+ n" (buffer-text "*goals*")))))))
+
+(ert-deftest coq-eglot-delete-empty-windows ()
+  "With `proof-delete-empty-windows', the window of an empty buffer is
+deleted, and comes back with some content."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((proof-delete-empty-windows t))
+        (goto-marker "hello")
+        (run #'coq-eglot-goto-point)
+        (should (get-buffer-window "*goals*"))
+        (should (get-buffer-window "*response*"))
+        ;; no messages
+        (goto-marker "split")
+        (run #'coq-eglot-goto-point)
+        (should (get-buffer-window "*goals*"))
+        (should-not (get-buffer-window "*response*"))
+        ;; outside of proofs, no goals
+        (goto-marker "definition")
+        (run #'coq-eglot-goto-point)
+        (should-not (get-buffer-window "*goals*"))
+        (goto-marker "hello")
+        (run #'coq-eglot-goto-point)
+        (should (get-buffer-window "*goals*"))
+        (should (get-buffer-window "*response*"))))))
+
+(ert-deftest coq-eglot-shrink-windows-tofit ()
+  "With `proof-shrink-windows-tofit', the windows below the script get
+the height they need, the script window the rest."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((proof-shrink-windows-tofit t)
+            (coq-optimise-resp-windows-enable nil)
+            (script (selected-window)))
+        (goto-marker "split")
+        (run #'coq-eglot-goto-point)
+        (pcase-let ((`(,goals ,response) (windows-of "*goals*" "*response*")))
+          (should (= (window-total-height goals)
+                     (max window-min-height (coq-eglot--window-need goals))))
+          (should (= (window-total-height response) window-min-height))
+          (should (> (window-total-height script)
+                     (window-total-height goals))))))
+    ;; two windows: the shared window too
+    (with-layout nil 'vertical
+      (let ((proof-shrink-windows-tofit t)
+            (split-width-threshold 1000))
+        (goto-marker "hello")
+        (run #'coq-eglot-goto-point)
+        (let ((shared (car (output-windows))))
+          (should (= (window-total-height shared)
+                     (max window-min-height
+                          (coq-eglot--window-need shared)))))))))
+
+(ert-deftest coq-eglot-shrink-windows-tofit-columns ()
+  "`proof-shrink-windows-tofit' does nothing to windows on the right of
+the script."
+  (with-test-file
+    (with-layout t 'hybrid
+      (let ((proof-shrink-windows-tofit t)
+            (coq-optimise-resp-windows-enable nil)
+            (calls 0))
+        (cl-letf (((symbol-function 'coq-eglot--resize-column)
+                   (lambda (&rest _) (setq calls (1+ calls)))))
+          (goto-marker "split")
+          (run #'coq-eglot-goto-point))
+        (should (= calls 0))))))
+
+(ert-deftest coq-eglot-display-some-buffers ()
+  "C-c C-o displays the messages, the trace and the goals in turn, in
+the same window when they share it."
+  (with-test-file
+    (with-layout nil 'vertical
+      (let ((coq-eglot-trace t)
+            (split-width-threshold 1000))
+        (goto-marker "hello")
+        (run #'coq-eglot-goto-point)
+        (should (eq (key-binding (kbd "C-c C-o"))
+                    #'coq-eglot-display-some-buffers))
+        (let ((window (car (output-windows)))
+              (shown nil))
+          (dotimes (i 4)
+            (let ((last-command (and (> i 0) 'coq-eglot-display-some-buffers)))
+              (coq-eglot-display-some-buffers))
+            (push (buffer-name (window-buffer window)) shown))
+          (should (equal (nreverse shown)
+                         '("*response*" "*coq-trace*" "*goals*" "*response*")))
+          (should (= (length (window-list)) 2)))))
+    ;; three windows: the trace in the window of the messages, until the
+    ;; next ones
+    (with-layout t 'vertical
+      (let ((coq-eglot-trace t))
+        (goto-marker "split")
+        (run #'coq-eglot-goto-point)
+        (let ((response (car (windows-of "*response*")))
+              (last-command 'coq-eglot-display-some-buffers)
+              (coq-eglot--rotation 0))
+          (coq-eglot-display-some-buffers)
+          (should (equal (buffer-name (window-buffer response)) "*coq-trace*"))
+          (should (get-buffer-window "*goals*"))
+          (goto-marker "hello")
+          (run #'coq-eglot-goto-point)
+          (should (eq (get-buffer-window "*response*") response))
+          (should (= (length (window-list)) 3)))))))
+
+(ert-deftest coq-eglot-layout-on-visit ()
+  "With `proof-layout-windows-on-visit-file', the windows are laid out
+when visiting a file."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((proof-layout-windows-on-visit-file t))
+        (coq-eglot--layout-on-visit)
+        (should-not (output-windows))
+        (accept-process-output nil 0.1)
+        (should (get-buffer-window "*goals*"))
+        (should (get-buffer-window "*response*"))))))
+
 (defun other-goals-overlay ()
   "The overlay of the goals after the first one in the current buffer."
   (seq-find (lambda (ov) (overlay-get ov 'coq-other-goals))
