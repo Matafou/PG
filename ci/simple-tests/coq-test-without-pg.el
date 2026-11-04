@@ -9,7 +9,8 @@
 ;; Test the part of Coq mode common to all backends, with the Proof
 ;; General backend disabled (`coq-use-pg' nil): it must not load the
 ;; proof shell, and the abbrevs, the terminator command, the query
-;; and insertion commands and their keys must be there.
+;; and insertion commands, their keys and the insertion menu must be
+;; there.
 
 ;;; Code:
 
@@ -20,10 +21,12 @@
 (require 'proof-site)
 (require 'ert)
 (require 'cl-lib)
+(require 'seq)
 
 (defvar coq-mode-abbrev-table)
 (defvar coq-query-function)
 (defvar coq-use-yasnippet)
+(defvar coq-insert-menu)
 
 (declare-function coq-run-query "coq-queries")
 (declare-function coq-templates-setup "coq-templates")
@@ -118,6 +121,22 @@ indent."
     (insert "\nSection S.\n")
     (coq-end-Section)
     (should (string-suffix-p "Section S.\nEnd S." (buffer-string)))))
+
+(ert-deftest coq-test-without-pg-insert-menu ()
+  "The menu of the insertions is defined without backend."
+  (coq-test-without-pg-with-file
+    (should (equal (car coq-insert-menu) "INSERT"))
+    (let ((commands (delq nil (mapcar (lambda (item)
+                                        (and (vectorp item) (aref item 1)))
+                                      coq-insert-menu)))
+          (submenus (mapcar #'car (seq-filter #'consp (cdr coq-insert-menu)))))
+      (dolist (command '(coq-insert-intros coq-insert-tactic
+                         coq-insert-tactical coq-insert-command
+                         coq-insert-term coq-insert-section-or-module
+                         coq-insert-requires))
+        (should (memq command commands)))
+      (should (equal submenus '("Tactics (menu)" "Tacticals (menu)"
+                                "Command (menu)" "Term (menu)"))))))
 
 (provide 'coq-test-without-pg)
 
