@@ -473,23 +473,56 @@ goals window."
                            'below 'right))
          buffer)))))
 
+(defconst coq-eglot--frame-parameters
+  '((minibuffer . nil)
+    (unsplittable . t)
+    (menu-bar-lines . 0)
+    (tool-bar-lines . 0)
+    (coq-eglot . t))
+  "Parameters of the frames of the goals, conclusion and messages.
+Like `proof-multiframe-parameters' in Proof General.  The parameter
+`coq-eglot' marks these frames.  See `proof-multiple-frames-enable'.")
+
+(defun coq-eglot--frames ()
+  "The frames of the goals, conclusion and messages buffers."
+  (seq-filter (lambda (frame) (frame-parameter frame 'coq-eglot))
+              (frame-list)))
+
+(defun coq-eglot--display-in-frame (buffer)
+  "Display BUFFER in a frame of its own, see `proof-multiple-frames-enable'."
+  (let ((window (display-buffer
+                 buffer
+                 `((display-buffer-reuse-window display-buffer-pop-up-frame)
+                   (reusable-frames . t)
+                   (pop-up-frame-parameters . ,coq-eglot--frame-parameters)))))
+    (when window
+      (set-window-dedicated-p window t))
+    window))
+
 (defun coq-eglot--display-buffer (name mode)
   "Return buffer NAME in MODE, displayed like in Proof General.
-See `proof-three-window-enable' and `proof-three-window-mode-policy'.
-If the windows cannot be split, let `display-buffer' choose."
+See `proof-three-window-enable', `proof-three-window-mode-policy' and
+`proof-multiple-frames-enable'.  If the windows cannot be split, let
+`display-buffer' choose."
   (let ((buffer (coq-eglot--output-buffer name mode)))
-    (unless (get-buffer-window buffer)
+    (cond
+     (proof-multiple-frames-enable
+      (unless (get-buffer-window buffer t)
+        (coq-eglot--display-in-frame buffer)))
+     ((not (get-buffer-window buffer))
       (condition-case nil
           (if (coq-eglot--three-windows-p)
               (coq-eglot--display-three)
             (coq-eglot--display-two buffer))
-        (error (display-buffer buffer))))
+        (error (display-buffer buffer)))))
     buffer))
 
 (defun coq-eglot-layout-windows ()
   "Display the goals and response windows again, like in Proof General.
 They come back if closed, with their default sizes, see
-`proof-three-window-enable' and `proof-three-window-mode-policy'."
+`proof-three-window-enable' and `proof-three-window-mode-policy'.  With
+`proof-multiple-frames-enable', in frames of their own; without, these
+frames are deleted."
   (interactive)
   (let ((selected (current-buffer)))
     (coq-eglot--with-script
@@ -498,9 +531,11 @@ They come back if closed, with their default sizes, see
         (when (and (coq-eglot--output-window-p window)
                    (not (frame-root-window-p window)))
           (delete-window window)))
+      (unless proof-multiple-frames-enable
+        (mapc #'delete-frame (coq-eglot--frames)))
       (coq-eglot--display-buffer coq-eglot-goals-buffer-name
                                  #'coq-eglot-goals-mode)
-      (when (coq-eglot--three-windows-p)
+      (when (or proof-multiple-frames-enable (coq-eglot--three-windows-p))
         (coq-eglot--display-buffer coq-eglot-response-buffer-name
                                    #'coq-eglot-response-mode))
       (when coq-eglot-split-goals
@@ -563,7 +598,11 @@ messages."
       (let ((window (seq-find (lambda (window)
                                 (member (buffer-name (window-buffer window))
                                         shared))
-                              (window-list nil 'no-minibuffer))))
+                              ;; also in their frames, see
+                              ;; `proof-multiple-frames-enable'
+                              (window-list-1 nil 'no-minibuffer
+                                             (and proof-multiple-frames-enable
+                                                  t)))))
         (if (not window)
             (display-buffer buffer)
           (coq-eglot--show-in window buffer)
@@ -603,10 +642,13 @@ in Proof General, the buffer is displayed only if
 `proof-auto-raise-buffers', and its windows are deleted when it becomes
 empty if `proof-delete-empty-windows'."
   (let* ((empty (string-empty-p text))
-         (delete (and empty proof-delete-empty-windows))
+         (delete-empty (and proof-delete-empty-windows
+                            (not proof-multiple-frames-enable)))
+         (delete (and empty delete-empty))
          (display (and proof-auto-raise-buffers
                        (not delete)
-                       (or (coq-eglot--three-windows-p)
+                       (or proof-multiple-frames-enable
+                           (coq-eglot--three-windows-p)
                            (not (equal name coq-eglot-response-buffer-name))
                            (not empty)))))
     (with-current-buffer (if display
@@ -619,7 +661,7 @@ empty if `proof-delete-empty-windows'."
       ;; before resizing: folded, the other goals take one line
       (when (derived-mode-p 'coq-eglot-goals-mode)
         (coq-goals-fold-other-goals)))
-    (when proof-delete-empty-windows
+    (when delete-empty
       ;; also the windows that the layout created for empty buffers
       (dolist (other (list coq-eglot-goals-buffer-name
                            coq-eglot-conclusion-buffer-name
@@ -662,8 +704,10 @@ heights in the same order, or nil if TOTAL is too small."
 
 (defun coq-eglot--resize-windows ()
   "Adjust the heights of the windows.
-See `coq-optimise-resp-windows-enable' and `proof-shrink-windows-tofit'."
-  (when (or coq-optimise-resp-windows-enable proof-shrink-windows-tofit)
+See `coq-optimise-resp-windows-enable' and `proof-shrink-windows-tofit'.
+Not with `proof-multiple-frames-enable'."
+  (when (and (or coq-optimise-resp-windows-enable proof-shrink-windows-tofit)
+             (not proof-multiple-frames-enable))
     (coq-eglot-resize-windows-by-priority)))
 
 (defun coq-eglot-resize-windows-by-priority ()
@@ -1106,7 +1150,12 @@ See `coq-eglot-split-goals'."
   (unless coq-eglot-split-goals
     (let ((buffer (get-buffer coq-eglot-conclusion-buffer-name)))
       (when buffer
-        (mapc #'delete-window (get-buffer-window-list buffer nil t))
+        (dolist (window (get-buffer-window-list buffer nil t))
+          (if (frame-root-window-p window)
+              ;; its own frame, see `proof-multiple-frames-enable'
+              (when (frame-parameter (window-frame window) 'coq-eglot)
+                (delete-frame (window-frame window)))
+            (delete-window window)))
         (kill-buffer buffer))))
   (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals
                                :printing-width coq-eglot--displayed-width))
@@ -1903,6 +1952,12 @@ Run when Eglot starts or stops managing the buffer."
      ["Rotate Output Buffers" coq-eglot-display-some-buffers
       :help "Display the messages, the trace or the goals"]
      "---"
+     ["Multiple Frames"
+      (coq-eglot-set-layout-option 'proof-multiple-frames-enable
+                                   (not proof-multiple-frames-enable))
+      :style toggle :selected proof-multiple-frames-enable
+      :active (display-graphic-p)
+      :help "The goals and the messages in frames of their own"]
      ["Auto Raise"
       (customize-set-variable 'proof-auto-raise-buffers
                               (not proof-auto-raise-buffers))
@@ -1917,11 +1972,13 @@ Run when Eglot starts or stops managing the buffer."
       (customize-set-variable 'proof-delete-empty-windows
                               (not proof-delete-empty-windows))
       :style toggle :selected proof-delete-empty-windows
+      :active (not proof-multiple-frames-enable)
       :help "Delete the windows of the goals or messages when empty"]
      ["Shrink to Fit"
       (customize-set-variable 'proof-shrink-windows-tofit
                               (not proof-shrink-windows-tofit))
       :style toggle :selected proof-shrink-windows-tofit
+      :active (not proof-multiple-frames-enable)
       :help "The goals and messages windows below the script fit their content"])
     ["Fold Other Goals" coq-toggle-other-goals
      :style toggle :selected coq-fold-other-goals]

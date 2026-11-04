@@ -881,6 +881,47 @@ the same window when they share it."
           (should (eq (get-buffer-window "*response*") response))
           (should (= (length (window-list)) 3)))))))
 
+(ert-deftest coq-eglot-multiple-frames ()
+  "With `proof-multiple-frames-enable', the goals and the messages are
+displayed in frames of their own, not resized; without, these frames
+are deleted.  Frames cannot be made in batch mode: their creation is
+simulated by a window."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((proof-multiple-frames-enable t)
+            (proof-delete-empty-windows t)
+            (popped nil)
+            (resized 0)
+            (deleted nil))
+        (cl-letf (((symbol-function 'display-buffer-pop-up-frame)
+                   (lambda (buffer alist)
+                     (push (cons (buffer-name buffer)
+                                 (alist-get 'pop-up-frame-parameters alist))
+                           popped)
+                     (let ((window (split-window (frame-root-window) nil 'below)))
+                       (set-window-buffer window buffer)
+                       window)))
+                  ((symbol-function 'coq-eglot-resize-windows-by-priority)
+                   (lambda () (setq resized (1+ resized))))
+                  ((symbol-function 'coq-eglot--frames)
+                   (lambda () '(frame-of-goals)))
+                  ((symbol-function 'delete-frame)
+                   (lambda (frame &rest _) (push frame deleted))))
+          (goto-marker "split")
+          (run #'coq-eglot-goto-point)
+          (should (equal (sort (mapcar #'car popped) #'string<)
+                         '("*goals*" "*response*")))
+          (dolist (entry popped)
+            (should (eq (alist-get 'coq-eglot (cdr entry)) t))
+            (should (window-dedicated-p (get-buffer-window (car entry)))))
+          ;; the empty messages keep their frame
+          (should (get-buffer-window "*response*"))
+          (should (= resized 0))
+          (should-not deleted)
+          (setq proof-multiple-frames-enable nil)
+          (coq-eglot-layout-windows)
+          (should (equal deleted '(frame-of-goals))))))))
+
 (ert-deftest coq-eglot-layout-on-visit ()
   "With `proof-layout-windows-on-visit-file', the windows are laid out
 when visiting a file."
