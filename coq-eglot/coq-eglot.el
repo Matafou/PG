@@ -1116,6 +1116,7 @@ checked: moving back while checking is not possible."
 Move the proof position before it and display the error, with the
 goals before the sentence.  ANSWER is the answer of the server for the
 sentence before, if known."
+  (coq-eglot--trace-error start end text)
   (let ((before (if answer (cons (coq-eglot-position) answer)
                   (coq-eglot--sentence-before start))))
     (coq-eglot--set-position (car before) (cdr before))
@@ -1199,6 +1200,7 @@ Compile first the libraries it requires, if any."
       (coq-eglot--fail (car bounds) (cdr bounds) (plist-get answer :error)
                        nil))
      (t
+      (coq-eglot--trace-check (car bounds) (cdr bounds) answer)
       (coq-eglot--set-position (cdr bounds) answer)
       (coq-eglot--show-answer answer)
       (coq-eglot--continue then)))))
@@ -1245,16 +1247,144 @@ failed, reported if there was no error before."
         (let* ((answer (coq-eglot-lsp-goals (car error)))
                (range (plist-get answer :range))
                (bounds (if range (coq-eglot-lsp-range range) error)))
+          (when (< start (car bounds))
+            (coq-eglot--trace-check start (car bounds) nil))
           (coq-eglot--fail (car bounds) (cdr bounds)
                            (or (plist-get answer :error) "Error.") nil))
       (let* ((answer (coq-eglot-lsp-goals last))
              (range (plist-get answer :range)))
         (when range
+          (coq-eglot--trace-check start (cdr (coq-eglot-lsp-range range))
+                                  answer)
           (coq-eglot--set-position (cdr (coq-eglot-lsp-range range)) answer)
           (coq-eglot--show-answer answer))
         (if failed
             (coq-eglot--compilation-failed failed)
           (coq-eglot--continue then))))))
+
+;;; Trace
+
+;; A transcript of what is sent to the server and what it answers, like
+;; a coqtop session: the sentences checked, then their messages and the
+;; number of goals, in comments.  The server checks several sentences in
+;; one request: their messages are not traced, only those of the last
+;; one.
+
+(defcustom coq-eglot-trace nil
+  "If non-nil, write a transcript of the session in buffer *coq-trace*.
+The sentences checked and the queries, followed by their messages and
+the number of goals, in comments: the transcript is a Coq file, see
+`coq-eglot-show-trace'."
+  :type 'boolean
+  :group 'coq-eglot)
+
+(defcustom coq-eglot-trace-max-size 200000
+  "Maximal number of characters of the trace, the oldest are removed.
+See `coq-eglot-trace'."
+  :type 'integer
+  :group 'coq-eglot)
+
+(defvar coq-eglot-trace-buffer-name "*coq-trace*")
+
+(defvar coq-eglot--trace-file nil
+  "Script buffer of the last entry of the trace.")
+
+(define-derived-mode coq-eglot-trace-mode coq-eglot-output-mode "Coq Trace"
+  "Major mode of the trace of the Eglot backend of Coq.
+See `coq-eglot-trace'."
+  (setq-local font-lock-defaults '(coq-font-lock-keywords-1)))
+
+(defun coq-eglot--trace-comment (text)
+  "TEXT as a Coq comment, or the empty string if TEXT is empty."
+  (let ((text (string-trim (or text ""))))
+    (if (string-empty-p text) ""
+      ;; no end of comment inside
+      (concat "(* " (string-replace "*)" "* )" text) " *)\n"))))
+
+(defun coq-eglot--trace (text)
+  "Append TEXT to the trace, if `coq-eglot-trace'.
+Called from the script buffer."
+  (when coq-eglot-trace
+    (let ((script (current-buffer)))
+      (with-current-buffer (coq-eglot--output-buffer coq-eglot-trace-buffer-name
+                                                     #'coq-eglot-trace-mode)
+        (let ((inhibit-read-only t)
+              (windows (seq-filter (lambda (w) (= (window-point w) (point-max)))
+                                   (get-buffer-window-list nil nil t))))
+          (save-excursion
+            (goto-char (point-max))
+            (unless (eq coq-eglot--trace-file script)
+              (setq coq-eglot--trace-file script)
+              (insert (coq-eglot--trace-comment
+                       (format "File %s" (buffer-name script)))))
+            (insert text)
+            (when (> (buffer-size) coq-eglot-trace-max-size)
+              (goto-char (- (point-max) coq-eglot-trace-max-size))
+              (forward-line 1)
+              (delete-region (point-min) (point))))
+          ;; the windows showing the end follow it
+          (dolist (window windows)
+            (set-window-point window (point-max))))))))
+
+(defun coq-eglot--trace-goals (answer)
+  "The number of goals of ANSWER of the server, as a comment."
+  (let ((goals (plist-get answer :goals)))
+    (if (null goals) ""
+      (let ((n (length (plist-get goals :goals)))
+            (unfocused (coq-eglot--unfocused-count goals)))
+        (coq-eglot--trace-comment
+         (concat (if (= n 0) "No more goals" (format "%d goal%s" n (if (= n 1) "" "s")))
+                 (if (> unfocused 0) (format ", %d unfocused" unfocused) "")))))))
+
+(defun coq-eglot--trace-check (start end answer)
+  "Trace the sentences from START to END, ANSWER for the last one.
+ANSWER may be nil."
+  (when coq-eglot-trace
+    (coq-eglot--trace
+     (concat (string-trim (buffer-substring-no-properties start end)) "\n"
+             (and answer
+                  (concat (coq-eglot--trace-comment
+                           (coq-eglot--format-messages
+                            (plist-get answer :messages)))
+                          (coq-eglot--trace-goals answer)))))))
+
+(defun coq-eglot--trace-error (start end text)
+  "Trace the sentence from START to END, that failed with error TEXT."
+  (when coq-eglot-trace
+    (coq-eglot--trace
+     (concat (coq-eglot--trace-comment
+              (concat "Failed: " (buffer-substring-no-properties start end)))
+             (coq-eglot--trace-comment text)))))
+
+(defun coq-eglot--trace-retract (pos)
+  "Trace a move of the proof position back to POS."
+  (when coq-eglot-trace
+    (coq-eglot--trace
+     (coq-eglot--trace-comment
+      (format "Back to line %d" (line-number-at-pos pos))))))
+
+(defun coq-eglot--trace-query (command flags messages)
+  "Trace the query COMMAND run after FLAGS, and its MESSAGES."
+  (when coq-eglot-trace
+    (coq-eglot--trace
+     (concat (coq-eglot--trace-comment
+              (and flags (concat "Query, with " (string-join flags ", "))))
+             command "\n"
+             (coq-eglot--trace-comment (string-join messages "\n"))))))
+
+(defun coq-eglot-show-trace ()
+  "Display the trace of the session, see `coq-eglot-trace'."
+  (interactive)
+  (unless coq-eglot-trace
+    (message "Coq: the trace is off, see `coq-eglot-trace'"))
+  (display-buffer (coq-eglot--output-buffer coq-eglot-trace-buffer-name
+                                            #'coq-eglot-trace-mode)))
+
+(defun coq-eglot-toggle-trace ()
+  "Turn the trace on or off, see `coq-eglot-trace'."
+  (interactive)
+  (setq coq-eglot-trace (not coq-eglot-trace))
+  (message "Coq: trace %s" (if coq-eglot-trace "on" "off")))
 
 ;;; Moving back
 
@@ -1262,6 +1392,7 @@ failed, reported if there was no error before."
   "Move the proof position back to the last sentence ending before POS.
 A sentence ending exactly at POS stays processed.  Display the goals."
   (coq-eglot--pop-ends pos)
+  (coq-eglot--trace-retract pos)
   (let ((before (coq-eglot--sentence-before pos)))
     (coq-eglot--set-position (car before) (cdr before)))
   (coq-eglot--goals-at-position))
@@ -1537,21 +1668,24 @@ THEN is called with the messages."
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
     (setq command (concat command ".")))
-  ;; the server runs all the sentences on a copy of the state
-  (setq command (concat (let ((width (coq-eglot--query-printing-width)))
-                          (if width (format "Set Printing Width %d. " width) ""))
-                        (mapconcat (lambda (flag) (concat flag ". ")) flags "")
-                        command))
-  ;; in the last processed sentence: the state after it
-  (coq-eglot-lsp-query-async
-   (1- (coq-eglot-position)) command
-   (lambda (messages)
-     (coq-eglot--show-response
-      (coq-eglot--trim-lines (mapconcat #'identity messages "\n")))
-     (unless messages (message "Coq: no output"))
-     (when then (funcall then messages)))
-   (lambda (err)
-     (coq-eglot--show-error (or (plist-get err :message) (format "%S" err))))))
+  (let ((script (current-buffer))
+        ;; the server runs all the sentences on a copy of the state
+        (sentences (concat (let ((width (coq-eglot--query-printing-width)))
+                             (if width (format "Set Printing Width %d. " width) ""))
+                           (mapconcat (lambda (flag) (concat flag ". ")) flags "")
+                           command)))
+    ;; in the last processed sentence: the state after it
+    (coq-eglot-lsp-query-async
+     (1- (coq-eglot-position)) sentences
+     (lambda (messages)
+       (with-current-buffer script
+         (coq-eglot--trace-query command flags messages))
+       (coq-eglot--show-response
+        (coq-eglot--trim-lines (mapconcat #'identity messages "\n")))
+       (unless messages (message "Coq: no output"))
+       (when then (funcall then messages)))
+     (lambda (err)
+       (coq-eglot--show-error (or (plist-get err :message) (format "%S" err)))))))
 
 ;;; Double hit
 
@@ -1611,6 +1745,7 @@ Run when Eglot starts or stops managing the buffer."
     ["Goto End of Locked" coq-eglot-goto-end-of-locked]
     "---"
     ["Show Goals" coq-eglot-show-goals]
+    ["Show Trace" coq-eglot-show-trace]
     ["Set Printing Width..." coq-eglot-ask-printing-width]
     ("Windows"
      ["Layout Windows" coq-eglot-layout-windows]
@@ -1650,6 +1785,9 @@ Run when Eglot starts or stops managing the buffer."
      :style toggle :selected coq-compile-before-require]
     ["Double Hit Electric Terminator" proof-double-hit-toggle
      :style toggle :selected proof-double-hit-enable]
+    ["Trace" coq-eglot-toggle-trace
+     :style toggle :selected coq-eglot-trace
+     :help "Transcript of the session in buffer *coq-trace*"]
     ,coq-hyps-menu
     ("Queries"
      ["About..." coq-About]

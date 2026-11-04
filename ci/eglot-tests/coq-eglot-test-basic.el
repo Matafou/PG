@@ -781,6 +781,7 @@ displayed, with arrows in the fringe, like in Proof General."
 
 (defvar coq-prefer-top-of-conclusion)     ; let-bound
 (defvar coq-highlight-hyps-sticky)        ; let-bound
+(defvar coq-eglot-trace)                 ; let-bound
 
 (defun separator-line ()
   "Start of the line of the separator in the current buffer."
@@ -1776,6 +1777,41 @@ in Proof General, until the goals window changes width."
             (shrink-goals-window 2)
             (should (= coq-eglot--displayed-width (- auto 2))))
         (setq coq-eglot--asked-width nil)))))
+
+(ert-deftest coq-eglot-trace ()
+  "With `coq-eglot-trace', the sentences, queries, errors and moves back
+are written in the trace, the outputs in comments."
+  (with-test-file
+    (let ((coq-eglot-trace t))
+      (unwind-protect
+          (progn
+            (goto-marker "hello")
+            (run #'coq-eglot-goto-point)
+            (let ((trace (buffer-text "*coq-trace*")))
+              (should (string-match-p "\\`(\\* File eglot_test.v \\*)\n" trace))
+              (should (string-match-p "^Definition double" trace))
+              (should (string-match-p "^  - idtac \"hello\".\n(\\* hello \\*)\n(\\* 1 goal, 1 unfocused \\*)\\'"
+                                      trace)))
+            (run #'coq-eglot-assert-next-command)
+            (should (string-match-p "^reflexivity.\n(\\* No more goals, 1 unfocused \\*)\\'"
+                                    (buffer-text "*coq-trace*")))
+            (query #'coq-eglot-run-query "Check double" '("Set Printing All"))
+            (should (string-match-p "(\\* Query, with Set Printing All \\*)\nCheck double.\n(\\* double\n *: forall _ : nat, nat \\*)\\'"
+                                    (buffer-text "*coq-trace*")))
+            (goto-marker "statement")
+            (run #'coq-eglot-goto-point)
+            (should (string-match-p "(\\* Back to line 10 \\*)\\'"
+                                    (buffer-text "*coq-trace*")))
+            (goto-marker "error")
+            (run #'coq-eglot-goto-point)
+            (should (string-match-p "(\\* Failed: rewrite unknown_lemma. \\*)\n(\\* .*unknown_lemma.* \\*)\\'"
+                                    (buffer-text "*coq-trace*")))
+            ;; off
+            (let ((size (length (buffer-text "*coq-trace*"))))
+              (setq coq-eglot-trace nil)
+              (run #'coq-eglot-retract-buffer)
+              (should (= (length (buffer-text "*coq-trace*")) size))))
+        (kill-buffer "*coq-trace*")))))
 
 (ert-deftest coq-eglot-format-hyp ()
   "A hypothesis is formatted like Coq does: on one line if it fits,
