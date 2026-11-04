@@ -5827,10 +5827,9 @@ a Coq file, which helps to report a bug.  Its size is bounded by
 @code{Coq -> Show Trace}) displays it.
 @item
 Only one frame is supported, and some options of Proof General are not
-honored yet, like @code{proof-shrink-windows-tofit}.  The insertion of
-tactics, commands and terms from the menus or by name is missing; the
-insertions built from a query work: @kbd{C-c C-a C-i} (intros),
-@kbd{C-c C-a C-m} (match) and @kbd{C-c C-a C-g} (goal selectors).
+honored yet, like @code{proof-shrink-windows-tofit}.  All the
+insertion commands and the menu @code{Coq -> INSERT} work, except
+@kbd{C-c C-a [} (@code{coq-insert-as-in-next-command}).
 @end itemize
 
 The other options of this backend are in the customization group

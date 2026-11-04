@@ -1804,11 +1804,8 @@ Run when Eglot starts or stops managing the buffer."
      ["About with Printing All..." coq-About-with-all]
      ["Check with Printing All..." coq-Check-show-all]
      ["Print with Printing All..." coq-Print-with-all])
-    ("Insert"
-     ["Intros (smart)" coq-insert-intros
-      :help "Insert \"intros h1 .. hn.\" where hi are the default names given by Coq."]
-     ["Match (smart)" coq-insert-match]
-     ["Named Goal Selectors" coq-insert-named-goal-selectors])
+    ,(append coq-insert-menu
+             '(["Named Goal Selectors" coq-insert-named-goal-selectors]))
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]

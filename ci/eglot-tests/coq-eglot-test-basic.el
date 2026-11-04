@@ -324,6 +324,40 @@ General."
         (should (string-match-p "| O =>" text))
         (should (string-match-p "| S [[:alnum:]_]+ =>" text))))))
 
+(ert-deftest coq-eglot-insertions-without-query ()
+  "The insertions without query of Proof General: keys, menu, Require."
+  (with-test-file
+    (dolist (binding '(("C-c C-a C-(" . coq-insert-section-or-module)
+                       ("C-c C-a C-)" . coq-end-Section)
+                       ("C-c C-a C-t" . coq-insert-tactic)
+                       ("C-c C-a t" . coq-insert-tactical)
+                       ("C-c C-a !" . coq-insert-solve-tactic)
+                       ("C-c C-a C-SPC" . coq-insert-term)
+                       ("C-c C-a C-<return>" . coq-insert-command)
+                       ("C-c C-a C-r" . coq-insert-requires)))
+      (should (eq (key-binding (kbd (car binding))) (cdr binding))))
+    (let* ((menu (assoc "INSERT" (cdr coq-eglot--menu-spec)))
+           (commands (delq nil (mapcar (lambda (item)
+                                         (and (vectorp item) (aref item 1)))
+                                       menu))))
+      (should menu)
+      (dolist (command '(coq-insert-intros coq-insert-tactic
+                         coq-insert-requires coq-insert-named-goal-selectors))
+        (should (memq command commands)))
+      (should (assoc "Tactics (menu)" (cdr menu))))
+    ;; Require completes on the files of the load path, "." by default
+    (goto-char (point-max))
+    (let ((answers '("Require Import" "eglot_other" "")))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _)
+                   (let ((answer (pop answers)))
+                     (should (or (equal answer "")
+                                 (member answer (all-completions "" collection))))
+                     answer))))
+        (coq-insert-requires)))
+    (should (looking-back "Require Import eglot_other\\.\n"
+                          (line-beginning-position 0)))))
+
 (ert-deftest coq-eglot-search ()
   "Search finds the lemmas proved before the proof position."
   (with-test-file
