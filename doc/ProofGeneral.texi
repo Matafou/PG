@@ -4406,6 +4406,7 @@ assistant.  It supports most of the generic features of Proof General.
 * Display of the goals::
 * Folding and highlighting hypotheses::
 * Opam-switch-mode support::
+* Eglot backend::
 @end menu
 
 
@@ -5689,7 +5690,7 @@ point.  The commands are also in the menu @code{Coq -> Settings ->
 Hypotheses} (@code{Coq -> Hypotheses} with the Eglot backend).
 Elsewhere than in the goals buffer, they work on the hypothesis named
 by the identifier at point.  These commands work the same with both
-backends.
+backends, see @ref{Eglot backend}.
 
 @node Opam-switch-mode support
 @section Opam-switch-mode support
@@ -5731,6 +5732,102 @@ See https://github.com/ProofGeneral/opam-switch-mode for @code{opam-switch-mode}
 @c
 @c  CHAPTER: EasyCrypt Proof General
 @c
+@node Eglot backend
+@section The Eglot backend (experimental)
+@cindex Eglot
+@cindex coq-lsp
+@vindex coq-backend
+
+Instead of running Coq in a shell, Coq Proof General can use the
+language server coq-lsp through Eglot, the language server client of
+Emacs.  This backend is experimental.  It keeps the look and the keys
+of Proof General: a proof position distinct from point, shown by the
+processed region, a goals and a response buffer, laid out like with
+Proof General (@pxref{Display customization}), and the same commands for
+the queries, the insertions and the hypotheses.  The server checks the
+sentences, Emacs only asks for the goals and messages at the proof
+position.
+
+To use it, set @code{coq-backend} to @code{eglot} before @code{coq-mode}
+is loaded, for instance in your init file:
+@lisp
+(setq coq-backend 'eglot)
+@end lisp
+Changing it afterwards has no effect until Emacs is restarted.
+
+@subsection Requirements
+
+@itemize @bullet
+@item
+Emacs 29 or later, for its built-in Eglot.
+@item
+coq-lsp 0.2.3 or later, found in the @code{PATH}, or given by
+@code{coq-eglot-server-program}.  With an older server, nothing gets
+processed and a warning is displayed at startup.  coq-lsp 0.2.5
+supports Coq 8.20 and Rocq 9.0, 9.1 and 9.2.  The opam package and the
+program are still named @code{coq-lsp}, although the project is now
+@code{rocq-community/rocq-lsp}.
+@item
+For Rocq 9.2, there is no opam release of coq-lsp yet: pin its
+@code{v9.2} branch.  Install @code{memprof-limits} first, otherwise the
+first installation fails (opam reinstalls Rocq while building coq-lsp):
+@example
+opam install memprof-limits
+opam pin add coq-lsp "git+https://github.com/rocq-community/rocq-lsp.git#v9.2"
+@end example
+@end itemize
+
+@subsection Interrupting
+@vindex coq-eglot-strong-interrupt
+
+@kbd{C-c C-c} interrupts the check.  A long reduction (like @code{cbn}
+on big numbers) can only be interrupted if coq-lsp was built with OCaml
+4.x or OCaml 5.3 or later: then @code{coq-eglot-strong-interrupt} makes
+it use memprof-limits.  With OCaml 5.0 to 5.2, only Ltac code can be
+interrupted.  The virtual machine (@code{vm_compute}, and a @code{Qed}
+checked by it) can never be interrupted: a second @kbd{C-c C-c}
+restarts the server.  coq-lsp considers an interruption unsafe with the
+released versions of Rocq: if Rocq seems inconsistent afterwards,
+restart the server with @kbd{C-c C-c} twice, or @kbd{C-c C-x}.
+
+@subsection Differences with the Proof General backend
+
+@itemize @bullet
+@item
+The server checks several sentences in one request: only the messages
+of the last sentence processed are displayed.
+@item
+@vindex coq-eglot-split-goals
+The conclusion of the first goal can be displayed in a window of its
+own, below the hypotheses: menu @code{Coq -> Windows -> Conclusion
+Apart}, or option @code{coq-eglot-split-goals}.
+@item
+The goals and the answers of the queries are printed at the width of
+their windows, see @code{coq-auto-adapt-printing-width}, without
+checking anything again.  @kbd{C-c C-a C-w} asks for a printing width,
+used until the goals windows change width.  The messages of the
+sentences already checked keep the width they had then.
+@item
+@vindex coq-eglot-trace
+@findex coq-eglot-show-trace
+If @code{coq-eglot-trace} is non-nil (menu @code{Coq -> Trace}), a
+transcript of the session is written in the buffer @code{*coq-trace*}:
+the sentences checked and the queries, followed by their messages and
+the number of goals in comments, the errors and the moves back.  It is
+a Coq file, which helps to report a bug.  Its size is bounded by
+@code{coq-eglot-trace-max-size}.  @code{coq-eglot-show-trace} (menu
+@code{Coq -> Show Trace}) displays it.
+@item
+Only one frame is supported, and some options of Proof General are not
+honored yet, like @code{proof-shrink-windows-tofit}.  The insertion of
+tactics, commands and terms from the menus or by name is missing; the
+insertions built from a query work: @kbd{C-c C-a C-i} (intros),
+@kbd{C-c C-a C-m} (match) and @kbd{C-c C-a C-g} (goal selectors).
+@end itemize
+
+The other options of this backend are in the customization group
+@code{coq-eglot}.
+
 @node EasyCrypt Proof General
 @chapter EasyCrypt Proof General
 @cindex EasyCrypt Proof General

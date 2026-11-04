@@ -53,6 +53,10 @@ the Git ChangeLog, the GitHub repo https://github.com/ProofGeneral/PG
     named at point.  A highlighting that is not sticky (see
     `coq-highlight-hyps-sticky') is forgotten at the next goals, and a
     middle click on a hypothesis inserts the name clicked.
+*** New experimental backend using the language server coq-lsp
+    through Eglot (Emacs 29 or later), with the look and keys of Proof
+    General: set `coq-backend' to eglot.  See the section "Eglot
+    backend" of the manual.
 *** Setting `coq-remap-mouse-1' with customize takes effect
     immediately, also in the goals and response buffers.
 *** The abbrevs and the default yasnippet templates of Coq mode are
