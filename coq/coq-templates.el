@@ -125,7 +125,7 @@ Otherwise the abbrevs of `coq-mode-abbrev-table' are available."
   (if (listp ldpth) (car ldpth) ldpth))
 
 (defun coq-build-accessible-modules-list ()
-  (let* ((pth (or coq-load-path '(".")))
+  (let* ((pth (or (bound-and-true-p coq-load-path) '(".")))
          (cleanpth (mapcar #'coq-load-path-to-paths pth))
          (existingpth (cl-remove-if-not #'file-exists-p cleanpth))
          (file-list (coq-directories-files existingpth)))

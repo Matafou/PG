@@ -120,7 +120,21 @@ indent."
     (should (string-suffix-p "Proof.\n  reflexivity" (buffer-string)))
     (insert "\nSection S.\n")
     (coq-end-Section)
-    (should (string-suffix-p "Section S.\nEnd S." (buffer-string)))))
+    (should (string-suffix-p "Section S.\nEnd S." (buffer-string)))
+    ;; the load path is "." without backend
+    (insert "\n")
+    (let ((answers (list "Require Import"
+                         (file-name-base (buffer-file-name)) "")))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _)
+                   (let ((answer (pop answers)))
+                     (should (or (equal answer "")
+                                 (member answer (all-completions "" collection))))
+                     answer))))
+        (coq-insert-requires)))
+    (should (string-suffix-p (format "End S.\nRequire Import %s.\n"
+                                     (file-name-base (buffer-file-name)))
+                             (buffer-string)))))
 
 (ert-deftest coq-test-without-pg-insert-menu ()
   "The menu of the insertions is defined without backend."
