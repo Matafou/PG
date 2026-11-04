@@ -648,26 +648,56 @@ See `coq-eglot--printing-width-margin'."
   (when (and coq-auto-adapt-printing-width window-width)
     (max 20 (- window-width indentation coq-eglot--printing-width-margin))))
 
+(defvar coq-eglot--asked-width nil
+  "Printing width asked by `coq-eglot-ask-printing-width', or nil.
+As (WIDTH . GOALS-WINDOWS-WIDTH): it holds while the goals windows keep
+this width.")
+
+(defun coq-eglot--goals-windows-width ()
+  "Number of characters of the narrowest goals window, or nil."
+  (apply #'coq-eglot--windows-width coq-eglot-goals-buffer-name
+         (and coq-eglot-split-goals (list coq-eglot-conclusion-buffer-name))))
+
+(defun coq-eglot--asked-width ()
+  "Printing width asked by the user, or nil if the windows changed since."
+  (and coq-eglot--asked-width
+       (eql (cdr coq-eglot--asked-width) (coq-eglot--goals-windows-width))
+       (car coq-eglot--asked-width)))
+
 (defun coq-eglot--goals-printing-width ()
   "Printing width of the goals, from the width of their windows, or nil.
 Nil if they are not displayed: the windows will be created at their
-display, the goals are printed again then.  This is
+display, the goals are printed again then.  The width asked by
+`coq-eglot-ask-printing-width' instead, if any.  This is
 `coq-eglot-lsp-printing-width-function'."
-  (coq-eglot--printing-width
-   (apply #'coq-eglot--windows-width coq-eglot-goals-buffer-name
-          (and coq-eglot-split-goals (list coq-eglot-conclusion-buffer-name)))
-   coq-eglot--hyp-indentation))
+  (or (coq-eglot--asked-width)
+      (coq-eglot--printing-width (coq-eglot--goals-windows-width)
+                                 coq-eglot--hyp-indentation)))
 
 (setq coq-eglot-lsp-printing-width-function #'coq-eglot--goals-printing-width)
 
 (defun coq-eglot--query-printing-width ()
   "Printing width of the answers of the queries, or nil.
 From the width of the response window, or of the goals window if the
-response is not displayed."
-  (coq-eglot--printing-width
-   (or (coq-eglot--windows-width coq-eglot-response-buffer-name)
-       (coq-eglot--windows-width coq-eglot-goals-buffer-name))
-   0))
+response is not displayed.  The width asked by
+`coq-eglot-ask-printing-width' instead, if any."
+  (or (coq-eglot--asked-width)
+      (coq-eglot--printing-width
+       (or (coq-eglot--windows-width coq-eglot-response-buffer-name)
+           (coq-eglot--windows-width coq-eglot-goals-buffer-name))
+       0)))
+
+(defun coq-eglot-ask-printing-width (width)
+  "Print the goals and the answers of the queries WIDTH columns wide.
+Until the goals windows change width, then the printing width follows
+them again if `coq-auto-adapt-printing-width'."
+  (interactive
+   (list (read-number "Printing width: "
+                      (or coq-eglot--displayed-width
+                          (coq-eglot--goals-printing-width)
+                          78))))
+  (setq coq-eglot--asked-width (cons width (coq-eglot--goals-windows-width)))
+  (coq-eglot--refresh-width))
 
 (defvar coq-eglot--width-timer nil
   "Timer of `coq-eglot--refresh-width'.")
@@ -1565,7 +1595,8 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-p" #'coq-eglot-show-goals
   "C-c C-l" #'coq-eglot-layout-windows
   "C-c C-." #'coq-eglot-goto-end-of-locked
-  "C-c C-v" #'coq-eglot-query)
+  "C-c C-v" #'coq-eglot-query
+  "C-c C-a C-w" #'coq-eglot-ask-printing-width)
 
 ;; like in Proof General, in the goals buffer only
 (coq-hyps-define-keys coq-eglot-goals-mode-map)
@@ -1580,6 +1611,7 @@ Run when Eglot starts or stops managing the buffer."
     ["Goto End of Locked" coq-eglot-goto-end-of-locked]
     "---"
     ["Show Goals" coq-eglot-show-goals]
+    ["Set Printing Width..." coq-eglot-ask-printing-width]
     ("Windows"
      ["Layout Windows" coq-eglot-layout-windows]
      ["Three Windows"

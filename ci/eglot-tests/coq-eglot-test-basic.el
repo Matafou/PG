@@ -1748,6 +1748,35 @@ window, for this query only."
       (should (string-match-p "^  aaaaaaaa \\+ bbbbbbbbb \\* cccccccccc \\+ dddddddddd =$"
                               (buffer-text "*goals*"))))))
 
+(ert-deftest coq-eglot-ask-printing-width ()
+  "C-c C-a C-w sets the printing width of the goals and the queries, like
+in Proof General, until the goals window changes width."
+  (with-width-file
+    (goto-marker "intros")
+    (run #'coq-eglot-goto-point)
+    (wait-until (lambda () coq-eglot--displayed-width) 10)
+    (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-eglot-ask-printing-width))
+    (with-current-buffer "*goals*"
+      (should (eq (key-binding (kbd "C-c C-a C-w"))
+                  #'coq-eglot-ask-printing-width)))
+    (let ((auto coq-eglot--displayed-width))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'read-number) (lambda (&rest _) 25)))
+              (call-interactively #'coq-eglot-ask-printing-width))
+            (wait-until (lambda () (eql coq-eglot--displayed-width 25)) 10)
+            (should (eql coq-eglot--displayed-width 25))
+            (should (string-match-p "\\b25\\b" (query #'coq-eglot-run-query
+                                                      "Test Printing Width")))
+            ;; the next goals too
+            (run #'coq-eglot-assert-next-command)
+            (should (eql coq-eglot--displayed-width 25))
+            (run #'coq-eglot-undo-last-command)
+            ;; the window changes: the width follows it again
+            (shrink-goals-window 2)
+            (should (= coq-eglot--displayed-width (- auto 2))))
+        (setq coq-eglot--asked-width nil)))))
+
 (ert-deftest coq-eglot-format-hyp ()
   "A hypothesis is formatted like Coq does: on one line if it fits,
 otherwise the names on several lines and the type below them."
