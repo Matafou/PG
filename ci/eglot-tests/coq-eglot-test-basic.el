@@ -780,6 +780,7 @@ displayed, with arrows in the fringe, like in Proof General."
         (should (= (window-start window) (point-min)))))))
 
 (defvar coq-prefer-top-of-conclusion)     ; let-bound
+(defvar coq-highlight-hyps-sticky)        ; let-bound
 
 (defun separator-line ()
   "Start of the line of the separator in the current buffer."
@@ -853,31 +854,42 @@ the numbers of goals.  Like in Proof General."
       (setq coq-fold-other-goals t))))
 
 (defun hyp-overlay (name property)
-  "Overlay with PROPERTY on the line of hypothesis NAME in the goals."
+  "Overlay with PROPERTY on the type of hypothesis NAME in the goals."
   (with-current-buffer "*goals*"
     (goto-char (point-min))
-    (should (re-search-forward (format "^  %s :" name) nil t))
+    (should (re-search-forward (format "^  %s : " name) nil t))
     (seq-find (lambda (ov) (overlay-get ov property))
-              (overlays-in (line-beginning-position) (line-end-position)))))
+              (overlays-at (point)))))
+
+(defun hyp-cross (name)
+  "The folding button of hypothesis NAME in the goals."
+  (with-current-buffer "*goals*"
+    (goto-char (point-min))
+    (should (re-search-forward (format "^  %s : " name) nil t))
+    (let ((ov (seq-find (lambda (ov) (overlay-get ov 'display))
+                        (overlays-at (line-beginning-position)))))
+      (and ov (overlay-get ov 'display)))))
 
 (ert-deftest coq-eglot-highlight-and-fold-hyps ()
   "Hypotheses can be highlighted and folded, they stay so in the next
-goals, like in Proof General."
+goals, like in Proof General: highlighted if `coq-highlight-hyps-sticky'."
   (with-test-file
     (unwind-protect
-        (progn
+        (let ((coq-highlight-hyps-sticky t))
           (goto-marker "hyps")
           (run #'coq-eglot-goto-point)
           (with-current-buffer "*goals*"
-            (should (eq (key-binding "h") #'coq-eglot-toggle-highlight-hyp))
-            (should (eq (key-binding "f") #'coq-eglot-toggle-fold-hyp))
+            (should (eq (key-binding "h") #'coq-toggle-highlight-hyp-at-point))
+            (should (eq (key-binding "f") #'coq-toggle-fold-hyp-at-point))
+            (should (equal (hyp-cross "H") "-"))
             (goto-char (point-min))
             (search-forward "H :")
-            (coq-eglot-toggle-highlight-hyp)
-            (coq-eglot-toggle-fold-hyp))
+            (coq-toggle-highlight-hyp-at-point)
+            (coq-toggle-fold-hyp-at-point))
           (should (hyp-overlay "H" 'face))
           (should (equal (overlay-get (hyp-overlay "H" 'display) 'display)
-                         " : ..."))
+                         "....."))
+          (should (equal (hyp-cross "H") "+"))
           ;; the type is still there, for copy
           (should (string-match-p "H : n = m" (buffer-text "*goals*")))
           (run #'coq-eglot-assert-next-command)
@@ -888,21 +900,39 @@ goals, like in Proof General."
           ;; from the script, on the name of the hypothesis
           (goto-marker "hyps")
           (search-backward "H")
-          (coq-eglot-toggle-highlight-hyp)
+          (coq-toggle-highlight-hyp-at-point)
           (should-not (hyp-overlay "H" 'face))
           ;; n and m are on the same line
           (search-backward "m")
-          (coq-eglot-toggle-highlight-hyp)
+          (coq-toggle-highlight-hyp-at-point)
           (should (hyp-overlay "n, m" 'face))
-          (should (equal (sort (copy-sequence coq-eglot--highlighted-hyps)
+          (should (equal (sort (copy-sequence coq-highlighted-hyps)
                                #'string<)
                          '("m" "n")))
-          (coq-eglot-unfold-hyps)
+          (coq-unfold-hyps)
           (should-not (hyp-overlay "H" 'display))
           (goto-char (point-min))
-          (should-error (coq-eglot-toggle-highlight-hyp) :type 'user-error))
-      (coq-eglot-unhighlight-hyps)
-      (coq-eglot-unfold-hyps))))
+          (should-error (coq-toggle-highlight-hyp-at-point) :type 'user-error))
+      (coq-unhighlight-selected-hyps)
+      (coq-unfold-hyps))))
+
+(ert-deftest coq-eglot-highlight-not-sticky ()
+  "Without `coq-highlight-hyps-sticky', the highlighting stops at the
+next goals, not when the same goals are displayed again."
+  (with-test-file
+    (unwind-protect
+        (progn
+          (goto-marker "hyps")
+          (run #'coq-eglot-goto-point)
+          (coq-toggle-highlight-hyp "H")
+          (should (hyp-overlay "H" 'face))
+          (coq-eglot-toggle-split-goals)
+          (coq-eglot-toggle-split-goals)
+          (should (hyp-overlay "H" 'face))
+          (run #'coq-eglot-assert-next-command)
+          (should-not (hyp-overlay "H" 'face))
+          (should-not coq-highlighted-hyps))
+      (coq-unhighlight-selected-hyps))))
 
 (ert-deftest coq-eglot-search-highlights-hyps ()
   "Search highlights the hypotheses it finds, like in Proof General."
@@ -912,9 +942,9 @@ goals, like in Proof General."
           (goto-marker "hyps")
           (run #'coq-eglot-goto-point)
           (should (string-match-p "^H: n = m" (query-interactively #'coq-Search nil "n")))
-          (should (equal coq-eglot--highlighted-hyps '("H")))
+          (should (equal coq-highlighted-hyps '("H")))
           (should (hyp-overlay "H" 'face)))
-      (coq-eglot-unhighlight-hyps))))
+      (coq-unhighlight-selected-hyps))))
 
 (ert-deftest coq-eglot-query-at-mouse ()
   "Control click prints, shift click shows About, control shift click
@@ -1745,10 +1775,10 @@ otherwise the names on several lines and the type below them."
                    "  x :=\n    aaaaaaaa +\n    bbbbbbbb\n    : nat"))
     ;; the properties for highlighting and folding
     (let ((text (coq-eglot--format-hyp '(:names ["H"] :ty "a =\nb"))))
-      (should (equal (get-text-property 2 'coq-eglot-hyp text) '("H")))
-      (should-not (get-text-property 2 'coq-eglot-hyp-body text))
-      (should (get-text-property 3 'coq-eglot-hyp-body text))
-      (should (get-text-property (1- (length text)) 'coq-eglot-hyp-body text)))))
+      (should (equal (get-text-property 2 'coq-hyp text) '("H")))
+      (should-not (get-text-property 2 'coq-hyp-body text))
+      (should (get-text-property 3 'coq-hyp-body text))
+      (should (get-text-property (1- (length text)) 'coq-hyp-body text)))))
 
 (ert-deftest coq-eglot-format-conclusion-indented ()
   "The lines of a conclusion are indented, like in Coq, without the

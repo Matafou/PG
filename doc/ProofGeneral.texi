@@ -5686,8 +5686,10 @@ The first column of each hypothesis is a button, @code{-} or @code{+}
 when folded: click on it to fold or unfold the hypothesis.  A right
 click on its name does the same, a middle click inserts its name at
 point.  The commands are also in the menu @code{Coq -> Settings ->
-Hypotheses}.  Elsewhere than in the goals buffer, they work on the
-hypothesis named by the identifier at point.
+Hypotheses} (@code{Coq -> Hypotheses} with the Eglot backend).
+Elsewhere than in the goals buffer, they work on the hypothesis named
+by the identifier at point.  These commands work the same with both
+backends.
 
 @node Opam-switch-mode support
 @section Opam-switch-mode support
