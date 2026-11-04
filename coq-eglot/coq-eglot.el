@@ -430,14 +430,12 @@ apart, its window is below the goals window."
             (coq-eglot--show-in (split-window goals-window nil 'right)
                                 response)))
     (when (and conclusion (not (get-buffer-window conclusion)))
-      (coq-eglot--show-in
-       ;; between the goals and the messages, from the higher one
-       (if (and response-window (not columns)
-                (> (window-total-height response-window)
-                   (window-total-height goals-window)))
-           (split-window response-window nil 'above)
-         (split-window goals-window nil 'below))
-       conclusion))
+      ;; always below the goals, room taken from the neighbours if needed
+      (let ((missing (- (* 2 window-min-height)
+                        (window-total-height goals-window))))
+        (when (> missing 0)
+          (window-resize goals-window (window-resizable goals-window missing))))
+      (coq-eglot--show-in (split-window goals-window nil 'below) conclusion))
     (unless response-window
       (coq-eglot--show-in
        (split-window (or (and conclusion (get-buffer-window conclusion))

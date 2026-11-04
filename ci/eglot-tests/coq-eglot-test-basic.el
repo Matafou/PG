@@ -606,6 +606,28 @@ script."
         (should (= (window-left-column goals) (window-left-column response)))
         (should (< (window-top-line goals) (window-top-line response)))))))
 
+(ert-deftest coq-eglot-layout-hybrid-conclusion ()
+  "The conclusion window is always created just below the goals window,
+even when the messages window is higher."
+  (with-test-file
+    (with-layout t 'hybrid
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (let ((coq-optimise-resp-windows-enable nil))
+        (pcase-let ((`(,goals ,response)
+                     (windows-of "*goals*" "*response*")))
+          (window-resize goals (- window-min-height (window-total-height goals)))
+          (should (> (window-total-height response)
+                     (window-total-height goals))))
+        (unwind-protect
+            (progn
+              (coq-eglot-toggle-split-goals)
+              (pcase-let ((`(,goals ,conclusion ,response)
+                           (windows-of "*goals*" "*conclusion*" "*response*")))
+                (should (eq (window-in-direction 'below goals) conclusion))
+                (should (eq (window-in-direction 'below conclusion) response))))
+          (coq-eglot-toggle-split-goals))))))
+
 (ert-deftest coq-eglot-layout-horizontal ()
   "Horizontal policy: three columns.  With the conclusion apart, it is
 below the goals, the messages keep the whole height."
