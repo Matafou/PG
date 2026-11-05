@@ -2115,6 +2115,64 @@ given by Coq, like in Proof General."
                (line-end-position 2) t))
       (should (= (coq-eglot-position) position)))))
 
+(ert-deftest coq-eglot-output-buffers-keys ()
+  "The goals and response buffers have the common keys of the queries
+and of the display, like in Proof General, not those of the insertions:
+they insert in the script."
+  (dolist (mode '(coq-eglot-goals-mode coq-eglot-response-mode))
+    (with-temp-buffer
+      (funcall mode)
+      (dolist (binding '(("C-c C-a C-s" . coq-Show)
+                         ("C-c C-a C-c" . coq-Check)
+                         ("C-c C-a C-w" . coq-ask-printing-width)
+                         ("C-c C-a n" . coq-unset-printing-notations)
+                         ("C-c C-a r" . coq-store-response-win)
+                         ("C-c C-a g" . coq-store-goals-win)
+                         ("C-c C-n" . coq-eglot-assert-next-command)))
+        (should (eq (key-binding (kbd (car binding))) (cdr binding))))
+      (dolist (key '("C-c C-a [" "C-c C-a C-i" "C-c C-a C-t" "."))
+        (should-not (eq (key-binding (kbd key))
+                        (lookup-key coq-mode-map (kbd key)))))))
+  ;; like in Proof General, kept for compatibility
+  (with-temp-buffer
+    (coq-eglot-response-mode)
+    (should (eq (key-binding (kbd "C-c C-a C-r")) #'coq-store-response-win))
+    (should (eq (key-binding (kbd "C-c C-a C-g")) #'coq-store-goals-win))))
+
+(ert-deftest coq-eglot-frozen-copies ()
+  "C-c C-a r and C-c C-a g copy the response and the goals at the top of
+a buffer of their own, like in Proof General."
+  (with-test-file
+    (goto-marker "hello")
+    (run #'coq-eglot-goto-point)
+    (when (get-buffer coq-store-buffer-name)
+      (kill-buffer coq-store-buffer-name))
+    (unwind-protect
+        ;; another frame: a window in batch mode, see
+        ;; `coq-eglot-multiple-frames'
+        (cl-letf (((symbol-function 'display-buffer-other-frame)
+                   (lambda (buffer) (display-buffer buffer))))
+          (with-current-buffer "*response*"
+            (call-interactively (key-binding (kbd "C-c C-a r"))))
+          (should (equal (buffer-text coq-store-buffer-name)
+                         (concat "hello\n" (make-string 36 ?*))))
+          (should (eq (buffer-local-value 'major-mode
+                                          (get-buffer coq-store-buffer-name))
+                      'coq-eglot-response-mode))
+          (should (get-buffer-window coq-store-buffer-name))
+          ;; from the script: the goals, above the response
+          (call-interactively (key-binding (kbd "C-c C-a g")))
+          (let ((text (buffer-text coq-store-buffer-name)))
+            (should (string-match-p "\\`1 goal" text))
+            (should (string-match-p "double n = n \\+ n" text))
+            (should (string-match-p "^hello$" text)))
+          ;; with a prefix argument, erased first
+          (let ((current-prefix-arg '(4)))
+            (call-interactively #'coq-store-response-win))
+          (should (equal (buffer-text coq-store-buffer-name) "hello")))
+      (when (get-buffer coq-store-buffer-name)
+        (kill-buffer coq-store-buffer-name)))))
+
 (ert-deftest coq-eglot-trace ()
   "With `coq-eglot-trace', the sentences, queries, errors and moves back
 are written in the trace, the outputs in comments."

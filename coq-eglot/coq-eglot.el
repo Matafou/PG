@@ -335,9 +335,11 @@ error."
 
 (define-derived-mode coq-eglot-output-mode nil "Coq Output"
   "Parent mode of the goals and response buffers of the Eglot backend.
-Read-only, with the keys of the script buffer, but not those of
-`special-mode': like in Proof General, \"q\" does not close the
-window.  Queries run on the active script buffer."
+Read-only, with the keys of the backend, and the keys of the queries
+and of the display common to all backends, see
+`coq-queries-define-keys', but not those of `special-mode': like in
+Proof General, \"q\" does not close the window.  Queries run on the
+active script buffer."
   :syntax-table coq-mode-syntax-table   ; for `coq-id-at-point'
   (setq buffer-read-only t)
   (setq coq-query-function #'coq-eglot-run-query)
@@ -2074,9 +2076,25 @@ Run when Eglot starts or stops managing the buffer."
   "Menu of the Eglot backend of Coq."
   coq-eglot--menu-spec)
 
-;; the same keys in the goals and response buffers, like Proof General
+(defvar coq-eglot--output-common-map
+  (let ((map (make-sparse-keymap)))
+    (coq-queries-define-keys map)
+    map)
+  "Keys common to all backends in the goals and response buffers.
+The queries and the display, not the insertions: they insert in the
+script, see `coq-queries-define-keys'.")
+
+;; the keys of the backend, and the common keys of the goals and response
+;; buffers of Proof General
 (set-keymap-parent coq-eglot-output-mode-map
-                   (make-composed-keymap coq-eglot-mode-map coq-mode-map))
+                   (make-composed-keymap coq-eglot-mode-map
+                                         coq-eglot--output-common-map))
+
+;; like in Proof General: before C-c C-a r and g, kept for compatibility
+(define-key coq-eglot-response-mode-map (kbd "C-c C-a C-r")
+            #'coq-store-response-win)
+(define-key coq-eglot-response-mode-map (kbd "C-c C-a C-g")
+            #'coq-store-goals-win)
 
 ;; The queries at mouse click, see `coq-remap-mouse-1'.
 (coq-mouse-query-add-keymap coq-eglot-output-mode-map)
