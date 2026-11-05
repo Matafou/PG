@@ -38,6 +38,7 @@
 (require 'pg-double-hit)
 (require 'coq-queries)                  ; common to all backends
 (require 'coq-templates)                ; abbrevs and yasnippets, idem
+(require 'coq-project)                  ; load path and project file, idem
 
 (declare-function coq-pg-setup "coq")   ; coq.el requires this file
 
@@ -173,20 +174,24 @@ and `proof-double-hit-enable'.  Bind another key to this command in
   (let ((map (make-sparse-keymap)))
     ;; In all backends, see `coq-terminator-insert-function'.
     (define-key map (kbd ".") #'coq-terminator-insert)
-    ;; Queries, in all backends, see `coq-query-function'.
-    (define-key map (kbd "C-c C-a C-a") #'coq-Search)
-    (define-key map (kbd "C-c C-a C-b") #'coq-About)
-    (define-key map (kbd "C-c C-a C-c") #'coq-Check)
-    (define-key map (kbd "C-c C-a C-o") #'coq-SearchIsos)
-    (define-key map (kbd "C-c C-a C-p") #'coq-Print)
-    (define-key map (kbd "C-c C-a C-q") #'coq-query)
-    (define-key map (kbd "C-c C-a C-l") #'coq-LocateConstant)
-    (define-key map (kbd "C-c C-a C-n") #'coq-LocateNotation)
-    (define-key map (kbd "C-c C-a h") #'coq-PrintHint)
+    ;; Queries and display, in all backends, also in the goals and
+    ;; response buffers.
+    (coq-queries-define-keys map)
     ;; Insertions built from a query, see `coq-query-result-function'.
     (define-key map (kbd "C-c C-a C-i") #'coq-insert-intros)
     (define-key map (kbd "C-c C-a C-m") #'coq-insert-match)
     (define-key map (kbd "C-c C-a C-g") #'coq-insert-named-goal-selectors)
+    ;; "as [xxx]", see `coq-processed-end-function'
+    (define-key map (kbd "C-c C-a [") #'coq-insert-as-in-next-command)
+    ;; Insertions without backend, see coq-templates.el.
+    (define-key map (kbd "C-c C-a C-(") #'coq-insert-section-or-module)
+    (define-key map (kbd "C-c C-a C-)") #'coq-end-Section)
+    (define-key map (kbd "C-c C-a C-t") #'coq-insert-tactic)
+    (define-key map (kbd "C-c C-a t") #'coq-insert-tactical)
+    (define-key map (kbd "C-c C-a !") #'coq-insert-solve-tactic)
+    (define-key map (kbd "C-c C-a C-SPC") #'coq-insert-term)
+    (define-key map (kbd "C-c C-a C-<return>") #'coq-insert-command)
+    (define-key map (kbd "C-c C-a C-r") #'coq-insert-requires)
     map)
   "Keymap for `coq-mode'.")
 
@@ -326,6 +331,10 @@ Near here means PT is either inside or just aside of a comment."
 
   ;; abbrevs and yasnippet templates, in all backends
   (coq-templates-setup)
+
+  ;; load path from the project file, in all backends, after the
+  ;; file/dir local variables, which may override it
+  (add-hook 'hack-local-variables-hook #'coq-load-project-file nil t)
 
   ;; Setup the interface to Coq.
   (pcase coq-backend

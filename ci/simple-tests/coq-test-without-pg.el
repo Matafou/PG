@@ -9,7 +9,7 @@
 ;; Test the part of Coq mode common to all backends, with the Proof
 ;; General backend disabled (`coq-use-pg' nil): it must not load the
 ;; proof shell, and the abbrevs, the terminator command, the query
-;; commands and their keys must be there.
+;; and insertion commands and their keys must be there.
 
 ;;; Code:
 
@@ -19,8 +19,11 @@
 
 (require 'proof-site)
 (require 'ert)
+(require 'cl-lib)
 
 (defvar coq-mode-abbrev-table)
+(defvar coq-load-path)
+(defvar coq-prog-args)
 (defvar coq-query-function)
 (defvar coq-use-yasnippet)
 
@@ -29,7 +32,21 @@
 (declare-function coq-terminator-insert "coq-mode")
 (declare-function coq-About "coq-queries")
 (declare-function coq-Check "coq-queries")
+(declare-function coq-Show "coq-queries")
+(declare-function coq-set-printing-parentheses "coq-queries")
+(declare-function coq-ask-printing-width "coq-goals")
+(declare-function coq-store-goals-win "coq-goals")
+(declare-function coq-store-response-win "coq-goals")
 (declare-function coq-insert-intros "coq-queries")
+(declare-function coq-insert-as-in-next-command "coq-queries")
+(declare-function coq-insert-tactic "coq-templates")
+(declare-function coq-insert-tactical "coq-templates")
+(declare-function coq-insert-solve-tactic "coq-templates")
+(declare-function coq-insert-term "coq-templates")
+(declare-function coq-insert-command "coq-templates")
+(declare-function coq-insert-requires "coq-templates")
+(declare-function coq-insert-section-or-module "coq-templates")
+(declare-function coq-end-Section "coq-templates")
 
 
 ;;; utility functions
@@ -70,6 +87,26 @@
     (let ((coq-use-yasnippet nil))
       (coq-templates-setup))))
 
+(ert-deftest coq-test-without-pg-project-file ()
+  "The project file sets the load path and the arguments."
+  (let* ((dir (file-name-as-directory (make-temp-file "without_pg" t)))
+         (file (expand-file-name "a.v" dir))
+         buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "_RocqProject" dir)
+            (insert "-R theories Foo\n-Q lib \"\"\n-arg -w -arg all\n"))
+          (with-temp-file file (insert "Definition x := 0.\n"))
+          (find-file file)
+          (setq buffer (current-buffer))
+          (should (equal coq-load-path
+                         `((rec ,(expand-file-name "theories" dir) "Foo")
+                           (recnoimport ,(expand-file-name "lib" dir) ""))))
+          (should (equal coq-prog-args '("-w" "all")))
+          (should-not (featurep 'proof)))
+      (when buffer (kill-buffer buffer))
+      (delete-directory dir t))))
+
 (ert-deftest coq-test-without-pg-commands ()
   "The common commands and their keys are there, without backend to
 run the queries."
@@ -77,15 +114,50 @@ run the queries."
     (should (eq (key-binding ".") #'coq-terminator-insert))
     (should (eq (key-binding (kbd "C-c C-a C-b")) #'coq-About))
     (should (eq (key-binding (kbd "C-c C-a C-c")) #'coq-Check))
+    (should (eq (key-binding (kbd "C-c C-a C-s")) #'coq-Show))
+    (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-ask-printing-width))
+    (should (eq (key-binding (kbd "C-c C-a r")) #'coq-store-response-win))
+    (should (eq (key-binding (kbd "C-c C-a g")) #'coq-store-goals-win))
+    (should (eq (key-binding (kbd "C-c C-a C-9")) #'coq-set-printing-parentheses))
     (should (eq (key-binding (kbd "C-c C-a C-i")) #'coq-insert-intros))
+    (should (eq (key-binding (kbd "C-c C-a [")) #'coq-insert-as-in-next-command))
+    (should (eq (key-binding (kbd "C-c C-a C-(")) #'coq-insert-section-or-module))
+    (should (eq (key-binding (kbd "C-c C-a C-)")) #'coq-end-Section))
+    (should (eq (key-binding (kbd "C-c C-a C-t")) #'coq-insert-tactic))
+    (should (eq (key-binding (kbd "C-c C-a t")) #'coq-insert-tactical))
+    (should (eq (key-binding (kbd "C-c C-a !")) #'coq-insert-solve-tactic))
+    (should (eq (key-binding (kbd "C-c C-a C-SPC")) #'coq-insert-term))
+    (should (eq (key-binding (kbd "C-c C-a C-<return>")) #'coq-insert-command))
+    (should (eq (key-binding (kbd "C-c C-a C-r")) #'coq-insert-requires))
     ;; no backend
     (should-not coq-query-function)
     (should-error (coq-run-query "Check x") :type 'user-error)
+    (should-error (coq-ask-printing-width) :type 'user-error)
+    (should-error (coq-set-printing-parentheses) :type 'user-error)
+    (should-error (coq-insert-as-in-next-command) :type 'user-error)
+    ;; no goals buffer, nothing to copy
+    (coq-store-goals-win)
+    (should-not (get-buffer "*response-freeze*"))
     ;; the terminator is just inserted
     (goto-char (point-max))
     (let ((last-command-event ?.))
       (call-interactively (key-binding ".")))
     (should (string-suffix-p "0.\n." (buffer-string)))))
+
+(ert-deftest coq-test-without-pg-insertions ()
+  "The insertion commands without query work without backend, and
+indent."
+  (coq-test-without-pg-with-file
+    (goto-char (point-max))
+    (insert "Lemma l : True.\nProof.\n")
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "reflexivity")))
+      (coq-insert-tactic))
+    ;; inserted and indented
+    (should (string-suffix-p "Proof.\n  reflexivity" (buffer-string)))
+    (insert "\nSection S.\n")
+    (coq-end-Section)
+    (should (string-suffix-p "Section S.\nEnd S." (buffer-string)))))
 
 (provide 'coq-test-without-pg)
 
