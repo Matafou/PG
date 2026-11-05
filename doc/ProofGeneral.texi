@@ -5834,7 +5834,16 @@ Windows}): @code{proof-auto-raise-buffers},
 messages, the trace and the goals in turn.
 @item
 All the insertion commands and the menu @code{Coq -> INSERT} work,
-except @kbd{C-c C-a [} (@code{coq-insert-as-in-next-command}).
+@kbd{C-c C-a [} (@code{coq-insert-as-in-next-command}) included.
+@item
+The printing flags (like @kbd{C-c C-a n}, Unset Printing Notations) hold
+for the next goals and queries: the server runs them before each one, on
+a copy of the state.  Nothing is checked again, the goals are printed
+again at once.  They are forgotten when the server stops.
+@item
+In the processed part, @kbd{C-c C-a C-s} (@code{coq-Show}) displays the
+goals and messages after the sentence at point, printed again, without
+moving the proof position.
 @end itemize
 
 The other options of this backend are in the customization group

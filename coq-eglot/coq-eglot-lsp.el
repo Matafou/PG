@@ -311,38 +311,65 @@ See `coq-eglot-lsp-printing-width-function'."
   (and coq-eglot-lsp-printing-width-function
        (funcall coq-eglot-lsp-printing-width-function)))
 
-(defun coq-eglot-lsp--goals-params (pos &optional width)
-  "Parameters of a goals request at buffer position POS.
-With Set Printing Width WIDTH if non-nil: the server runs it on a copy
-of the state after the sentence, it changes nothing else."
-  (append (list :textDocument (eglot--VersionedTextDocumentIdentifier)
-                :position (coq-eglot-lsp-position pos)
-                :pp_format "Str")
-          (and width
-               (list :command (format "Set Printing Width %d." width)))))
+(defvar coq-eglot-lsp-printing-flags-function nil
+  "Function giving the printing flags of the goals, or nil.
+Called without argument in the script buffer before each goals request.
+It returns a list of Coq commands without their final dot, like \"Set
+Printing Parentheses\", run before the goals are printed.  The answer
+gives them with the key :printing-flags.")
 
-(defun coq-eglot-lsp--with-width (answer width)
-  "ANSWER of a goals request printed at WIDTH, with key :printing-width."
-  (if answer (plist-put answer :printing-width width) answer))
+(defun coq-eglot-lsp--printing-flags ()
+  "Printing flags of the next goals request.
+See `coq-eglot-lsp-printing-flags-function'."
+  (and coq-eglot-lsp-printing-flags-function
+       (funcall coq-eglot-lsp-printing-flags-function)))
+
+(defun coq-eglot-lsp--goals-params (pos &optional width flags)
+  "Parameters of a goals request at buffer position POS.
+With Set Printing Width WIDTH if non-nil, and the commands FLAGS: the
+server runs them on a copy of the state after the sentence, they change
+nothing else."
+  (let ((commands (append (and width
+                               (list (format "Set Printing Width %d" width)))
+                          flags)))
+    (append (list :textDocument (eglot--VersionedTextDocumentIdentifier)
+                  :position (coq-eglot-lsp-position pos)
+                  :pp_format "Str")
+            (and commands
+                 (list :command (mapconcat (lambda (command)
+                                             (concat command "."))
+                                           commands " "))))))
+
+(defun coq-eglot-lsp--with-width (answer width flags)
+  "ANSWER of a goals request printed at WIDTH with FLAGS.
+With the keys :printing-width and :printing-flags."
+  (if answer
+      (plist-put (plist-put answer :printing-width width)
+                 :printing-flags flags)
+    answer))
 
 (defun coq-eglot-lsp-goals (pos)
   "Ask the goals after the sentence at buffer position POS.
 Return the answer of the server as a plist with keys :range, :goals,
 :messages and :error, and :printing-width, see
-`coq-eglot-lsp-printing-width-function'."
-  (let ((width (coq-eglot-lsp--printing-width)))
+`coq-eglot-lsp-printing-width-function', and :printing-flags, see
+`coq-eglot-lsp-printing-flags-function'."
+  (let ((width (coq-eglot-lsp--printing-width))
+        (flags (coq-eglot-lsp--printing-flags)))
     (coq-eglot-lsp--with-width
-     (coq-eglot-lsp-request :proof/goals (coq-eglot-lsp--goals-params pos width))
-     width)))
+     (coq-eglot-lsp-request :proof/goals
+                            (coq-eglot-lsp--goals-params pos width flags))
+     width flags)))
 
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
 See `coq-eglot-lsp-goals' and `coq-eglot-lsp-async-request'."
-  (let ((width (coq-eglot-lsp--printing-width)))
+  (let ((width (coq-eglot-lsp--printing-width))
+        (flags (coq-eglot-lsp--printing-flags)))
     (coq-eglot-lsp-async-request
-     :proof/goals (coq-eglot-lsp--goals-params pos width)
+     :proof/goals (coq-eglot-lsp--goals-params pos width flags)
      (lambda (answer)
-       (funcall on-success (coq-eglot-lsp--with-width answer width)))
+       (funcall on-success (coq-eglot-lsp--with-width answer width flags)))
      on-error)))
 
 (defun coq-eglot-lsp-ping (on-answer)

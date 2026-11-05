@@ -341,7 +341,9 @@ window.  Queries run on the active script buffer."
   :syntax-table coq-mode-syntax-table   ; for `coq-id-at-point'
   (setq buffer-read-only t)
   (setq coq-query-function #'coq-eglot-run-query)
-  (setq coq-query-result-function #'coq-eglot-query-result))
+  (setq coq-query-result-function #'coq-eglot-query-result)
+  (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
+  (setq coq-set-flag-function #'coq-eglot-set-flag))
 
 (define-derived-mode coq-eglot-goals-mode coq-eglot-output-mode "Coq Goals"
   "Major mode for the goals of the Eglot backend of Coq."
@@ -863,6 +865,41 @@ them again if `coq-auto-adapt-printing-width'."
   (setq coq-eglot--asked-width (cons width (coq-eglot--goals-windows-width)))
   (coq-eglot--refresh-width))
 
+(defvar coq-eglot--printing-flags nil
+  "Commands setting the printing flags of the goals and queries.
+Without their final dot, in the order they were run, at most one per
+flag.  See `coq-eglot-set-flag'.")
+
+(defvar coq-eglot--displayed-flags nil
+  "Printing flags of the goals displayed, see `coq-eglot--printing-flags'.")
+
+(defun coq-eglot--flag-name (command)
+  "Name of the flag set or unset by COMMAND, like \"Printing All\"."
+  (replace-regexp-in-string "\\`\\(?:Set\\|Unset\\)[ \t]+" ""
+                            (string-trim command)))
+
+(defun coq-eglot-set-flag (command)
+  "Run COMMAND, setting a printing flag, for the next goals and queries.
+COMMAND is like \"Set Printing Parentheses\", without final dot.  The
+server runs it before each goals request and each query, on a copy of
+the state: nothing is checked again, the goals are printed again now.
+The flags are forgotten when the server stops.  This is
+`coq-set-flag-function' for the Eglot backend."
+  (let ((name (coq-eglot--flag-name command)))
+    (setq coq-eglot--printing-flags
+          (append (cl-remove name coq-eglot--printing-flags
+                             :key #'coq-eglot--flag-name :test #'equal)
+                  (list (string-trim command)))))
+  (message "Coq: %s" command)
+  (coq-eglot--refresh-width))
+
+(defun coq-eglot--goals-printing-flags ()
+  "Printing flags of the goals.
+This is `coq-eglot-lsp-printing-flags-function'."
+  coq-eglot--printing-flags)
+
+(setq coq-eglot-lsp-printing-flags-function #'coq-eglot--goals-printing-flags)
+
 (defvar coq-eglot--width-timer nil
   "Timer of `coq-eglot--refresh-width'.")
 
@@ -877,14 +914,17 @@ redisplay, and to wait for the end of a resizing."
         (run-at-time 0.1 nil #'coq-eglot--refresh-width)))
 
 (defun coq-eglot--refresh-width ()
-  "Print the goals again if the width of their windows changed.
-Not during a check: the goals of each sentence are asked when it is
-checked, at the current width."
+  "Print the goals again if their width or printing flags changed.
+The width of their windows, or the flags of `coq-eglot-set-flag'.  Not
+during a check: the goals of each sentence are asked when it is checked,
+at the current width."
   (setq coq-eglot--width-timer nil)
   (let ((script coq-eglot--active-buffer)
         (width (coq-eglot--goals-printing-width)))
     (when (and coq-eglot--displayed-goals
-               width (not (eql width coq-eglot--displayed-width))
+               (or (and width (not (eql width coq-eglot--displayed-width)))
+                   (not (equal coq-eglot--printing-flags
+                               coq-eglot--displayed-flags)))
                (buffer-live-p script))
       (with-current-buffer script
         (let ((last (car coq-eglot--ends)))
@@ -1064,6 +1104,7 @@ See `coq-eglot-split-goals'."
          (new (not (equal goals coq-eglot--displayed-goals))))
     (setq coq-eglot--displayed-goals goals)
     (setq coq-eglot--displayed-width (plist-get answer :printing-width))
+    (setq coq-eglot--displayed-flags (plist-get answer :printing-flags))
     (if (not coq-eglot-split-goals)
         (progn
           (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
@@ -1158,7 +1199,8 @@ See `coq-eglot-split-goals'."
             (delete-window window)))
         (kill-buffer buffer))))
   (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals
-                               :printing-width coq-eglot--displayed-width))
+                               :printing-width coq-eglot--displayed-width
+                               :printing-flags coq-eglot--displayed-flags))
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
 
 (defun coq-eglot--show-response (text)
@@ -1683,6 +1725,7 @@ server managed.  The next command starts a new server."
             (setq coq-eglot--interrupting nil)
             (coq-eglot--set-position nil nil)
             (coq-eglot--clear-error)))))
+    (setq coq-eglot--printing-flags nil)
     (coq-eglot--show-goals nil)
     (coq-eglot--show-response "")
     (message "Coq: server stopped")))
@@ -1693,6 +1736,19 @@ server managed.  The next command starts a new server."
   (coq-eglot--with-script
     (coq-eglot--check-busy)
     (coq-eglot--goals-at-position t)))
+
+(defun coq-eglot-show-at-point ()
+  "Display the goals and messages after the sentence at point.
+Only in the processed part, return nil elsewhere.  The proof position
+does not move.  This is `coq-show-at-point-function' for the Eglot
+backend, see `coq-Show'."
+  (when (< (point) (coq-eglot-position))
+    (coq-eglot--activate)
+    (coq-eglot--check-busy)
+    (let ((answer (coq-eglot-lsp-goals (point))))
+      (coq-eglot--clear-error)
+      (coq-eglot--show-answer answer))
+    t))
 
 (defun coq-eglot-goto-end-of-locked ()
   "Move point to the proof position.
@@ -1841,7 +1897,9 @@ THEN is called with the messages."
         ;; the server runs all the sentences on a copy of the state
         (sentences (concat (let ((width (coq-eglot--query-printing-width)))
                              (if width (format "Set Printing Width %d. " width) ""))
-                           (mapconcat (lambda (flag) (concat flag ". ")) flags "")
+                           (mapconcat (lambda (flag) (concat flag ". "))
+                                      (append coq-eglot--printing-flags flags)
+                                      "")
                            command)))
     ;; in the last processed sentence: the state after it
     (coq-eglot-lsp-query-async
@@ -1899,8 +1957,7 @@ Run when Eglot starts or stops managing the buffer."
   "C-c C-l" #'coq-eglot-layout-windows
   "C-c C-o" #'coq-eglot-display-some-buffers
   "C-c C-." #'coq-eglot-goto-end-of-locked
-  "C-c C-v" #'coq-eglot-query
-  "C-c C-a C-w" #'coq-eglot-ask-printing-width)
+  "C-c C-v" #'coq-eglot-query)
 
 ;; like in Proof General, in the goals buffer only
 (coq-hyps-define-keys coq-eglot-goals-mode-map)
@@ -1916,7 +1973,7 @@ Run when Eglot starts or stops managing the buffer."
     "---"
     ["Show Goals" coq-eglot-show-goals]
     ["Show Trace" coq-eglot-show-trace]
-    ["Set Printing Width..." coq-eglot-ask-printing-width]
+    ["Set Printing Width..." coq-ask-printing-width]
     ("Windows"
      ["Layout Windows" coq-eglot-layout-windows]
      ["Three Windows"
@@ -2048,6 +2105,10 @@ Warn if processed Require sentences load outdated libraries."
         (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)
         (setq coq-query-function #'coq-eglot-run-query)
         (setq coq-query-result-function #'coq-eglot-query-result)
+        (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
+        (setq coq-set-flag-function #'coq-eglot-set-flag)
+        (setq coq-show-at-point-function #'coq-eglot-show-at-point)
+        (setq coq-processed-end-function #'coq-eglot-position)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
@@ -2059,6 +2120,10 @@ Warn if processed Require sentences load outdated libraries."
     (kill-local-variable 'coq-terminator-insert-function)
     (kill-local-variable 'coq-query-function)
     (kill-local-variable 'coq-query-result-function)
+    (kill-local-variable 'coq-ask-printing-width-function)
+    (kill-local-variable 'coq-set-flag-function)
+    (kill-local-variable 'coq-show-at-point-function)
+    (kill-local-variable 'coq-processed-end-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)

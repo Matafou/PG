@@ -32,6 +32,13 @@ Proof.
   intros. (* marker long *)
 Abort.
 
+Lemma as_clause : forall l : list nat, l = l.
+Proof.
+  intros l. (* marker as *)
+  destruct l.
+  all: reflexivity.
+Qed.
+
 Lemma bad : 1 = 2.
 Proof. (* marker before error *)
   rewrite unknown_lemma. (* marker error *)

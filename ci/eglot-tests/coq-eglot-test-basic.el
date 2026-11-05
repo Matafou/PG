@@ -1961,15 +1961,17 @@ in Proof General, until the goals window changes width."
     (goto-marker "intros")
     (run #'coq-eglot-goto-point)
     (wait-until (lambda () coq-eglot--displayed-width) 10)
-    (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-eglot-ask-printing-width))
+    (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-ask-printing-width))
+    (should (eq coq-ask-printing-width-function #'coq-eglot-ask-printing-width))
     (with-current-buffer "*goals*"
-      (should (eq (key-binding (kbd "C-c C-a C-w"))
+      (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-ask-printing-width))
+      (should (eq coq-ask-printing-width-function
                   #'coq-eglot-ask-printing-width)))
     (let ((auto coq-eglot--displayed-width))
       (unwind-protect
           (progn
             (cl-letf (((symbol-function 'read-number) (lambda (&rest _) 25)))
-              (call-interactively #'coq-eglot-ask-printing-width))
+              (call-interactively #'coq-ask-printing-width))
             (wait-until (lambda () (eql coq-eglot--displayed-width 25)) 10)
             (should (eql coq-eglot--displayed-width 25))
             (should (string-match-p "\\b25\\b" (query #'coq-eglot-run-query
@@ -1982,6 +1984,87 @@ in Proof General, until the goals window changes width."
             (shrink-goals-window 2)
             (should (= coq-eglot--displayed-width (- auto 2))))
         (setq coq-eglot--asked-width nil)))))
+
+(ert-deftest coq-eglot-set-flag ()
+  "The printing flags of the common commands, like C-c C-a n, hold for
+the next goals and queries, like in Proof General."
+  (with-test-file
+    (should (eq coq-set-flag-function #'coq-eglot-set-flag))
+    (should (eq (key-binding (kbd "C-c C-a n")) #'coq-unset-printing-notations))
+    (goto-marker "hyps")
+    (run #'coq-eglot-goto-point)
+    (should (string-match-p "^ *m = n$" (buffer-text "*goals*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer "*goals*"
+            (should (eq coq-set-flag-function #'coq-eglot-set-flag))
+            (call-interactively (key-binding (kbd "C-c C-a n"))))
+          ;; the goals are printed again
+          (should (wait-until (lambda () (string-match-p "^ *eq m n$"
+                                                         (buffer-text "*goals*")))
+                              10))
+          ;; nothing checked again
+          (should (position-at-marker-p "hyps"))
+          (should (string-match-p "\\`eq 0 0" (query #'coq-run-query "Check 0 = 0")))
+          ;; the next goals too
+          (run #'coq-eglot-assert-next-command)
+          (should (string-match-p "^ *eq n m$" (buffer-text "*goals*")))
+          ;; one command per flag
+          (coq-set-printing-notations)
+          (should (equal coq-eglot--printing-flags '("Set Printing Notations")))
+          (should (wait-until (lambda () (string-match-p "^ *n = m$"
+                                                         (buffer-text "*goals*")))
+                              10))
+          (should (string-match-p "\\`0 = 0" (query #'coq-run-query "Check 0 = 0")))
+          ;; forgotten when the server stops
+          (coq-unset-printing-notations)
+          (coq-eglot-exit)
+          (should-not coq-eglot--printing-flags))
+      (setq coq-eglot--printing-flags nil))))
+
+(ert-deftest coq-eglot-show-at-point ()
+  "C-c C-a C-s shows the goals and messages after the sentence at point,
+in the processed part, like in Proof General.  Elsewhere it asks for a
+goal number."
+  (with-test-file
+    (should (eq (key-binding (kbd "C-c C-a C-s")) #'coq-Show))
+    (goto-marker "subproof")
+    (run #'coq-eglot-goto-point)
+    (let ((position (coq-eglot-position)))
+      (goto-marker "hello")
+      (search-backward "idtac")
+      (call-interactively #'coq-Show)
+      (should (equal (buffer-text "*response*") "hello"))
+      (should (string-match-p "^ *double n = n \\+ n$" (buffer-text "*goals*")))
+      (search-backward "intros n")
+      (call-interactively #'coq-Show)
+      (should (string-match-p "^ *double n = n \\+ n /\\\\ True$"
+                              (buffer-text "*goals*")))
+      ;; the proof position does not move
+      (should (= (coq-eglot-position) position))
+      ;; after it, Show for a goal number
+      (goto-marker "hyps")
+      (should-not (coq-eglot-show-at-point))
+      (let (asked)
+        (cl-letf (((symbol-function 'coq-ask-do)
+                   (lambda (&rest args) (setq asked args))))
+          (call-interactively #'coq-Show))
+        (should (equal (nth 1 asked) "Show"))))))
+
+(ert-deftest coq-eglot-insert-as ()
+  "C-c C-a [ inserts the \"as\" clause of the next command, from the names
+given by Coq, like in Proof General."
+  (with-test-file
+    (should (eq coq-processed-end-function #'coq-eglot-position))
+    (should (eq (key-binding (kbd "C-c C-a [")) #'coq-insert-as-in-next-command))
+    (goto-marker "as")
+    (run #'coq-eglot-goto-point)
+    (let ((position (coq-eglot-position)))
+      (coq-insert-as-in-next-command)
+      (should (search-forward-regexp
+               "destruct l as \\[ *| *[[:alnum:]_']+ +[[:alnum:]_']+ *\\]\\."
+               (line-end-position 2) t))
+      (should (= (coq-eglot-position) position)))))
 
 (ert-deftest coq-eglot-trace ()
   "With `coq-eglot-trace', the sentences, queries, errors and moves back
