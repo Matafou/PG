@@ -9,7 +9,8 @@
 ;; Test the part of Coq mode common to all backends, with the Proof
 ;; General backend disabled (`coq-use-pg' nil): it must not load the
 ;; proof shell, and the abbrevs, the terminator command, the query
-;; and insertion commands and their keys must be there.
+;; and insertion commands, their keys and the insertion menu must be
+;; there.
 
 ;;; Code:
 
@@ -20,12 +21,14 @@
 (require 'proof-site)
 (require 'ert)
 (require 'cl-lib)
+(require 'seq)
 
 (defvar coq-mode-abbrev-table)
 (defvar coq-load-path)
 (defvar coq-prog-args)
 (defvar coq-query-function)
 (defvar coq-use-yasnippet)
+(defvar coq-insert-menu)
 
 (declare-function coq-run-query "coq-queries")
 (declare-function coq-templates-setup "coq-templates")
@@ -157,7 +160,37 @@ indent."
     (should (string-suffix-p "Proof.\n  reflexivity" (buffer-string)))
     (insert "\nSection S.\n")
     (coq-end-Section)
-    (should (string-suffix-p "Section S.\nEnd S." (buffer-string)))))
+    (should (string-suffix-p "Section S.\nEnd S." (buffer-string)))
+    ;; the load path is "." without backend
+    (insert "\n")
+    (let ((answers (list "Require Import"
+                         (file-name-base (buffer-file-name)) "")))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _)
+                   (let ((answer (pop answers)))
+                     (should (or (equal answer "")
+                                 (member answer (all-completions "" collection))))
+                     answer))))
+        (coq-insert-requires)))
+    (should (string-suffix-p (format "End S.\nRequire Import %s.\n"
+                                     (file-name-base (buffer-file-name)))
+                             (buffer-string)))))
+
+(ert-deftest coq-test-without-pg-insert-menu ()
+  "The menu of the insertions is defined without backend."
+  (coq-test-without-pg-with-file
+    (should (equal (car coq-insert-menu) "INSERT"))
+    (let ((commands (delq nil (mapcar (lambda (item)
+                                        (and (vectorp item) (aref item 1)))
+                                      coq-insert-menu)))
+          (submenus (mapcar #'car (seq-filter #'consp (cdr coq-insert-menu)))))
+      (dolist (command '(coq-insert-intros coq-insert-tactic
+                         coq-insert-tactical coq-insert-command
+                         coq-insert-term coq-insert-section-or-module
+                         coq-insert-requires))
+        (should (memq command commands)))
+      (should (equal submenus '("Tactics (menu)" "Tacticals (menu)"
+                                "Command (menu)" "Term (menu)"))))))
 
 (provide 'coq-test-without-pg)
 

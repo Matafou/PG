@@ -125,7 +125,7 @@ Otherwise the abbrevs of `coq-mode-abbrev-table' are available."
   (if (listp ldpth) (car ldpth) ldpth))
 
 (defun coq-build-accessible-modules-list ()
-  (let* ((pth (or coq-load-path '(".")))
+  (let* ((pth (or (bound-and-true-p coq-load-path) '(".")))
          (cleanpth (mapcar #'coq-load-path-to-paths pth))
          (existingpth (cl-remove-if-not #'file-exists-p cleanpth))
          (file-list (coq-directories-files existingpth)))
@@ -218,6 +218,48 @@ Completion is on a quasi-exhaustive list of Coq tacticals."
   "Ask for a term kind, with completion, and insert it at point."
   (interactive)
   (coq-insert-from-db coq-terms-db "Kind of term"))
+
+;; The menu of the insertions, common to all backends.  The insertions
+;; built from a query (Intros, Match) are in coq-queries.el.
+
+(defconst coq-tactics-menu
+  (append '("Tactics (menu)"
+	    ["Intros (smart)" coq-insert-intros :help "Insert \"intros h1 .. hn.\" where hi are the default names given by Coq."])
+	  (coq-build-menu-from-db (append coq-tactics-db coq-solve-tactics-db))))
+
+(defconst coq-tacticals-menu
+  (append '("Tacticals (menu)")
+	  (coq-build-menu-from-db coq-tacticals-db)))
+
+(defconst coq-commands-menu
+  (append '("Command (menu)"
+	    ;["Module/Section (smart)" coq-insert-section-or-module t]
+	    ;["Require (smart)" coq-insert-requires t]
+	    )
+	  (coq-build-menu-from-db coq-commands-db)))
+
+(defconst coq-terms-menu
+  (append '("Term (menu)"
+	    ["Match (smart)" coq-insert-match t])
+	  (coq-build-menu-from-db coq-terms-db)))
+
+(defconst coq-insert-menu
+  `("INSERT"
+    ["Intros (smart)" coq-insert-intros :help "Insert \"intros h1 .. hn.\" where hi are the default names given by Coq."]
+    ""
+    ["Tactic (interactive)" coq-insert-tactic t]
+    ["Tactical (interactive)" coq-insert-tactical t]
+    ["Command (interactive)" coq-insert-command t]
+    ["Term (interactive)" coq-insert-term t]
+    ""
+    ,coq-tactics-menu
+    ,coq-tacticals-menu
+    ,coq-commands-menu
+    ,coq-terms-menu
+    ""
+    ["Module/Section (smart)" coq-insert-section-or-module t]
+    ["Require (smart)" coq-insert-requires t])
+  "Menu of the insertions, common to all Coq backends.")
 
 (provide 'coq-templates)
 
