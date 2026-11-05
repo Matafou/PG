@@ -5844,6 +5844,22 @@ again at once.  They are forgotten when the server stops.
 In the processed part, @kbd{C-c C-a C-s} (@code{coq-Show}) displays the
 goals and messages after the sentence at point, printed again, without
 moving the proof position.
+@item
+The language server reads the project file (@code{_CoqProject} or
+@code{_RocqProject}) of the directory it runs in, the one of the
+dominating project file of the script.  It is also given the load path
+of the script, @code{coq-load-path}, which the compilation uses too
+(@pxref{Using the Coq project file}): for instance the one of a
+@file{.dir-locals.el} file.  It adds to the one of the project file
+instead of replacing it.  Only the @code{-R} and @code{-Q} entries are
+given, and only the arguments @code{-arg} of the project file reach
+Coq.  The server is shared by the files of a project, with the load
+path of the file that started it: a warning tells when another file has
+a different one, @kbd{C-c C-x} stops the server.
+@item
+If @code{coq-use-project-file} is nil, the server runs in the directory
+of the script and reads no project file, unless this directory has one:
+a warning tells it then.
 @end itemize
 
 The other options of this backend are in the customization group

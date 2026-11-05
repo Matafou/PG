@@ -22,6 +22,7 @@
 (require 'jsonrpc)
 (require 'subr-x)                       ; hash-table-keys
 (require 'coq-system)                   ; coq-project-filename
+(require 'coq-project)                  ; coq-include-options
 
 (defgroup coq-eglot nil
   "Coq backend using a language server through Eglot."
@@ -147,11 +148,76 @@ reset the options given at initialization."
 ;; Must run after `eglot-signal-didChangeConfiguration'
 (add-hook 'eglot-connect-hook #'coq-eglot-lsp--send-options t)
 
+(defun coq-eglot-lsp-load-path-args (&optional command)
+  "Options -R and -Q of the server, from `coq-load-path'.
+The load path of the current buffer, like the compilation uses it, see
+`coq-include-options', relative to the directory of the file.  With
+COMMAND, a command line, the options -R and -Q of COMMAND instead.  The
+entries ocamlimport and package are ignored: coq-lsp has no such
+options."
+  (let ((options (or command
+                     (let ((default-directory
+                            (if buffer-file-name
+                                (file-name-directory buffer-file-name)
+                              default-directory)))
+                       (coq-include-options coq-load-path))))
+        args)
+    (while options
+      (let ((option (pop options)))
+        (pcase option
+          ((or "-R" "-Q")
+           (if command
+               ;; DIR,LP
+               (push (list option (pop options)) args)
+             (let* ((dir (pop options))
+                    (path (pop options)))
+               (push (list option (concat (directory-file-name dir) "," path))
+                     args))))
+          ((or "-I" "-package") (unless command (pop options))))))
+    (apply #'append (nreverse args))))
+
+(defun coq-eglot-lsp--server-load-path-args (server)
+  "Options -R and -Q of the command line of SERVER."
+  (let ((process (jsonrpc--process server)))
+    (and (processp process)
+         (coq-eglot-lsp-load-path-args (cdr (process-command process))))))
+
+(defun coq-eglot-lsp-check-load-path ()
+  "Warn if the server of the current buffer has another load path.
+The server is shared by the files of a project, with the load path of
+the file that started it, see `coq-eglot-lsp--contact'.  Warn too if
+`coq-use-project-file' is nil but the server reads a project file.  Run
+when Eglot starts managing the buffer."
+  (let ((server (and (bound-and-true-p eglot--managed-mode)
+                     (eglot-current-server))))
+    (when (cl-typep server 'coq-eglot-lsp-server)
+      (let ((args (ignore-errors (coq-eglot-lsp-load-path-args))))
+        (unless (equal args (coq-eglot-lsp--server-load-path-args server))
+          (display-warning
+           'coq-eglot
+           (format "The language server of %s was started by another file, \
+with another load path (coq-load-path).  C-c C-x stops it, the next \
+command starts it with the load path of %s."
+                   (buffer-name) (buffer-name)))))
+      (let ((root (project-root (eglot--project server))))
+        (when (and (not coq-use-project-file)
+                   (seq-some (lambda (name)
+                               (file-exists-p (expand-file-name name root)))
+                             '("_CoqProject" "_RocqProject")))
+          (display-warning
+           'coq-eglot
+           (format "coq-use-project-file is nil, but the language server \
+reads the project file of %s anyway." root)))))))
+
 (defun coq-eglot-lsp--contact (&optional _interactive)
-  "Eglot contact for Coq: our server class and its command line."
+  "Eglot contact for Coq: our server class and its command line.
+With the load path of the current buffer, see
+`coq-eglot-lsp-load-path-args': coq-lsp adds it to the one of the
+project file it finds in its root directory, if any."
   (let ((command (coq-eglot-lsp-server-command)))
     (cons 'coq-eglot-lsp-server
           (append command
+                  (coq-eglot-lsp-load-path-args)
                   (when coq-eglot-server-idle-delay
                     (list (format "--idle-delay=%s"
                                   coq-eglot-server-idle-delay)))
@@ -167,10 +233,14 @@ reset the options given at initialization."
   "Return the project of a Coq file in DIR, for `project-find-functions'.
 It is the directory of the dominating Coq project file (_CoqProject),
 if any.  The server is started there, where it reads the project file,
-and is shared by the files of this directory and its subdirectories."
-  (when-let* ((root (locate-dominating-file
-                     dir (lambda (d) (funcall coq-project-filename d)))))
-    (cons 'transient root)))
+and is shared by the files of this directory and its subdirectories.
+If `coq-use-project-file' is nil, it is DIR: the server reads no project
+file, unless DIR has one, see `coq-eglot-lsp-check-load-path'."
+  (if (not coq-use-project-file)
+      (cons 'transient (expand-file-name dir))
+    (when-let* ((root (locate-dominating-file
+                       dir (lambda (d) (funcall coq-project-filename d)))))
+      (cons 'transient root))))
 
 ;;; Positions and requests
 

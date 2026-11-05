@@ -21,3 +21,4 @@ all: $(COQ_EGLOT_SUCCESS)
 clean:
 	rm -f *.vo *.glob *.vos *.vok .*.aux *.success
 	cd compile && rm -f *.vo *.glob *.vos *.vok .*.aux
+	cd loadpath/lib && rm -f *.vo *.glob *.vos *.vok .*.aux

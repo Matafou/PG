@@ -1663,6 +1663,55 @@ libraries loaded by the previous tests."
                    (file-name-directory
                     (executable-find (car (coq-eglot-lsp-server-command))))))))
 
+(defconst load-path-directory (expand-file-name "loadpath/")
+  "Directory of the tests of the load path, without project file.
+Its .dir-locals.el sets `coq-load-path'.")
+
+(defun clean-load-path-library ()
+  "Delete the files produced by the compilation of loadpath/lib."
+  (dolist (file (directory-files
+                 (expand-file-name "lib" load-path-directory) t
+                 "\\.\\(vo[sk]?\\|glob\\|aux\\)\\'"))
+    (delete-file file)))
+
+(ert-deftest coq-eglot-load-path ()
+  "The server gets the load path of the buffer, here from .dir-locals.el,
+like the compilation."
+  (skip-unless-server)
+  (let ((coq-compile-before-require t)
+        (enable-local-variables :all))
+    (clean-load-path-library)
+    (unwind-protect
+        (with-file (expand-file-name "eglot_load_path.v" load-path-directory)
+          (should (equal coq-load-path '((rec "lib" "LoadPathLib"))))
+          (should (equal (coq-eglot-lsp-load-path-args)
+                         (list "-R" (concat load-path-directory
+                                            "lib,LoadPathLib"))))
+          ;; without project file, the server may be the one of the
+          ;; other tests, in the same version control repository
+          (coq-eglot-exit)
+          (goto-marker "check")
+          (run #'coq-eglot-goto-point)
+          (should (position-at-marker-p "check"))
+          (should (string-match-p "\\`eglot_lib\\.x\\s-+: nat"
+                                  (buffer-text "*response*")))
+          ;; another load path than the one of the server: a warning
+          (let ((coq-load-path nil) warned)
+            (cl-letf (((symbol-function 'display-warning)
+                       (lambda (&rest args) (setq warned args))))
+              (coq-eglot-lsp-check-load-path))
+            (should (string-match-p "another load path" (nth 1 warned))))
+          (coq-eglot-exit))
+      (clean-load-path-library))))
+
+(ert-deftest coq-eglot-use-project-file-nil ()
+  "Without `coq-use-project-file', the server of a file runs in its
+directory, not in the one of the dominating project file."
+  (skip-unless-server)
+  (let ((coq-use-project-file nil)
+        (dir (expand-file-name "lib/" load-path-directory)))
+    (should (equal (coq-eglot-lsp-project dir) (cons 'transient dir)))))
+
 (ert-deftest coq-eglot-compile-next ()
   "A Require processed alone is compiled first too.
 The file starts with a sentence, not a comment."
