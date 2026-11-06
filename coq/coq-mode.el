@@ -38,9 +38,9 @@
 (require 'pg-double-hit)
 (require 'coq-queries)                  ; common to all backends
 (require 'coq-templates)                ; abbrevs and yasnippets, idem
-(require 'coq-project)                  ; load path and project file, idem
 
 (declare-function coq-pg-setup "coq")   ; coq.el requires this file
+(require 'coq-project)                  ; load path and project file, idem
 
 (defgroup coq-mode ()
   "Major mode to edit Coq code."

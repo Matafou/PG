@@ -7,15 +7,16 @@
 ;;; Commentary:
 ;;
 ;; Test the part of Coq mode common to all backends, with the Proof
-;; General backend disabled (`coq-use-pg' nil): it must not load the
-;; proof shell, and the abbrevs, the terminator command, the query
-;; and insertion commands, their keys and the insertion menu must be
-;; there.
+;; General backend disabled (obsolete `coq-use-pg' nil, so `coq-backend'
+;; nil): it must not load the proof shell, and the abbrevs, the
+;; terminator command, the query and insertion commands, their keys and
+;; the insertion menu must be there.
 
 ;;; Code:
 
 ;; before loading coq-mode.el, which defines it
 (defvar coq-use-pg)
+(defvar coq-backend)
 (setq coq-use-pg nil)
 
 (require 'proof-site)
@@ -28,6 +29,14 @@
 (defvar coq-prog-args)
 (defvar coq-query-function)
 (defvar coq-use-yasnippet)
+(defvar coq-goals-count-function)
+(defvar coq-par-release-items-function)
+(defvar coq-par-failure-function)
+(defvar coq-par-abort-function)
+(defvar coq-lock-ancestors)
+(defvar coq-compile-menu)
+(defvar coq-set-search-blacklist-function)
+(defvar coq-search-blacklist-current-string)
 (defvar coq-insert-menu)
 
 (declare-function coq-run-query "coq-queries")
@@ -41,6 +50,9 @@
 (declare-function coq-store-goals-win "coq-goals")
 (declare-function coq-store-response-win "coq-goals")
 (declare-function coq-insert-intros "coq-queries")
+(declare-function coq-goals-count "coq-goals")
+(declare-function coq-par-start-compilation "coq-par-compile")
+(declare-function coq-change-search-blacklist "coq-queries")
 (declare-function coq-insert-as-in-next-command "coq-queries")
 (declare-function coq-insert-tactic "coq-templates")
 (declare-function coq-insert-tactical "coq-templates")
@@ -77,6 +89,8 @@
   "Coq mode without the Proof General backend loads no proof shell."
   (coq-test-without-pg-with-file
     (should (eq major-mode 'coq-mode))
+    ;; the obsolete option gives the default of the new one
+    (should (null coq-backend))
     (should-not (featurep 'proof))
     (should-not (featurep 'proof-shell))
     (should-not (featurep 'proof-script))))
@@ -191,6 +205,82 @@ indent."
         (should (memq command commands)))
       (should (equal submenus '("Tactics (menu)" "Tacticals (menu)"
                                 "Command (menu)" "Term (menu)"))))))
+
+(ert-deftest coq-test-without-pg-goals-count-function ()
+  "A backend can give the numbers of goals instead of reading them."
+  (require 'coq-goals)
+  (with-temp-buffer
+    (insert "2 goals\n")
+    (should (equal (car (coq-goals-count)) 2))
+    (setq-local coq-goals-count-function (lambda () '(5 . 3)))
+    (should (equal (coq-goals-count) '(5 . 3)))))
+;; compilation of the Requires
+
+(defun coq-test-without-pg-compile-require (dir lib-text)
+  "Compile the Require of a library with text LIB-TEXT in DIR.
+Without the proof shell, with `coq-par-start-compilation' and local
+interface functions.  Return released or failed."
+  (with-temp-file (expand-file-name "WpgLib.v" dir)
+    (insert lib-text))
+  (with-temp-file (expand-file-name "WpgMain.v" dir)
+    (insert "Require WpgLib.\n"))
+  (let ((buffer (find-file-noselect (expand-file-name "WpgMain.v" dir)))
+        result)
+    (unwind-protect
+        (with-current-buffer buffer
+          ;; coq/ is in the load path once a Coq file is visited
+          (require 'coq-par-compile)
+          (setq-local coq-par-release-items-function
+                      (lambda (items _job)
+                        (setq result (cons 'released items))))
+          (setq-local coq-par-failure-function
+                      (lambda () (setq result 'failed)))
+          (setq-local coq-par-abort-function
+                      (lambda (_buffer) (setq result 'aborted)))
+          (setq-local coq-lock-ancestors nil)
+          (let ((overlay (make-overlay (point-min) (1- (point-max)))))
+            (coq-par-start-compilation
+             (list (list overlay (list "Require WpgLib.") nil)))
+            (with-timeout (60 (error "Compilation timeout"))
+              (while (not result)
+                (accept-process-output nil 0.1)))
+            (when (consp result)
+              (should (eq (car (cadr result)) overlay)))
+            (if (consp result) 'released result)))
+      (with-current-buffer buffer
+        (set-buffer-modified-p nil))
+      (kill-buffer buffer))))
+
+(ert-deftest coq-test-without-pg-compile ()
+  "The Requires are compiled without the proof shell."
+  (let ((dir (make-temp-file "without_pg_compile" t)))
+    (unwind-protect
+        (progn
+          (should (eq (coq-test-without-pg-compile-require
+                       dir "Definition a := 0.\n")
+                      'released))
+          (should (file-exists-p (expand-file-name "WpgLib.vo" dir)))
+          (should (eq (coq-test-without-pg-compile-require
+                       dir "Definition a := undefined_constant.\n")
+                      'failed))
+          (should-not (featurep 'proof-shell))
+          (should-not (featurep 'proof-script))
+          ;; the menu and its toggle commands
+          (should (equal (car coq-compile-menu) "Auto Compilation"))
+          (should (commandp 'coq-compile-before-require-toggle)))
+      (delete-directory dir t))))
+
+(ert-deftest coq-test-without-pg-search-blacklist ()
+  "The search blacklist goes through the function of the backend."
+  (coq-test-without-pg-with-file
+    (should-error (coq-change-search-blacklist "\"foo_\"") :type 'user-error)
+    (let ((coq-search-blacklist-current-string "\"Private_\"")
+          args)
+      (setq-local coq-set-search-blacklist-function
+                  (lambda (old new) (setq args (list old new))))
+      (coq-change-search-blacklist "\"foo_\"")
+      (should (equal args '("\"Private_\"" "\"foo_\"")))
+      (should (equal coq-search-blacklist-current-string "\"foo_\"")))))
 
 (provide 'coq-test-without-pg)
 

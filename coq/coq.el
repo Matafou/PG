@@ -66,6 +66,57 @@
 (defvar prettify-symbols-alist)
 (declare-function yas-expand-snippet "yasnippet")
 
+;;; enable / disable parallel / sequential compilation in the proof shell
+;; Here, not in coq-compile-common.el, which does not depend on the
+;; proof shell: other backends call coq-par-compile.el directly.
+
+(defun coq-par-enable ()
+  "Enable parallel compilation.
+Must be used together with `coq-seq-disable'."
+  (add-hook 'proof-shell-extend-queue-hook
+	    #'coq-par-preprocess-require-commands)
+  (add-hook 'proof-shell-signal-interrupt-hook
+	    #'coq-par-user-interrupt)
+  (add-hook 'proof-shell-handle-error-or-interrupt-hook
+	    #'coq-par-user-interrupt))
+
+(defun coq-par-disable ()
+  "Disable parallel compilation.
+Must be used together with `coq-seq-enable'."
+  (remove-hook 'proof-shell-extend-queue-hook
+	       #'coq-par-preprocess-require-commands)
+  (remove-hook 'proof-shell-signal-interrupt-hook
+	       #'coq-par-user-interrupt)
+  (remove-hook 'proof-shell-handle-error-or-interrupt-hook
+	       #'coq-par-user-interrupt))
+
+(defun coq-seq-enable ()
+  "Enable sequential synchronous compilation.
+Must be used together with `coq-par-disable'."
+  (add-hook 'proof-shell-extend-queue-hook
+	    #'coq-seq-preprocess-require-commands))
+
+(defun coq-seq-disable ()
+  "Disable sequential synchronous compilation.
+Must be used together with `coq-par-enable'."
+  (remove-hook 'proof-shell-extend-queue-hook
+	       #'coq-seq-preprocess-require-commands))
+
+(defun coq-switch-compilation-method ()
+  "Set function for function `coq-compile-parallel-in-background'."
+  (if coq-compile-parallel-in-background
+      (progn
+	(coq-par-enable)
+	(coq-seq-disable))
+    (coq-par-disable)
+    (coq-seq-enable)))
+
+(defun coq-compile-parallel-in-background ()
+  (coq-switch-compilation-method))
+
+;; defpacustom fails to call :eval during inititialization, see trac #456
+(coq-switch-compilation-method)
+
 
 ;; ----- coq-shell configuration options
 
@@ -73,6 +124,7 @@
 ;; debugging functions
 ;; (defun proofstack () (coq-get-span-proofstack (span-at (point) 'type)))
 (defvar coq-debug nil)
+(defvar coq-prog-args)                  ; defpgcustom prog-args, pg-custom.el
 ;; End debugging
 
 ;; Obsolete
@@ -110,27 +162,50 @@ These are appended at the end of `coq-shell-init-cmd'."
   :type '(repeat string)
   :group 'coq)
 
-;; Default coq is only Private_ and _subproof
-(defcustom coq-search-blacklist-string ; add this? \"_ind\" \"_rect\" \"_rec\"
- "\"Private_\" \"_subproof\""
-  "Initial strings to blacklist in requests to Coq environment.
-If you are setting this via Emacs customization menus, you should
-restart Coq to see the effect.  To change blacklist during a Coq
-development, please use \\[coq-change-search-blacklist-interactive]
-instead (or menu: Coq/Settings/Search Blacklist)."
-  :type 'string
-  :group 'coq)
+;; Detecting coqtop or rocq args should happen at the last moment
+;; before calling the process. In particular it should happen after
+;; that proof-prog-name-ask is performed. This hook is exactly called
+;; after querying proof-prog-name (if proof-prog-name-ask is t). This
+;; way the options can be elaborated correctly (coqtop and rocq have
+;; different options). We first detect executables (taking
+;; proof-prog-name-ask into account), then elaborate the
+;; proof-prog-args. Note: we don't support proof-prog-name-guess
+(defun coq-pg-detect-programs ()
+  "Detect the Coq programs and arguments, just before starting Coq.
+In `proof-shell-before-process-hook'."
+  ;; detect executables unless explicitely set by hand,
+  ;; with proof-prog-name-ask or by customizing them. When
+  ;; the prover is set by hand, we try to find coqdep and
+  ;; coqc in the same directory
+  (if (and (or proof-prog-name-ask (coq--user-set-p 'coq-prog-name))
+           proof-prog-name)
+      ;; let us find other executables in the exact same
+      ;; place. TODO: go back to default exec-path if not found?
+      (let ((exec-path (if (file-name-directory proof-prog-name)
+                           (list (file-name-directory proof-prog-name))
+                         exec-path)))
+        (unless (coq--user-set-p 'coq-compiler)
+          (setq coq-compiler (executable-find (coq-detect-coqc))))
+        (unless (coq--user-set-p 'coq-dependency-analyzer)
+          (setq coq-dependency-analyzer (executable-find (coq-detect-coqdep)))))
+    ;; default: detect everything from the current exec-path
+    (setq proof-prog-name (coq-autodetect-progname))
+    (unless (coq--user-set-p 'coq-compiler)
+      (setq coq-compiler (coq-detect-coqc)))
+    (unless (coq--user-set-p 'coq-dependency-analyzer)
+      (setq coq-dependency-analyzer (coq-detect-coqdep))))
+  (when coq-debug
+    (message "coq-proof-prog-name: %S" proof-prog-name)
+    (message "coq-dependency-analyzer: %S"  coq-dependency-analyzer)
+    (message "coq-compiler: %S"  coq-compiler))
+  ;; in principe coq-prog-name is only used to set up
+  ;; proof-prog-name, but it may sometimes be used by itself
+  ;; so let us sync them
+  (setq coq-prog-name proof-prog-name)
+  ;; now elaborate args
+  (setq coq-prog-args (coq-prog-args)))
 
-;; Coq has no command to overwrite the current blacklist, only to add or remove
-;; particular strings. To provide the overwrite feature to the user we thus need
-;; to know the current value of blacklist to first remove everything, then add
-;; the new values.
-;;; TODO: retrieve the value from coq itself and remove this variable?
-(defvar coq-search-blacklist-current-string coq-search-blacklist-string
-  "Current value of Coq Search Blacklist.
-This may become desynchronized with Coq if you use the command
-\"Add/Remove Search Blacklist\" in you script." )
-
+(add-hook 'proof-shell-before-process-hook #'coq-pg-detect-programs)
 
 (defun coq-shell-init-cmd ()
   "Commands for initial Coq configuration, Coq variant of `proof-shell-init-cmd'.
@@ -238,6 +313,8 @@ It is mostly useful in three window mode, see also
   :type 'boolean
   :safe 'booleanp
   :group 'coq-auto-compile)
+
+(proof-deftoggle coq-show-proof-stepwise)
 
 ;;
 ;; prooftree customization
@@ -1133,6 +1210,7 @@ backends call them."
   (setq coq-query-result-function #'coq-pg-query-result)
   (setq coq-show-at-point-function #'coq-pg-show-at-point)
   (setq coq-set-flag-function #'coq-pg-set-flag)
+  (setq coq-set-search-blacklist-function #'coq-pg-set-search-blacklist)
   (setq coq-processed-end-function #'proof-unprocessed-begin)
   (setq coq-ask-printing-width-function
         #'coq-ask-adapt-printing-width-and-show))
@@ -1445,23 +1523,15 @@ Set Diffs setting if Coq is running and has a version >= 8.10."
 ;; state: unnoticed by the user, and desynched from
 ;; coq-search-blacklist-current-string.
 ;; TODO: have a way to detect error and re-set old value.
-(defun coq-change-search-blacklist (s)
-  (let* ((cmd-clean (list (format "Remove Search Blacklist %s."
-                                  coq-search-blacklist-current-string)))
+(defun coq-pg-set-search-blacklist (old new)
+  "Replace the search blacklist OLD of Coq by NEW.
+This is `coq-set-search-blacklist-function' for Proof General."
+  (proof-shell-ready-prover)
+  (let* ((cmd-clean (list (format "Remove Search Blacklist %s." old)))
          (item-clean `(nil ,cmd-clean proof-done-invisible 'invisible))
-         (cmd-set (list (format "Add Search Blacklist %s." s)))
+         (cmd-set (list (format "Add Search Blacklist %s." new)))
          (item-set `(nil ,cmd-set proof-done-invisible 'invisible)))
   (proof-add-to-queue `(,item-clean ,item-set) 'advancing)))
-
-(defun coq-change-search-blacklist-interactive ()
-  (interactive)
-  (proof-shell-ready-prover)
-  (let* ((current-value coq-search-blacklist-current-string)
-         (s (read-string
-             "Set search blacklist to: "
-             current-value 'proof-minibuffer-history)))
-    (coq-change-search-blacklist s)
-    (setq coq-search-blacklist-current-string s)))
 
 ;; (defpacustom search-blacklist coq-search-blacklist-string
 ;;   "Strings to blacklist in requests to Coq environment."
