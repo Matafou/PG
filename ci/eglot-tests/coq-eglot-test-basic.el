@@ -1901,12 +1901,13 @@ hybrid layout."
     (seq-every-p (lambda (line) (<= (string-width line) width))
                  (split-string (buffer-text name) "\n"))))
 
-(defun shrink-goals-window (columns)
-  "Make the goals window COLUMNS narrower, print its goals again.
-Batch mode has no redisplay to run `window-size-change-functions'."
+(defun resize-goals-window (columns)
+  "Make the goals window COLUMNS wider, print its goals again.
+Narrower if COLUMNS is negative.  Wait for the goals printed at the new
+width.  Batch mode has no redisplay to run `window-size-change-functions'."
   (let ((width coq-eglot--displayed-width))
     (with-selected-window (get-buffer-window "*goals*")
-      (shrink-window-horizontally columns))
+      (enlarge-window-horizontally columns))
     (coq-eglot--refresh-width)
     (wait-until (lambda () (not (eql coq-eglot--displayed-width width))) 10)))
 
@@ -1926,23 +1927,20 @@ changes, like with `coq-auto-adapt-printing-width' in Proof General."
                             (buffer-text "*goals*")))
     (should (lines-fit-p "*goals*"))
     (let ((width coq-eglot--displayed-width))
-      (shrink-goals-window 2)
+      (resize-goals-window -2)
       (should (= coq-eglot--displayed-width (- width 2)))
       (should (lines-fit-p "*goals*")))
     ;; column by column: the lines as wide as the window fit too, down
     ;; to the width of the separator line
     (dotimes (_ 6)
-      (shrink-goals-window 1)
+      (resize-goals-window -1)
       (should (lines-fit-p "*goals*")))
     ;; and with lines ending with an infix operator
     (goto-marker "limit")
     (run #'coq-eglot-goto-point)
     (wait-until (lambda () (string-match-p "H :" (buffer-text "*goals*"))) 10)
     (dotimes (_ 6)
-      (with-selected-window (get-buffer-window "*goals*")
-        (enlarge-window-horizontally 1))
-      (coq-eglot--refresh-width)
-      (accept-process-output nil 0.3)
+      (resize-goals-window 1)
       (should (lines-fit-p "*goals*")))
     ;; the answer kept for the proof position is printed again
     (let ((width coq-eglot--displayed-width))
@@ -2030,7 +2028,7 @@ in Proof General, until the goals window changes width."
             (should (eql coq-eglot--displayed-width 25))
             (run #'coq-eglot-undo-last-command)
             ;; the window changes: the width follows it again
-            (shrink-goals-window 2)
+            (resize-goals-window -2)
             (should (= coq-eglot--displayed-width (- auto 2))))
         (setq coq-eglot--asked-width nil)))))
 
