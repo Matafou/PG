@@ -2071,6 +2071,41 @@ the next goals and queries, like in Proof General."
           (should-not coq-eglot--printing-flags))
       (setq coq-eglot--printing-flags nil))))
 
+(defvar coq-search-blacklist-current-string) ; let-bound
+
+(ert-deftest coq-eglot-search-blacklist ()
+  "The search blacklist holds for the next queries, like in Proof General."
+  (with-test-file
+    (should (eq coq-set-search-blacklist-function
+                #'coq-eglot-set-search-blacklist))
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (with-current-buffer "*goals*"
+      (should (eq coq-set-search-blacklist-function
+                  #'coq-eglot-set-search-blacklist)))
+    (let ((coq-search-blacklist-current-string coq-search-blacklist-string))
+      (should (string-match-p "Private_"
+                              (query #'coq-run-query "Test Search Blacklist")))
+      (coq-change-search-blacklist "\"foo_\" \"_bar\"")
+      (let ((answer (query #'coq-run-query "Test Search Blacklist")))
+        (should (string-match-p "\\_<foo_\\_>" answer))
+        (should (string-match-p "\\_<_bar\\_>" answer))
+        (should-not (string-match-p "Private_" answer)))
+      ;; not a list of strings: refused, the blacklist does not change
+      (should-error (coq-change-search-blacklist "foo_") :type 'user-error)
+      (should (equal coq-search-blacklist-current-string
+                     "\"foo_\" \"_bar\"")))))
+
+(ert-deftest coq-eglot-compile-menu ()
+  "The menu of the compilation is the one of Proof General."
+  (should (member coq-compile-menu (cdr coq-eglot--menu-spec)))
+  (should (equal (car coq-compile-menu) "Auto Compilation"))
+  (should (seq-some (lambda (item)
+                      (and (vectorp item)
+                           (eq (aref item 1)
+                               'coq-change-search-blacklist-interactive)))
+                    (cdr (assoc "Queries" (cdr coq-eglot--menu-spec))))))
+
 (ert-deftest coq-eglot-show-at-point ()
   "C-c C-a C-s shows the goals and messages after the sentence at point,
 in the processed part, like in Proof General.  Elsewhere it asks for a

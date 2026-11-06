@@ -5852,6 +5852,20 @@ for the next goals and queries: the server runs them before each one, on
 a copy of the state.  Nothing is checked again, the goals are printed
 again at once.  They are forgotten when the server stops.
 @item
+The search blacklist (menu @code{Coq -> Queries -> Search Blacklist...},
+@code{coq-change-search-blacklist-interactive}) holds for the next
+queries, it is given to the server with each one.
+@item
+With @code{coq-compile-before-require}, the libraries required by the
+part to check are compiled before the server checks it, in the
+background, with the compiler next to the server (@pxref{Multiple
+File Support}).  The menu @code{Coq -> Auto Compilation} is the one of
+Proof General.  The compilation is always parallel and in the
+background, and the files of the imported libraries are not locked:
+@code{coq-compile-parallel-in-background} and @code{coq-lock-ancestors}
+have no effect.  A processed Require sentence whose libraries changed
+since is marked, the user decides when to go back before it.
+@item
 In the processed part, @kbd{C-c C-a C-s} (@code{coq-Show}) displays the
 goals and messages after the sentence at point, printed again, without
 moving the proof position.

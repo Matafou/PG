@@ -345,7 +345,8 @@ active script buffer."
   (setq coq-query-function #'coq-eglot-run-query)
   (setq coq-query-result-function #'coq-eglot-query-result)
   (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
-  (setq coq-set-flag-function #'coq-eglot-set-flag))
+  (setq coq-set-flag-function #'coq-eglot-set-flag)
+  (setq coq-set-search-blacklist-function #'coq-eglot-set-search-blacklist))
 
 (define-derived-mode coq-eglot-goals-mode coq-eglot-output-mode "Coq Goals"
   "Major mode for the goals of the Eglot backend of Coq."
@@ -901,6 +902,31 @@ This is `coq-eglot-lsp-printing-flags-function'."
   coq-eglot--printing-flags)
 
 (setq coq-eglot-lsp-printing-flags-function #'coq-eglot--goals-printing-flags)
+
+(defun coq-eglot-set-search-blacklist (_old new)
+  "Check the search blacklist NEW, used by the next queries.
+NEW is in the syntax of Add Search Blacklist.  The server keeps no
+state between two queries: each query starts by replacing the strings
+of `coq-search-blacklist-string' by those of
+`coq-search-blacklist-current-string', see
+`coq-eglot--search-blacklist-commands'.  This is
+`coq-set-search-blacklist-function' for the Eglot backend."
+  (unless (string-match-p "\\`\\(?:[ \t\n]*\"[^\"]*\"\\)*[ \t\n]*\\'" new)
+    (user-error "Coq: the search blacklist is a list of strings in \
+double quotes, like \"Private_\" \"_subproof\""))
+  (message "Coq: search blacklist %s" new))
+
+(defun coq-eglot--search-blacklist-commands ()
+  "Commands setting the search blacklist at the start of a query.
+Without their final dot.  Like Proof General, which adds
+`coq-search-blacklist-string' to the blacklist of Coq when it starts,
+then replaces the old blacklist by the new one at each change."
+  (append (unless (string-blank-p coq-search-blacklist-string)
+            (list (format "Remove Search Blacklist %s"
+                          coq-search-blacklist-string)))
+          (unless (string-blank-p coq-search-blacklist-current-string)
+            (list (format "Add Search Blacklist %s"
+                          coq-search-blacklist-current-string)))))
 
 (defvar coq-eglot--width-timer nil
   "Timer of `coq-eglot--refresh-width'.")
@@ -1900,7 +1926,8 @@ THEN is called with the messages."
         (sentences (concat (let ((width (coq-eglot--query-printing-width)))
                              (if width (format "Set Printing Width %d. " width) ""))
                            (mapconcat (lambda (flag) (concat flag ". "))
-                                      (append coq-eglot--printing-flags flags)
+                                      (append (coq-eglot--search-blacklist-commands)
+                                              coq-eglot--printing-flags flags)
                                       "")
                            command)))
     ;; in the last processed sentence: the state after it
@@ -2041,8 +2068,7 @@ Run when Eglot starts or stops managing the buffer."
       :help "The goals and messages windows below the script fit their content"])
     ["Fold Other Goals" coq-toggle-other-goals
      :style toggle :selected coq-fold-other-goals]
-    ["Compile Before Require" coq-compile-before-require-toggle
-     :style toggle :selected coq-compile-before-require]
+    ,coq-compile-menu
     ["Double Hit Electric Terminator" proof-double-hit-toggle
      :style toggle :selected proof-double-hit-enable]
     ["Trace" coq-eglot-toggle-trace
@@ -2055,6 +2081,7 @@ Run when Eglot starts or stops managing the buffer."
      ["Print..." coq-Print]
      ["Search..." coq-Search]
      ["SearchPattern..." coq-SearchIsos]
+     ["Search Blacklist..." coq-change-search-blacklist-interactive]
      ["Locate..." coq-LocateConstant]
      ["Locate Notation..." coq-LocateNotation]
      ["Print Hint" coq-PrintHint]
@@ -2125,6 +2152,7 @@ Warn if processed Require sentences load outdated libraries."
         (setq coq-query-result-function #'coq-eglot-query-result)
         (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
         (setq coq-set-flag-function #'coq-eglot-set-flag)
+        (setq coq-set-search-blacklist-function #'coq-eglot-set-search-blacklist)
         (setq coq-show-at-point-function #'coq-eglot-show-at-point)
         (setq coq-processed-end-function #'coq-eglot-position)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
@@ -2141,6 +2169,7 @@ Warn if processed Require sentences load outdated libraries."
     (kill-local-variable 'coq-query-result-function)
     (kill-local-variable 'coq-ask-printing-width-function)
     (kill-local-variable 'coq-set-flag-function)
+    (kill-local-variable 'coq-set-search-blacklist-function)
     (kill-local-variable 'coq-show-at-point-function)
     (kill-local-variable 'coq-processed-end-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)

@@ -42,14 +42,6 @@
 
 (declare-function coq-eglot-position "coq-eglot")
 
-;; Settings of the Proof General backend (coq.el, pg-custom.el), used
-;; by coq-system.el
-(defvar coq-prog-args nil
-  "Arguments given to the compiler, on top of the load path.
-Set from _CoqProject by `coq-load-project-file'.")
-(defvar coq-debug nil
-  "Non-nil to display debugging messages of the Coq settings.")
-
 (defface coq-eglot-outdated-require '((t :inherit flymake-warning))
   "Face of a processed Require sentence whose libraries changed since."
   :group 'coq-eglot)
