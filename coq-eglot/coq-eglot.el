@@ -51,9 +51,8 @@
 (require 'color)
 (require 'coq-eglot-lsp)
 (require 'coq-eglot-compile)
-(require 'pg-double-hit)
-(require 'coq-goals)                    ; folding, number of goals
-(require 'coq-hyps)                     ; folding and highlighting of hypotheses
+(require 'pg-terminator)                ; the double hit
+(require 'coq-goals)                    ; folding, number of goals, hypotheses
 (require 'pg-goals-indicators)          ; goals out of view
 
 (defvar coq-eglot-mode)                 ; defined below
