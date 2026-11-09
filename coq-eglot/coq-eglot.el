@@ -336,11 +336,12 @@ error."
   "Parent mode of the goals and response buffers of the Eglot backend.
 Read-only, with the keys of the backend, and the keys of the queries
 and of the display common to all backends, see
-`coq-queries-define-keys', but not those of `special-mode': like in
+`coq-eglot--set-output-keys', but not those of `special-mode': like in
 Proof General, \"q\" does not close the window.  Queries run on the
 active script buffer."
   :syntax-table coq-mode-syntax-table   ; for `coq-id-at-point'
   (setq buffer-read-only t)
+  (coq-eglot--set-output-keys)
   (setq coq-query-function #'coq-eglot-run-query)
   (setq coq-query-result-function #'coq-eglot-query-result)
   (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
@@ -2102,25 +2103,39 @@ Run when Eglot starts or stops managing the buffer."
   "Menu of the Eglot backend of Coq."
   coq-eglot--menu-spec)
 
-(defvar coq-eglot--output-common-map
-  (let ((map (make-sparse-keymap)))
-    (coq-queries-define-keys map)
-    map)
-  "Keys common to all backends in the goals and response buffers.
-The queries and the display, not the insertions: they insert in the
-script, see `coq-queries-define-keys'.")
+(defconst coq-eglot-all-buffers-commands
+  '(coq-eglot-assert-next-command
+    coq-eglot-undo-last-command
+    coq-eglot-process-buffer
+    coq-eglot-retract-buffer
+    coq-eglot-interrupt
+    coq-eglot-exit
+    coq-eglot-show-goals
+    coq-eglot-layout-windows
+    coq-eglot-display-some-buffers
+    coq-eglot-goto-end-of-locked
+    coq-eglot-query
+    coq-toggle-highlight-hyp-at-point)
+  "Commands of the Eglot backend valid in the goals and response buffers.
+Their bindings in `coq-mode-map', those of the user, also apply in the
+goals and response buffers, see `coq-all-buffers-keymap'.  Like in
+Proof General, highlighting a hypothesis depends on point in the current
+buffer, not in the script.")
 
-;; the keys of the backend, and the common keys of the goals and response
-;; buffers of Proof General
-(set-keymap-parent coq-eglot-output-mode-map
-                   (make-composed-keymap coq-eglot-mode-map
-                                         coq-eglot--output-common-map))
+(defun coq-eglot--set-output-keys ()
+  "Set the parent of the keymap of the goals and response buffers.
+The keys of the backend, `coq-eglot-mode-map', then those of
+`coq-all-buffers-keymap': the queries, the display, C-c C-a C-r and
+C-c C-a C-g, and the bindings of the user in `coq-mode-map' for these
+commands and `coq-eglot-all-buffers-commands'.  Called each time such a
+buffer is set up, after the configuration of the user."
+  (set-keymap-parent coq-eglot-output-mode-map
+                     (make-composed-keymap
+                      coq-eglot-mode-map
+                      (coq-all-buffers-keymap
+                       coq-eglot-all-buffers-commands))))
 
-;; like in Proof General: before C-c C-a r and g, kept for compatibility
-(define-key coq-eglot-response-mode-map (kbd "C-c C-a C-r")
-            #'coq-store-response-win)
-(define-key coq-eglot-response-mode-map (kbd "C-c C-a C-g")
-            #'coq-store-goals-win)
+(coq-eglot--set-output-keys)
 
 ;; The queries at mouse click, see `coq-remap-mouse-1'.
 (coq-mouse-query-add-keymap coq-eglot-output-mode-map)

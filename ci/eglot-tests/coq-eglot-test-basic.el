@@ -2166,11 +2166,43 @@ they insert in the script."
       (dolist (key '("C-c C-a [" "C-c C-a C-i" "C-c C-a C-t" "."))
         (should-not (eq (key-binding (kbd key))
                         (lookup-key coq-mode-map (kbd key)))))))
-  ;; like in Proof General, kept for compatibility
-  (with-temp-buffer
-    (coq-eglot-response-mode)
-    (should (eq (key-binding (kbd "C-c C-a C-r")) #'coq-store-response-win))
-    (should (eq (key-binding (kbd "C-c C-a C-g")) #'coq-store-goals-win))))
+  ;; like in Proof General, kept for compatibility, now in both buffers
+  (dolist (mode '(coq-eglot-goals-mode coq-eglot-response-mode))
+    (with-temp-buffer
+      (funcall mode)
+      (should (eq (key-binding (kbd "C-c C-a C-r")) #'coq-store-response-win))
+      (should (eq (key-binding (kbd "C-c C-a C-g")) #'coq-store-goals-win)))))
+
+(ert-deftest coq-eglot-output-buffers-user-keys ()
+  "The bindings of the user in `coq-mode-map' for the commands valid in
+all buffers, common ones and `coq-eglot-all-buffers-commands', apply
+also in the goals and response buffers set up afterwards.  Not those of
+other commands."
+  (unwind-protect
+      (progn
+        (define-key coq-mode-map (kbd "C-c y") #'coq-Check)
+        (define-key coq-mode-map (kbd "C-M-<down>")
+                    #'coq-eglot-assert-next-command)
+        (define-key coq-mode-map (kbd "C-M-b") #'coq-eglot-process-buffer)
+        (define-key coq-mode-map (kbd "<f7>")
+                    #'coq-toggle-highlight-hyp-at-point)
+        ;; depends on point in the script: not in the output buffers
+        (define-key coq-mode-map (kbd "C-M-e") #'coq-eglot-goto-point)
+        (dolist (mode '(coq-eglot-goals-mode coq-eglot-response-mode))
+          (with-temp-buffer
+            (funcall mode)
+            (should (eq (key-binding (kbd "C-c y")) #'coq-Check))
+            (should (eq (key-binding (kbd "C-M-<down>"))
+                        #'coq-eglot-assert-next-command))
+            (should (eq (key-binding (kbd "C-M-b")) #'coq-eglot-process-buffer))
+            (should (eq (key-binding (kbd "<f7>"))
+                        #'coq-toggle-highlight-hyp-at-point))
+            (should-not (eq (key-binding (kbd "C-M-e"))
+                            #'coq-eglot-goto-point)))))
+    (dolist (key '("C-c y" "C-M-<down>" "C-M-b" "<f7>" "C-M-e"))
+      (define-key coq-mode-map (kbd key) nil))
+    ;; the output buffers set up afterwards no longer have them
+    (coq-eglot--set-output-keys)))
 
 (ert-deftest coq-eglot-frozen-copies ()
   "C-c C-a r and C-c C-a g copy the response and the goals at the top of
