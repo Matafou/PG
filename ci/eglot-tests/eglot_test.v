@@ -39,6 +39,12 @@ Proof.
   all: reflexivity.
 Qed.
 
+Lemma compact (n m : nat) (P : nat -> Prop) (h : P n) (A : Type) (a : A)
+  (x := 3) (q : SProp) (pq : q) (e : n = m) : True.
+Proof.
+  idtac. (* marker compact *)
+Abort.
+
 Lemma bad : 1 = 2.
 Proof. (* marker before error *)
   rewrite unknown_lemma. (* marker error *)

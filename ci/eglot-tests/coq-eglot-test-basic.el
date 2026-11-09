@@ -2121,6 +2121,37 @@ the next goals and queries."
       (should-not (member "Set Printing Coercions"
                           coq-eglot--printing-flags)))))
 
+(ert-deftest coq-eglot-compact-contexts ()
+  "With Set Printing Compact Contexts, like in Coq, the hypotheses whose
+type is in Type share their lines, three spaces apart: not those in Prop
+or SProp, nor the definitions.  Each one keeps its folding button."
+  (with-test-file
+    (let ((coq-eglot--printing-flags nil))
+      (goto-marker "compact")
+      (run #'coq-eglot-goto-point)
+      (should (string-search "  A : Type\n  a : A\n"
+                             (with-current-buffer "*goals*" (buffer-string))))
+      (coq-set-printing-compact-contexts)
+      (wait-until (lambda ()
+                    (with-current-buffer "*goals*"
+                      (string-search "A : Type   a : A" (buffer-string))))
+                  10)
+      (with-current-buffer "*goals*"
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-search "\n  n, m : nat   P : nat -> Prop\n" text))
+          (should (string-search "\n  h : P n\n" text))
+          (should (string-search "\n  A : Type   a : A\n" text))
+          (should (string-search "\n  x := 3 : nat\n" text))
+          (should (string-search "\n  q : SProp\n  pq : q\n  e : n = m\n"
+                                 text))))
+      (should (member "a" (coq-hyps-names)))
+      (should (= (length (coq-hyps-regions)) 9))
+      (coq-unset-printing-compact-contexts)
+      (wait-until (lambda ()
+                    (with-current-buffer "*goals*"
+                      (string-search "A : Type\n  a : A" (buffer-string))))
+                  10))))
+
 (ert-deftest coq-eglot-show-at-point ()
   "C-c C-a C-s shows the goals and messages after the sentence at point,
 in the processed part, like in Proof General.  Elsewhere it asks for a

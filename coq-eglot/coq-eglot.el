@@ -991,6 +991,15 @@ is left for the comma or the colon after them."
           (setq line name))))
     (mapconcat #'identity (nreverse (cons line lines)) "\n  ")))
 
+(defun coq-eglot--hyps-width ()
+  "Width of the lines of the hypotheses.
+They must fit in the window, or in Coq's default width."
+  (if coq-eglot--displayed-width
+      (+ coq-eglot--displayed-width
+         coq-eglot--hyp-indentation
+         coq-eglot--printing-width-margin)
+    78))
+
 (defun coq-eglot--format-hyp (hyp)
   "Format hypothesis HYP of a goal.
 Like Coq does: if it does not fit on one line, its names are on several
@@ -999,12 +1008,7 @@ property `coq-hyp', the list of its names, and the part after the
 names the property `coq-hyp-body', to highlight and fold it, see
 `coq-hyps-decorate'."
   (let* ((names (append (plist-get hyp :names) nil))
-         ;; the lines must fit in the window, or in Coq's default width
-         (width (if coq-eglot--displayed-width
-                    (+ coq-eglot--displayed-width
-                       coq-eglot--hyp-indentation
-                       coq-eglot--printing-width-margin)
-                  78))
+         (width (coq-eglot--hyps-width))
          (names-text (coq-eglot--fill-names names (- width 2)))
          (last-line (car (last (split-string names-text "\n"))))
          (def (and (plist-get hyp :def)
@@ -1024,10 +1028,50 @@ names the property `coq-hyp-body', to highlight and fold it, see
      (concat "  " names-text (propertize body 'coq-hyp-body t))
      'coq-hyp names)))
 
+(defun coq-eglot--compact-contexts-p ()
+  "Non-nil if the flags of the goals include Set Printing Compact Contexts.
+See `coq-eglot-set-flag'.  This is `coq-eglot-lsp-hyp-sorts-function':
+the goals need the sorts of the hypotheses."
+  (member "Set Printing Compact Contexts" coq-eglot--printing-flags))
+
+(setq coq-eglot-lsp-hyp-sorts-function #'coq-eglot--compact-contexts-p)
+
+(defun coq-eglot--simple-hyp-p (hyp text sorts)
+  "Non-nil if HYP, formatted as TEXT, can share its line with others.
+Like Coq with Set Printing Compact Contexts: an assumption, not a
+definition, whose type is in Type, neither in Prop nor in SProp, see
+SORTS, the alist of `coq-eglot-lsp--parse-hyp-sorts'.  And TEXT is on
+one line."
+  (and (not (plist-get hyp :def))
+       (not (string-search "\n" text))
+       (seq-every-p (lambda (name)
+                      (let ((sort (cdr (assoc name sorts))))
+                        (and sort (not (member sort '("Prop" "SProp"))))))
+                    (plist-get hyp :names))))
+
 (defun coq-eglot--format-hyps (goal)
-  "Format the hypotheses of GOAL, one per line."
-  (mapconcat (lambda (hyp) (concat (coq-eglot--format-hyp hyp) "\n"))
-             (plist-get goal :hyps) ""))
+  "Format the hypotheses of GOAL, one per line.
+Several on one line if GOAL has the sorts of its hypotheses, with Set
+Printing Compact Contexts, see `coq-eglot--simple-hyp-p': like Coq,
+three spaces between them, as many as fit in the width."
+  (let ((sorts (plist-get goal :hyp-sorts))
+        (width (coq-eglot--hyps-width))
+        (lines nil)
+        (line nil))                     ; the current line of simple hyps
+    (dolist (hyp (append (plist-get goal :hyps) nil))
+      (let ((text (coq-eglot--format-hyp hyp)))
+        (cond
+         ((not (and sorts (coq-eglot--simple-hyp-p hyp text sorts)))
+          (when line (push line lines) (setq line nil))
+          (push text lines))
+         ;; each hyp keeps its indentation of 2, for its folding button
+         ((and line (<= (+ (length line) 1 (length text)) width))
+          (setq line (concat line " " text)))
+         (t
+          (when line (push line lines))
+          (setq line text)))))
+    (when line (push line lines))
+    (mapconcat (lambda (text) (concat text "\n")) (nreverse lines) "")))
 
 (defun coq-eglot--format-conclusion (goal &optional no-separator)
   "Format the conclusion of GOAL, below the separator unless NO-SEPARATOR."
