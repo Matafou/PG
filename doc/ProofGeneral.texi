@@ -5870,12 +5870,17 @@ The printing flags (like @kbd{C-c C-a n}, Unset Printing Notations) hold
 for the next goals and queries: the server runs them before each one, on
 a copy of the state.  Nothing is checked again, the goals are printed
 again at once.  They are forgotten when the server stops.  The menu
-@code{Coq -> OPTIONS} is the one of Proof General.  With Set Printing
-Compact Contexts, like in Coq, the hypotheses whose type is in
+@code{Coq -> OPTIONS} is the one of Proof General.  Like in Coq with
+Set Printing Compact Contexts, the hypotheses whose type is in
 @code{Type} (neither in @code{Prop} nor in @code{SProp}, and not the
-definitions) share their lines, as many as fit; the server is asked
-the sorts of the types of the hypotheses with each goals.  Only for a
-flag set through these commands, not for a Set sentence of the script.
+definitions) share their lines, as many as fit, unless
+@code{coq-eglot-compact-contexts} is nil; the commands Set and Unset
+Printing Compact Contexts override this option until the server stops,
+a Set sentence of the script does not.  The server is asked the sorts
+of the types of the hypotheses with each goals.  The menu entries and
+the commands without effect in the Eglot backend warn, like Unset
+Printing Unfocused (the unfocused goals are always displayed, folded)
+or the parallel compilation and the locks of the compilation menu.
 @item
 The search blacklist (menu @code{Coq -> Queries -> Search Blacklist...},
 @code{coq-change-search-blacklist-interactive}) holds for the next

@@ -893,7 +893,11 @@ The flags are forgotten when the server stops.  This is
           (append (cl-remove name coq-eglot--printing-flags
                              :key #'coq-eglot--flag-name :test #'equal)
                   (list (string-trim command)))))
-  (message "Coq: %s" command)
+  (if (string-match-p "Printing Unfocused\\'" command)
+      (coq-eglot--warn-no-effect
+       command "the goals show the unfocused goals, folded by \
+`coq-fold-other-goals'")
+    (message "Coq: %s" command))
   (coq-eglot--refresh-width))
 
 (defun coq-eglot--goals-printing-flags ()
@@ -1028,11 +1032,29 @@ names the property `coq-hyp-body', to highlight and fold it, see
      (concat "  " names-text (propertize body 'coq-hyp-body t))
      'coq-hyp names)))
 
+(defcustom coq-eglot-compact-contexts t
+  "Non-nil: in the goals, the hypotheses whose type is in Type share lines.
+Like Coq with Set Printing Compact Contexts, see `coq-eglot--simple-hyp-p'.
+The commands Set and Unset Printing Compact Contexts (menu OPTIONS)
+override it until the server stops; a Set sentence in the script does
+not.  It costs a second request with each goals, sent with them."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'coq-eglot)
+
 (defun coq-eglot--compact-contexts-p ()
-  "Non-nil if the flags of the goals include Set Printing Compact Contexts.
-See `coq-eglot-set-flag'.  This is `coq-eglot-lsp-hyp-sorts-function':
-the goals need the sorts of the hypotheses."
-  (member "Set Printing Compact Contexts" coq-eglot--printing-flags))
+  "Non-nil if the hypotheses of the goals share their lines.
+The last command Set or Unset Printing Compact Contexts, see
+`coq-eglot-set-flag', otherwise `coq-eglot-compact-contexts'.  This is
+`coq-eglot-lsp-hyp-sorts-function': the goals need the sorts of the
+hypotheses."
+  (let ((flag (seq-find (lambda (flag)
+                          (string-match-p "\\`\\(?:Un\\)?[Ss]et Printing Compact Contexts\\'"
+                                          flag))
+                        coq-eglot--printing-flags)))
+    (if flag
+        (string-prefix-p "Set" flag)
+      coq-eglot-compact-contexts)))
 
 (setq coq-eglot-lsp-hyp-sorts-function #'coq-eglot--compact-contexts-p)
 
@@ -1526,8 +1548,8 @@ failed, reported if there was no error before."
   (let ((then (coq-eglot--stop))
         (error (coq-eglot-lsp-error-range start (1+ last))))
     (if error
-        ;; the sentence that failed and its error message
-        (let* ((answer (coq-eglot-lsp-goals (car error)))
+        ;; the sentence that failed and its error message, not its goals
+        (let* ((answer (coq-eglot-lsp-goals (car error) t))
                (range (plist-get answer :range))
                (bounds (if range (coq-eglot-lsp-range range) error)))
           (when (< start (car bounds))
@@ -2035,6 +2057,57 @@ Run when Eglot starts or stops managing the buffer."
 ;; like in Proof General, in the goals buffer only
 (coq-hyps-define-keys coq-eglot-goals-mode-map)
 
+(defun coq-eglot--warn-no-effect (what reason)
+  "Warn that WHAT, a menu entry or a command, has no effect, for REASON."
+  (display-warning 'coq-eglot
+                   (format "%s has no effect with the Eglot backend: %s"
+                           what reason)))
+
+(defconst coq-eglot--no-effect-entries
+  '((coq-compile-parallel-in-background-toggle
+     . "the compilation is always parallel and in the background")
+    (coq-lock-ancestors-toggle
+     . "the files of the imported libraries are not locked")
+    (coq-compile-quick
+     . "it is for Coq < 8.11, older than what coq-lsp supports")
+    (coq-compile-vos
+     . "coq-lsp loads the .vo files, never the .vos files"))
+  "Entries of the shared menus without effect in the Eglot backend.
+Their commands, or the variables that they set, with the reason.  See
+`coq-eglot--menu-with-warnings'.")
+
+(defun coq-eglot--no-effect-reason (callback)
+  "Why the menu entry with CALLBACK has no effect, or nil.
+CALLBACK is a command or a form (customize-set-variable \='VAR VALUE).
+See `coq-eglot--no-effect-entries'."
+  (cdr (assq (if (and (eq (car-safe callback) 'customize-set-variable)
+                      (eq (car-safe (nth 1 callback)) 'quote))
+                 (nth 1 (nth 1 callback))
+               callback)
+             coq-eglot--no-effect-entries)))
+
+(defun coq-eglot--run-no-effect (name callback reason)
+  "Run CALLBACK of the menu entry NAME, warn that it has no effect, REASON."
+  (if (commandp callback)
+      (call-interactively callback)
+    (eval callback t))
+  (coq-eglot--warn-no-effect (format "The menu entry \"%s\"" name) reason))
+
+(defun coq-eglot--menu-with-warnings (menu)
+  "MENU, a shared menu, with a warning on its entries without effect.
+They do what they do, then warn, see `coq-eglot--no-effect-entries'."
+  (mapcar (lambda (item)
+            (cond
+             ((and (vectorp item) (coq-eglot--no-effect-reason (aref item 1)))
+              (let ((new (copy-sequence item)))
+                (aset new 1 `(coq-eglot--run-no-effect
+                              ,(aref item 0) ',(aref item 1)
+                              ,(coq-eglot--no-effect-reason (aref item 1))))
+                new))
+             ((consp item) (coq-eglot--menu-with-warnings item))
+             (t item)))
+          menu))
+
 (defvar coq-eglot--menu-spec
   `("Coq"
     ["Next Step" coq-eglot-assert-next-command]
@@ -2112,7 +2185,7 @@ Run when Eglot starts or stops managing the buffer."
       :help "The goals and messages windows below the script fit their content"])
     ["Fold Other Goals" coq-toggle-other-goals
      :style toggle :selected coq-fold-other-goals]
-    ,coq-compile-menu
+    ,(coq-eglot--menu-with-warnings coq-compile-menu)
     ["Double Hit Electric Terminator" proof-double-hit-toggle
      :style toggle :selected proof-double-hit-enable]
     ["Trace" coq-eglot-toggle-trace

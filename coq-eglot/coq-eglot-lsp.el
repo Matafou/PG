@@ -399,7 +399,9 @@ See `coq-eglot-lsp-printing-flags-function'."
 Called without argument in the script buffer before each goals request.
 If it returns non-nil, a second request asks the sort of the type of
 each hypothesis of the first goal, see `coq-eglot-lsp--hyp-sorts-command':
-the first goal of the answer has them with the key :hyp-sorts.")
+the first goal of the answer has them with the key :hyp-sorts.  Both
+requests are sent together: most of the cost of a request is its
+latency, the sorts add almost nothing to the time of the goals.")
 
 (defconst coq-eglot-lsp--hyp-sorts-command
   "1: try (match reverse goal with H : ?T |- _ => \
@@ -408,11 +410,10 @@ let s := type of T in idtac \"COQ-EGLOT-SORT\" H s; fail end)."
 Of the first goal, one message \"COQ-EGLOT-SORT name sort\" each.  The
 failure after each message makes `match' try the next hypothesis.")
 
-(defun coq-eglot-lsp--hyp-sorts-p (answer)
-  "Non-nil if the sorts of the hypotheses of ANSWER are needed.
+(defun coq-eglot-lsp--hyp-sorts-p ()
+  "Non-nil if the goals need the sorts of the hypotheses.
 See `coq-eglot-lsp-hyp-sorts-function'."
   (and coq-eglot-lsp-hyp-sorts-function
-       (> (length (plist-get (plist-get answer :goals) :goals)) 0)
        (funcall coq-eglot-lsp-hyp-sorts-function)))
 
 (defun coq-eglot-lsp--parse-hyp-sorts (messages)
@@ -429,9 +430,11 @@ without universes."
 
 (defun coq-eglot-lsp--with-hyp-sorts (answer messages)
   "ANSWER of a goals request, its first goal with the sorts in MESSAGES.
-See `coq-eglot-lsp--parse-hyp-sorts'."
-  (let ((first (aref (plist-get (plist-get answer :goals) :goals) 0)))
-    (plist-put first :hyp-sorts (coq-eglot-lsp--parse-hyp-sorts messages)))
+See `coq-eglot-lsp--parse-hyp-sorts'.  ANSWER unchanged without goals."
+  (let ((goals (plist-get (plist-get answer :goals) :goals)))
+    (when (> (length goals) 0)
+      (plist-put (aref goals 0) :hyp-sorts
+                 (coq-eglot-lsp--parse-hyp-sorts messages))))
   answer)
 
 (defun coq-eglot-lsp--goals-params (pos &optional width flags)
@@ -458,20 +461,23 @@ With the keys :printing-width and :printing-flags."
                  :printing-flags flags)
     answer))
 
-(defun coq-eglot-lsp-goals (pos)
+(defun coq-eglot-lsp-goals (pos &optional no-sorts)
   "Ask the goals after the sentence at buffer position POS.
 Return the answer of the server as a plist with keys :range, :goals,
 :messages and :error, and :printing-width, see
 `coq-eglot-lsp-printing-width-function', and :printing-flags, see
 `coq-eglot-lsp-printing-flags-function'.  The first goal has the sorts
-of its hypotheses if needed, see `coq-eglot-lsp-hyp-sorts-function'."
+of its hypotheses if needed, see `coq-eglot-lsp-hyp-sorts-function',
+unless NO-SORTS is non-nil: the goals will not be displayed."
   (let ((width (coq-eglot-lsp--printing-width))
         (flags (coq-eglot-lsp--printing-flags)))
     (let ((answer (coq-eglot-lsp--with-width
                    (coq-eglot-lsp-request
                     :proof/goals (coq-eglot-lsp--goals-params pos width flags))
                    width flags)))
-      (if (coq-eglot-lsp--hyp-sorts-p answer)
+      (if (and (not no-sorts)
+               (coq-eglot-lsp--hyp-sorts-p)
+               (> (length (plist-get (plist-get answer :goals) :goals)) 0))
           (coq-eglot-lsp--with-hyp-sorts
            answer
            (condition-case nil
@@ -482,22 +488,27 @@ of its hypotheses if needed, see `coq-eglot-lsp-hyp-sorts-function'."
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
 See `coq-eglot-lsp-goals' and `coq-eglot-lsp-async-request'."
-  (let ((width (coq-eglot-lsp--printing-width))
-        (flags (coq-eglot-lsp--printing-flags)))
+  (let* ((width (coq-eglot-lsp--printing-width))
+         (flags (coq-eglot-lsp--printing-flags))
+         ;; with the sorts: the answer of the goals and the messages of
+         ;; the sorts, `none' until they arrive
+         (answer 'none)
+         (messages (if (coq-eglot-lsp--hyp-sorts-p) 'none nil))
+         (done (lambda ()
+                 (unless (or (eq answer 'none) (eq messages 'none))
+                   (funcall on-success
+                            (coq-eglot-lsp--with-hyp-sorts answer messages))))))
+    (when (eq messages 'none)
+      (coq-eglot-lsp-query-async
+       pos coq-eglot-lsp--hyp-sorts-command
+       (lambda (result) (setq messages result) (funcall done))
+       ;; outside of a proof for instance: no sorts
+       (lambda (_error) (setq messages nil) (funcall done))))
     (coq-eglot-lsp-async-request
      :proof/goals (coq-eglot-lsp--goals-params pos width flags)
-     (lambda (answer)
-       (setq answer (coq-eglot-lsp--with-width answer width flags))
-       (if (coq-eglot-lsp--hyp-sorts-p answer)
-           (coq-eglot-lsp-query-async
-            pos coq-eglot-lsp--hyp-sorts-command
-            (lambda (messages)
-              (funcall on-success
-                       (coq-eglot-lsp--with-hyp-sorts answer messages)))
-            ;; outside of a proof for instance: no sorts
-            (lambda (_error)
-              (funcall on-success (coq-eglot-lsp--with-hyp-sorts answer nil))))
-         (funcall on-success answer)))
+     (lambda (result)
+       (setq answer (coq-eglot-lsp--with-width result width flags))
+       (funcall done))
      on-error)))
 
 (defun coq-eglot-lsp-ping (on-answer)

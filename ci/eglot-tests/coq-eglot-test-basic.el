@@ -2094,10 +2094,27 @@ the next goals and queries, like in Proof General."
       (should (equal coq-search-blacklist-current-string
                      "\"foo_\" \"_bar\"")))))
 
+(defun menu-entry (menu name)
+  "The entry NAME of MENU, at any depth, or nil."
+  (seq-some (lambda (item)
+              (cond ((and (vectorp item) (equal (aref item 0) name)) item)
+                    ((consp item) (menu-entry (cdr item) name))))
+            menu))
+
 (ert-deftest coq-eglot-compile-menu ()
-  "The menu of the compilation is the one of Proof General."
-  (should (member coq-compile-menu (cdr coq-eglot--menu-spec)))
-  (should (equal (car coq-compile-menu) "Auto Compilation"))
+  "The menu of the compilation is the one of Proof General, with a
+warning on its entries without effect."
+  (let ((menu (assoc "Auto Compilation" (cdr coq-eglot--menu-spec))))
+    (should menu)
+    (should (equal (length menu) (length coq-compile-menu)))
+    (should (eq (aref (menu-entry menu "Compile Before Require") 1)
+                'coq-compile-before-require-toggle))
+    (should (eq (car (aref (menu-entry menu "Lock Ancestors") 1))
+                'coq-eglot--run-no-effect))
+    (should (eq (car (aref (menu-entry menu "use -vos and -vok") 1))
+                'coq-eglot--run-no-effect))
+    (should (eq (aref (menu-entry menu "Keep going") 1)
+                'coq-compile-keep-going-toggle)))
   (should (seq-some (lambda (item)
                       (and (vectorp item)
                            (eq (aref item 1)
@@ -2121,12 +2138,34 @@ the next goals and queries."
       (should-not (member "Set Printing Coercions"
                           coq-eglot--printing-flags)))))
 
+(ert-deftest coq-eglot-no-effect-warnings ()
+  "The menu entries and the commands without effect in the Eglot backend
+do what they do, and warn."
+  (let ((coq-lock-ancestors t)
+        (menu (assoc "Auto Compilation" (cdr coq-eglot--menu-spec))))
+    (with-current-buffer (get-buffer-create "*Warnings*")
+      (let ((inhibit-read-only t)) (erase-buffer)))
+    (eval (aref (menu-entry menu "Lock Ancestors") 1) t)
+    (should-not coq-lock-ancestors)
+    (should (string-search "\"Lock Ancestors\" has no effect"
+                           (with-current-buffer "*Warnings*" (buffer-string)))))
+  (with-test-file
+    (let ((coq-eglot--printing-flags nil))
+      (with-current-buffer "*Warnings*"
+        (let ((inhibit-read-only t)) (erase-buffer)))
+      (coq-unset-printing-unfocused)
+      (should (member "Unset Printing Unfocused" coq-eglot--printing-flags))
+      (should (string-search "Unset Printing Unfocused has no effect"
+                             (with-current-buffer "*Warnings*"
+                               (buffer-string)))))))
+
 (ert-deftest coq-eglot-compact-contexts ()
   "With Set Printing Compact Contexts, like in Coq, the hypotheses whose
 type is in Type share their lines, three spaces apart: not those in Prop
 or SProp, nor the definitions.  Each one keeps its folding button."
   (with-test-file
-    (let ((coq-eglot--printing-flags nil))
+    (let ((coq-eglot--printing-flags nil)
+          (coq-eglot-compact-contexts nil))
       (goto-marker "compact")
       (run #'coq-eglot-goto-point)
       (should (string-search "  A : Type\n  a : A\n"
@@ -2150,7 +2189,24 @@ or SProp, nor the definitions.  Each one keeps its folding button."
       (wait-until (lambda ()
                     (with-current-buffer "*goals*"
                       (string-search "A : Type\n  a : A" (buffer-string))))
-                  10))))
+                  10)
+      ;; the option, overridden by the commands until the server stops
+      (setq coq-eglot--printing-flags nil)
+      (setq coq-eglot-compact-contexts t)
+      (run #'coq-eglot-retract-buffer)
+      (goto-marker "compact")
+      (run #'coq-eglot-goto-point)
+      (should (wait-until (lambda ()
+                            (with-current-buffer "*goals*"
+                              (string-search "A : Type   a : A"
+                                             (buffer-string))))
+                          10))
+      (coq-unset-printing-compact-contexts)
+      (should (wait-until (lambda ()
+                            (with-current-buffer "*goals*"
+                              (string-search "A : Type\n  a : A"
+                                             (buffer-string))))
+                          10)))))
 
 (ert-deftest coq-eglot-show-at-point ()
   "C-c C-a C-s shows the goals and messages after the sentence at point,
