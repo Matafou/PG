@@ -2091,6 +2091,7 @@ Run when Eglot starts or stops managing the buffer."
      ["About with Printing All..." coq-About-with-all]
      ["Check with Printing All..." coq-Check-show-all]
      ["Print with Printing All..." coq-Print-with-all])
+    ,coq-options-menu
     ,(append coq-insert-menu
              '(["Named Goal Selectors" coq-insert-named-goal-selectors]))
     "---"

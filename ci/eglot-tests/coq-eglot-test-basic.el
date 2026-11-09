@@ -2104,6 +2104,23 @@ the next goals and queries, like in Proof General."
                                'coq-change-search-blacklist-interactive)))
                     (cdr (assoc "Queries" (cdr coq-eglot--menu-spec))))))
 
+(ert-deftest coq-eglot-options-menu ()
+  "The menu of the printing options is the one of Proof General, its
+commands are defined in the Eglot backend, and its flags are those of
+the next goals and queries."
+  (should (member coq-options-menu (cdr coq-eglot--menu-spec)))
+  (should (equal (car coq-options-menu) "OPTIONS"))
+  (dolist (item (cdr coq-options-menu))
+    (should (commandp (aref item 1))))
+  (with-test-file
+    (let ((coq-eglot--printing-flags nil))
+      (coq-set-printing-coercions)
+      (should (member "Set Printing Coercions" coq-eglot--printing-flags))
+      (coq-unset-printing-coercions)
+      (should (member "Unset Printing Coercions" coq-eglot--printing-flags))
+      (should-not (member "Set Printing Coercions"
+                          coq-eglot--printing-flags)))))
+
 (ert-deftest coq-eglot-show-at-point ()
   "C-c C-a C-s shows the goals and messages after the sentence at point,
 in the processed part, like in Proof General.  Elsewhere it asks for a
