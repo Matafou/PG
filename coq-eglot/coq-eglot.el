@@ -2071,7 +2071,7 @@ Run when Eglot starts or stops managing the buffer."
     (coq-compile-quick
      . "it is for Coq < 8.11, older than what coq-lsp supports")
     (coq-compile-vos
-     . "coq-lsp loads the .vo files, never the .vos files"))
+     . "coq-lsp loads the .vo files only, \"ensure vo\" is set again"))
   "Entries of the shared menus without effect in the Eglot backend.
 Their commands, or the variables that they set, with the reason.  See
 `coq-eglot--menu-with-warnings'.")

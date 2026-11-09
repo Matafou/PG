@@ -167,6 +167,18 @@ gone too."
       (when coq-eglot-compile--state
         (coq-eglot-compile--finish t)))))
 
+(defun coq-eglot-compile--disable-pg-options ()
+  "Give no effect to the options of the compilation meant for Proof General.
+Globally: the compilation reads them in any buffer, and the backend is
+chosen for the whole session, see `coq-backend', Proof General does not
+use them.  No locks, `coq-lock-ancestors': they are for the proof shell
+of Proof General.  No .vos files, `coq-compile-vos': the server loads
+the .vo files only.  Set when the Eglot backend is loaded and before
+each compilation, the menu warns, see `coq-eglot--no-effect-entries'.
+With `setq', not saved by customize."
+  (setq coq-lock-ancestors nil)
+  (setq coq-compile-vos 'ensure-vo))
+
 (defun coq-eglot-compile-requires (start end on-done)
   "Compile the libraries required by the sentences between START and END.
 Return nil if there is nothing to compile: no Require sentence there,
@@ -185,8 +197,7 @@ compilation."
       (setq-local coq-par-release-items-function #'coq-eglot-compile--release)
       (setq-local coq-par-failure-function #'coq-eglot-compile--failure)
       (setq-local coq-par-abort-function #'coq-eglot-compile--abort)
-      ;; the locks of Proof General are for the proof shell
-      (setq-local coq-lock-ancestors nil)
+      (coq-eglot-compile--disable-pg-options)
       (let ((items (mapcar #'coq-eglot-compile--item requires)))
         (setq coq-eglot-compile--state
               (list :pending (mapcar #'car items) :on-done on-done))
@@ -323,6 +334,8 @@ Check after the modification, when the buffer is marked as modified."
 (add-hook 'first-change-hook #'coq-eglot-compile--file-modified)
 (add-hook 'after-save-hook #'coq-eglot-compile--file-changed)
 (add-hook 'after-revert-hook #'coq-eglot-compile--file-changed)
+
+(coq-eglot-compile--disable-pg-options)
 
 (provide 'coq-eglot-compile)
 

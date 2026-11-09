@@ -1712,6 +1712,22 @@ directory, not in the one of the dominating project file."
         (dir (expand-file-name "lib/" load-path-directory)))
     (should (equal (coq-eglot-lsp-project dir) (cons 'transient dir)))))
 
+(ert-deftest coq-eglot-compile-vo-no-locks ()
+  "The compilation produces .vo files and locks nothing, whatever the
+options of Proof General, set again globally before each compilation:
+the server loads the .vo files only, the locks are for the proof shell
+of Proof General."
+  (let ((coq-compile-vos 'vos)
+        (coq-lock-ancestors t))
+    (with-compile-file
+      (goto-marker "def")
+      (run #'coq-eglot-goto-point)
+      (should (position-at-marker-p "def"))
+      (should (compiled-p "eglot_compile_b"))
+      (should (compiled-p "eglot_compile_c"))
+      (should (eq coq-compile-vos 'ensure-vo))
+      (should-not coq-lock-ancestors))))
+
 (ert-deftest coq-eglot-compile-next ()
   "A Require processed alone is compiled first too.
 The file starts with a sentence, not a comment."

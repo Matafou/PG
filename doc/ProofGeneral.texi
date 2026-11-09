@@ -5893,7 +5893,9 @@ File Support}).  The menu @code{Coq -> Auto Compilation} is the one of
 Proof General.  The compilation is always parallel and in the
 background, and the files of the imported libraries are not locked:
 @code{coq-compile-parallel-in-background} and @code{coq-lock-ancestors}
-have no effect.  A processed Require sentence whose libraries changed
+have no effect.  The libraries are compiled to @file{.vo} files, the
+server does not load the @file{.vos} files: @code{coq-compile-vos} is
+set to @code{ensure-vo}, and @code{coq-lock-ancestors} to nil.  A processed Require sentence whose libraries changed
 since is marked, the user decides when to go back before it.
 @item
 In the processed part, @kbd{C-c C-a C-s} (@code{coq-Show}) displays the
