@@ -49,6 +49,7 @@
 (require 'coq-syntax)                   ; also loads the faces of PG
 (require 'coq-indent)
 (require 'color)
+(require 'cl-lib)
 (require 'coq-eglot-lsp)
 (require 'coq-eglot-compile)
 (require 'pg-terminator)                ; the double hit
@@ -164,24 +165,96 @@ See `coq-eglot-inactive-locked-face'."
                                coq-eglot-inactive-saturation))
             'coq-eglot-inactive-locked-face))))
 
-(defvar coq-eglot--active-buffer nil
-  "The script buffer whose goals and messages are displayed.
-It is the last one where a command of the backend ran, or where the
-processed part was edited.  The processed part of the other script
-buffers is grayed: they go on checking, but display nothing.  Any
-command in one of them makes it active again.")
+(cl-defstruct (coq-eglot--output
+               (:constructor coq-eglot--make-output (&optional suffix))
+               (:copier nil))
+  "Where script buffers display their goals and messages, and its state.
+The goals, conclusion and response buffers, named after
+`coq-eglot-goals-buffer-name', `coq-eglot-conclusion-buffer-name' and
+`coq-eglot-response-buffer-name' followed by SUFFIX, and what they
+display.  Only the active script buffer of an output displays there,
+see `coq-eglot--active-p'.  All script buffers share the default
+output, `coq-eglot--default-output'."
+  (suffix "" :documentation "Suffix of the names of the buffers.")
+  (active nil :documentation "The script buffer whose goals and messages
+are displayed.  It is the last one where a command of the backend ran,
+or where the processed part was edited.  The processed part of the
+other script buffers of the output is grayed: they go on checking, but
+display nothing.  Any command in one of them makes it active again.")
+  (goals nil :documentation "Goals of the last answer displayed, to
+display them again.")
+  (width nil :documentation "Printing width of the goals displayed, or
+nil for Coq's default.  See `coq-eglot--goals-printing-width'.")
+  (flags nil :documentation "Printing flags of the goals displayed, see
+`coq-eglot--printing-flags'.")
+  (asked-width nil :documentation "Printing width asked by
+`coq-eglot-ask-printing-width', or nil.  As (WIDTH .
+GOALS-WINDOWS-WIDTH): it holds while the goals windows keep this
+width.")
+  (width-timer nil :documentation "Timer of `coq-eglot--refresh-width'."))
+
+(defvar coq-eglot--default-output (coq-eglot--make-output)
+  "The output of the script buffers, see `coq-eglot--output'.")
+
+(defvar-local coq-eglot--buffer-output nil
+  "Output of the current script, goals or response buffer, or nil.
+Nil for `coq-eglot--default-output'.")
+(put 'coq-eglot--buffer-output 'permanent-local t)
+
+(defvar coq-eglot--bound-output nil
+  "Output bound by `coq-eglot--with-output', or nil.")
+
+(defun coq-eglot--output ()
+  "The output of the current buffer.
+The one bound by `coq-eglot--with-output' if any, otherwise the one of
+the current script, goals or response buffer, see
+`coq-eglot--buffer-output'."
+  (or coq-eglot--bound-output coq-eglot--buffer-output
+      coq-eglot--default-output))
+
+(defmacro coq-eglot--with-output (output &rest body)
+  "Run BODY with OUTPUT as the output of all buffers.
+For timers and callbacks, which may run in any buffer."
+  (declare (indent 1) (debug t))
+  `(let ((coq-eglot--bound-output ,output))
+     ,@body))
+
+(defun coq-eglot--output-name (base)
+  "Name of the buffer BASE of the current output, see `coq-eglot--output'."
+  (concat base (coq-eglot--output-suffix (coq-eglot--output))))
+
+(defvar coq-eglot-goals-buffer-name "*goals*")
+(defvar coq-eglot-conclusion-buffer-name "*conclusion*"
+  "Buffer of the conclusion, see `coq-eglot-split-goals'.")
+(defvar coq-eglot-response-buffer-name "*response*")
+
+(defun coq-eglot--goals-name ()
+  "Name of the goals buffer of the current output."
+  (coq-eglot--output-name coq-eglot-goals-buffer-name))
+
+(defun coq-eglot--conclusion-name ()
+  "Name of the conclusion buffer of the current output."
+  (coq-eglot--output-name coq-eglot-conclusion-buffer-name))
+
+(defun coq-eglot--response-name ()
+  "Name of the response buffer of the current output."
+  (coq-eglot--output-name coq-eglot-response-buffer-name))
+
+(defun coq-eglot--active-buffer ()
+  "The active script buffer of the current output, or nil."
+  (coq-eglot--output-active (coq-eglot--output)))
 
 (defun coq-eglot--active-p ()
-  "Non-nil if the current buffer is the active script buffer."
-  (eq (current-buffer) coq-eglot--active-buffer))
+  "Non-nil if the current buffer is the active script buffer of its output."
+  (eq (current-buffer) (coq-eglot--active-buffer)))
 
 (defun coq-eglot--activate ()
   "Make the current buffer the active script buffer.
 Gray the processed part of the previous one, display the goals of the
 current one."
   (unless (coq-eglot--active-p)
-    (let ((previous coq-eglot--active-buffer))
-      (setq coq-eglot--active-buffer (current-buffer))
+    (let ((previous (coq-eglot--active-buffer)))
+      (setf (coq-eglot--output-active (coq-eglot--output)) (current-buffer))
       (when (buffer-live-p previous)
         (with-current-buffer previous (coq-eglot--update-overlays)))
       (coq-eglot-compile-check-outdated)
@@ -195,8 +268,8 @@ goals and response buffers, like in Proof General."
   (cond
    (coq-eglot-mode (current-buffer))
    ((and (derived-mode-p 'coq-eglot-output-mode)
-         (buffer-live-p coq-eglot--active-buffer))
-    coq-eglot--active-buffer)
+         (buffer-live-p (coq-eglot--active-buffer)))
+    (coq-eglot--active-buffer))
    (t (user-error "Coq: no script buffer"))))
 
 (defmacro coq-eglot--with-script (&rest body)
@@ -210,14 +283,14 @@ See `coq-eglot--script-buffer'."
 (defun coq-eglot--forget-active ()
   "Forget the current buffer if it is the active script buffer."
   (when (coq-eglot--active-p)
-    (setq coq-eglot--active-buffer nil)))
+    (setf (coq-eglot--output-active (coq-eglot--output)) nil)))
 
 (defun coq-eglot--update-overlays ()
   "Update the overlays of the processed part and of the checked part."
   (unless (overlayp coq-eglot--locked-overlay)
     (setq coq-eglot--locked-overlay (make-overlay (point-min) (point-min))))
   (overlay-put coq-eglot--locked-overlay 'face
-               (if (or (coq-eglot--active-p) (null coq-eglot--active-buffer))
+               (if (or (coq-eglot--active-p) (null (coq-eglot--active-buffer)))
                    'proof-locked-face
                  (coq-eglot--inactive-locked-face)))
   (move-overlay coq-eglot--locked-overlay (point-min) (coq-eglot-position))
@@ -327,11 +400,6 @@ error."
 
 ;;; Display
 
-(defvar coq-eglot-goals-buffer-name "*goals*")
-(defvar coq-eglot-conclusion-buffer-name "*conclusion*"
-  "Buffer of the conclusion, see `coq-eglot-split-goals'.")
-(defvar coq-eglot-response-buffer-name "*response*")
-
 (define-derived-mode coq-eglot-output-mode nil "Coq Output"
   "Parent mode of the goals and response buffers of the Eglot backend.
 Read-only, with the keys of the backend, and the keys of the queries
@@ -364,10 +432,13 @@ active script buffer."
   (setq-local font-lock-defaults '(coq-response-font-lock-keywords)))
 
 (defun coq-eglot--output-buffer (name mode)
-  "Return buffer NAME, in MODE."
-  (let ((buffer (get-buffer-create name)))
+  "Return buffer NAME, in MODE, of the current output."
+  (let ((output (coq-eglot--output))
+        (buffer (get-buffer-create name)))
     (with-current-buffer buffer
-      (unless (eq major-mode mode) (funcall mode)))
+      (unless (eq major-mode mode) (funcall mode))
+      (setq coq-eglot--buffer-output
+            (unless (eq output coq-eglot--default-output) output)))
     buffer))
 
 (defvar coq-eglot-trace-buffer-name)
@@ -375,8 +446,8 @@ active script buffer."
 (defun coq-eglot--output-window-p (window)
   "Non-nil if WINDOW displays the goals, the conclusion or the messages."
   (member (buffer-name (window-buffer window))
-          (list coq-eglot-goals-buffer-name coq-eglot-conclusion-buffer-name
-                coq-eglot-response-buffer-name)))
+          (list (coq-eglot--goals-name) (coq-eglot--conclusion-name)
+                (coq-eglot--response-name))))
 
 (defun coq-eglot--three-windows-p ()
   "Non-nil if the goals and the messages have windows of their own.
@@ -387,8 +458,8 @@ frame is high enough."
 
 (defun coq-eglot--main-window ()
   "The window of the script, next to which the output windows go."
-  (or (and coq-eglot--active-buffer
-           (get-buffer-window coq-eglot--active-buffer))
+  (or (and (coq-eglot--active-buffer)
+           (get-buffer-window (coq-eglot--active-buffer)))
       (seq-find (lambda (window) (not (coq-eglot--output-window-p window)))
                 (window-list nil 'no-minibuffer))
       (selected-window)))
@@ -409,13 +480,13 @@ apart, its window is below the goals window."
   (let* ((policy (proof-guess-3win-display-policy
                   proof-three-window-mode-policy))
          (columns (eq policy 'horizontal))
-         (goals (coq-eglot--output-buffer coq-eglot-goals-buffer-name
+         (goals (coq-eglot--output-buffer (coq-eglot--goals-name)
                                           #'coq-eglot-goals-mode))
          (conclusion (and coq-eglot-split-goals
                           (coq-eglot--output-buffer
-                           coq-eglot-conclusion-buffer-name
+                           (coq-eglot--conclusion-name)
                            #'coq-eglot-goals-mode)))
-         (response (coq-eglot--output-buffer coq-eglot-response-buffer-name
+         (response (coq-eglot--output-buffer (coq-eglot--response-name)
                                              #'coq-eglot-response-mode))
          (goals-window (get-buffer-window goals))
          (response-window (or (get-buffer-window response)
@@ -462,12 +533,12 @@ goals window."
                                 (and (coq-eglot--output-window-p window)
                                      (not (equal (buffer-name
                                                   (window-buffer window))
-                                                 coq-eglot-conclusion-buffer-name))))
+                                                 (coq-eglot--conclusion-name)))))
                               (window-list nil 'no-minibuffer))
                     (coq-eglot--reuse-rotated-window nil)))
-        (goals-window (get-buffer-window coq-eglot-goals-buffer-name)))
+        (goals-window (get-buffer-window (coq-eglot--goals-name))))
     (cond
-     ((and (equal (buffer-name buffer) coq-eglot-conclusion-buffer-name)
+     ((and (equal (buffer-name buffer) (coq-eglot--conclusion-name))
            goals-window)
       (coq-eglot--show-in (split-window goals-window nil 'below) buffer))
      (shared (coq-eglot--show-in shared buffer))
@@ -538,13 +609,13 @@ frames are deleted."
           (delete-window window)))
       (unless proof-multiple-frames-enable
         (mapc #'delete-frame (coq-eglot--frames)))
-      (coq-eglot--display-buffer coq-eglot-goals-buffer-name
+      (coq-eglot--display-buffer (coq-eglot--goals-name)
                                  #'coq-eglot-goals-mode)
       (when (or proof-multiple-frames-enable (coq-eglot--three-windows-p))
-        (coq-eglot--display-buffer coq-eglot-response-buffer-name
+        (coq-eglot--display-buffer (coq-eglot--response-name)
                                    #'coq-eglot-response-mode))
       (when coq-eglot-split-goals
-        (coq-eglot--display-buffer coq-eglot-conclusion-buffer-name
+        (coq-eglot--display-buffer (coq-eglot--conclusion-name)
                                    #'coq-eglot-goals-mode))
       (coq-eglot--resize-windows)
       (coq-eglot--scroll-goals))
@@ -586,18 +657,18 @@ messages."
         (if (eq last-command 'coq-eglot-display-some-buffers)
             (1+ coq-eglot--rotation)
           0))
-  (let* ((names (list coq-eglot-response-buffer-name coq-eglot-trace-buffer-name
-                      coq-eglot-goals-buffer-name))
+  (let* ((names (list (coq-eglot--response-name) coq-eglot-trace-buffer-name
+                      (coq-eglot--goals-name)))
          (buffers (delq nil (mapcar #'get-buffer names)))
          (buffer (and buffers
                       (nth (mod coq-eglot--rotation (length buffers)) buffers)))
          (three (coq-eglot--three-windows-p))
          (shared (if (and three (equal (buffer-name buffer)
-                                       coq-eglot-goals-buffer-name))
-                     (list coq-eglot-goals-buffer-name)
+                                       (coq-eglot--goals-name)))
+                     (list (coq-eglot--goals-name))
                    (seq-remove (lambda (name)
                                  (and three
-                                      (equal name coq-eglot-goals-buffer-name)))
+                                      (equal name (coq-eglot--goals-name))))
                                names))))
     (when buffer
       (let ((window (seq-find (lambda (window)
@@ -626,8 +697,9 @@ is not displayed yet."
                    (lambda ()
                      (when (and (buffer-live-p buffer)
                                 (eq (window-buffer (selected-window)) buffer)
-                                (or (not coq-eglot--active-buffer)
-                                    (eq coq-eglot--active-buffer buffer)))
+                                (with-current-buffer buffer
+                                  (or (not (coq-eglot--active-buffer))
+                                      (coq-eglot--active-p))))
                        (with-current-buffer buffer
                          (coq-eglot-layout-windows))))))))
 
@@ -654,7 +726,7 @@ empty if `proof-delete-empty-windows'."
                        (not delete)
                        (or proof-multiple-frames-enable
                            (coq-eglot--three-windows-p)
-                           (not (equal name coq-eglot-response-buffer-name))
+                           (not (equal name (coq-eglot--response-name)))
                            (not empty)))))
     (with-current-buffer (if display
                              (coq-eglot--display-buffer name mode)
@@ -668,9 +740,9 @@ empty if `proof-delete-empty-windows'."
         (coq-goals-fold-other-goals)))
     (when delete-empty
       ;; also the windows that the layout created for empty buffers
-      (dolist (other (list coq-eglot-goals-buffer-name
-                           coq-eglot-conclusion-buffer-name
-                           coq-eglot-response-buffer-name))
+      (dolist (other (list (coq-eglot--goals-name)
+                           (coq-eglot--conclusion-name)
+                           (coq-eglot--response-name)))
         (let ((buffer (get-buffer other)))
           (when (and buffer (zerop (buffer-size buffer)))
             (coq-eglot--delete-windows other)))))
@@ -729,9 +801,9 @@ height they need, at most half of the frame (two thirds without
 `proof-three-window-enable'), like in Proof General, and the script
 window the rest.  Without `coq-optimise-resp-windows-enable', only the
 windows below the script are resized."
-  (let* ((names `((goals . ,coq-eglot-goals-buffer-name)
-                  (conclusion . ,coq-eglot-conclusion-buffer-name)
-                  (response . ,coq-eglot-response-buffer-name)))
+  (let* ((names `((goals . ,(coq-eglot--goals-name))
+                  (conclusion . ,(coq-eglot--conclusion-name))
+                  (response . ,(coq-eglot--response-name))))
          (windows (delq nil (mapcar (lambda (role)
                                       (get-buffer-window
                                        (cdr (assq role names))))
@@ -782,12 +854,10 @@ windows mode).  See `coq-eglot-resize-windows-by-priority'."
 ;; it on a copy of the state, nothing is checked again.  See
 ;; `coq-auto-adapt-printing-width'.
 
-(defvar coq-eglot--displayed-goals nil
-  "Goals of the last answer displayed, to display them again.")
-
-(defvar coq-eglot--displayed-width nil
-  "Printing width of the goals displayed, or nil for Coq's default.
-See `coq-eglot--goals-printing-width'.")
+(defun coq-eglot--displayed-width ()
+  "Printing width of the goals displayed by the current output, or nil.
+See `coq-eglot--output'."
+  (coq-eglot--output-width (coq-eglot--output)))
 
 (defconst coq-eglot--hyp-indentation 4
   "Indentation of the type of a hypothesis below its names.
@@ -817,21 +887,17 @@ See `coq-eglot--printing-width-margin'."
   (when (and coq-auto-adapt-printing-width window-width)
     (max 20 (- window-width indentation coq-eglot--printing-width-margin))))
 
-(defvar coq-eglot--asked-width nil
-  "Printing width asked by `coq-eglot-ask-printing-width', or nil.
-As (WIDTH . GOALS-WINDOWS-WIDTH): it holds while the goals windows keep
-this width.")
-
 (defun coq-eglot--goals-windows-width ()
   "Number of characters of the narrowest goals window, or nil."
-  (apply #'coq-eglot--windows-width coq-eglot-goals-buffer-name
-         (and coq-eglot-split-goals (list coq-eglot-conclusion-buffer-name))))
+  (apply #'coq-eglot--windows-width (coq-eglot--goals-name)
+         (and coq-eglot-split-goals (list (coq-eglot--conclusion-name)))))
 
 (defun coq-eglot--asked-width ()
   "Printing width asked by the user, or nil if the windows changed since."
-  (and coq-eglot--asked-width
-       (eql (cdr coq-eglot--asked-width) (coq-eglot--goals-windows-width))
-       (car coq-eglot--asked-width)))
+  (let ((asked (coq-eglot--output-asked-width (coq-eglot--output))))
+    (and asked
+         (eql (cdr asked) (coq-eglot--goals-windows-width))
+         (car asked))))
 
 (defun coq-eglot--goals-printing-width ()
   "Printing width of the goals, from the width of their windows, or nil.
@@ -852,8 +918,8 @@ response is not displayed.  The width asked by
 `coq-eglot-ask-printing-width' instead, if any."
   (or (coq-eglot--asked-width)
       (coq-eglot--printing-width
-       (or (coq-eglot--windows-width coq-eglot-response-buffer-name)
-           (coq-eglot--windows-width coq-eglot-goals-buffer-name))
+       (or (coq-eglot--windows-width (coq-eglot--response-name))
+           (coq-eglot--windows-width (coq-eglot--goals-name)))
        0)))
 
 (defun coq-eglot-ask-printing-width (width)
@@ -862,19 +928,17 @@ Until the goals windows change width, then the printing width follows
 them again if `coq-auto-adapt-printing-width'."
   (interactive
    (list (read-number "Printing width: "
-                      (or coq-eglot--displayed-width
+                      (or (coq-eglot--displayed-width)
                           (coq-eglot--goals-printing-width)
                           78))))
-  (setq coq-eglot--asked-width (cons width (coq-eglot--goals-windows-width)))
+  (setf (coq-eglot--output-asked-width (coq-eglot--output))
+        (cons width (coq-eglot--goals-windows-width)))
   (coq-eglot--refresh-width))
 
 (defvar coq-eglot--printing-flags nil
   "Commands setting the printing flags of the goals and queries.
 Without their final dot, in the order they were run, at most one per
 flag.  See `coq-eglot-set-flag'.")
-
-(defvar coq-eglot--displayed-flags nil
-  "Printing flags of the goals displayed, see `coq-eglot--printing-flags'.")
 
 (defun coq-eglot--flag-name (command)
   "Name of the flag set or unset by COMMAND, like \"Printing All\"."
@@ -932,31 +996,37 @@ then replaces the old blacklist by the new one at each change."
             (list (format "Add Search Blacklist %s"
                           coq-search-blacklist-current-string)))))
 
-(defvar coq-eglot--width-timer nil
-  "Timer of `coq-eglot--refresh-width'.")
-
 (defun coq-eglot--schedule-width-refresh (&rest _)
   "Print the goals again soon if the width of their windows changed.
 In `window-size-change-functions' of the goals buffers, and after each
 display of the goals.  A timer, not to change the buffers during the
-redisplay, and to wait for the end of a resizing."
-  (when (timerp coq-eglot--width-timer)
-    (cancel-timer coq-eglot--width-timer))
-  (setq coq-eglot--width-timer
-        (run-at-time 0.1 nil #'coq-eglot--refresh-width)))
+redisplay, and to wait for the end of a resizing.  For the current
+output, see `coq-eglot--output'."
+  (let ((output (coq-eglot--output)))
+    (when (timerp (coq-eglot--output-width-timer output))
+      (cancel-timer (coq-eglot--output-width-timer output)))
+    (setf (coq-eglot--output-width-timer output)
+          (run-at-time 0.1 nil #'coq-eglot--refresh-width output))))
 
-(defun coq-eglot--refresh-width ()
+(defun coq-eglot--refresh-width (&optional output)
   "Print the goals again if their width or printing flags changed.
 The width of their windows, or the flags of `coq-eglot-set-flag'.  Not
 during a check: the goals of each sentence are asked when it is checked,
-at the current width."
-  (setq coq-eglot--width-timer nil)
-  (let ((script coq-eglot--active-buffer)
-        (width (coq-eglot--goals-printing-width)))
-    (when (and coq-eglot--displayed-goals
-               (or (and width (not (eql width coq-eglot--displayed-width)))
+at the current width.  For OUTPUT, the current one by default."
+  (coq-eglot--with-output (or output (coq-eglot--output))
+    (coq-eglot--refresh-width-1)))
+
+(defun coq-eglot--refresh-width-1 ()
+  "Like `coq-eglot--refresh-width' for the current output."
+  (setf (coq-eglot--output-width-timer (coq-eglot--output)) nil)
+  (let* ((output (coq-eglot--output))
+         (script (coq-eglot--active-buffer))
+         (width (coq-eglot--goals-printing-width)))
+    (when (and (coq-eglot--output-goals output)
+               (or (and width
+                        (not (eql width (coq-eglot--output-width output))))
                    (not (equal coq-eglot--printing-flags
-                               coq-eglot--displayed-flags)))
+                               (coq-eglot--output-flags output))))
                (buffer-live-p script))
       (with-current-buffer script
         (let ((last (car coq-eglot--ends)))
@@ -998,8 +1068,8 @@ is left for the comma or the colon after them."
 (defun coq-eglot--hyps-width ()
   "Width of the lines of the hypotheses.
 They must fit in the window, or in Coq's default width."
-  (if coq-eglot--displayed-width
-      (+ coq-eglot--displayed-width
+  (if (coq-eglot--displayed-width)
+      (+ (coq-eglot--displayed-width)
          coq-eglot--hyp-indentation
          coq-eglot--printing-width-margin)
     78))
@@ -1123,9 +1193,10 @@ three spaces between them, as many as fit in the width."
 Nil outside of proofs.  This is `coq-goals-count-function' for the
 Eglot backend: the server gives the unfocused goals, whatever Set
 Printing Unfocused."
-  (when coq-eglot--displayed-goals
-    (cons (length (plist-get coq-eglot--displayed-goals :goals))
-          (coq-eglot--unfocused-count coq-eglot--displayed-goals))))
+  (let ((goals (coq-eglot--output-goals (coq-eglot--output))))
+    (when goals
+      (cons (length (plist-get goals :goals))
+            (coq-eglot--unfocused-count goals)))))
 
 (defun coq-eglot--format-goal-list (goals first)
   "Format GOALS, numbered from FIRST, like Coq does for the other goals."
@@ -1194,26 +1265,27 @@ Return the empty string if GOALS is nil (outside of proofs)."
 (defun coq-eglot--show-goals (answer)
   "Display the goals of ANSWER of the server.
 See `coq-eglot-split-goals'."
-  (let* ((goals (plist-get answer :goals))
-         (new (not (equal goals coq-eglot--displayed-goals))))
-    (setq coq-eglot--displayed-goals goals)
-    (setq coq-eglot--displayed-width (plist-get answer :printing-width))
-    (setq coq-eglot--displayed-flags (plist-get answer :printing-flags))
+  (let* ((output (coq-eglot--output))
+         (goals (plist-get answer :goals))
+         (new (not (equal goals (coq-eglot--output-goals output)))))
+    (setf (coq-eglot--output-goals output) goals)
+    (setf (coq-eglot--output-width output) (plist-get answer :printing-width))
+    (setf (coq-eglot--output-flags output) (plist-get answer :printing-flags))
     (if (not coq-eglot-split-goals)
         (progn
-          (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
+          (coq-eglot--set-buffer-text (coq-eglot--goals-name)
                                       #'coq-eglot-goals-mode
                                       (coq-eglot--format-goals goals))
-          (coq-eglot--set-mode-line coq-eglot-goals-buffer-name t))
+          (coq-eglot--set-mode-line (coq-eglot--goals-name) t))
       ;; the windows separate the hypotheses from the conclusion
       (let ((parts (coq-eglot--format-goals-parts goals t)))
-        (coq-eglot--set-buffer-text coq-eglot-goals-buffer-name
+        (coq-eglot--set-buffer-text (coq-eglot--goals-name)
                                     #'coq-eglot-goals-mode (car parts))
         ;; the conclusion comes right below the hypotheses
-        (coq-eglot--set-mode-line coq-eglot-goals-buffer-name nil)
-        (coq-eglot--set-buffer-text coq-eglot-conclusion-buffer-name
+        (coq-eglot--set-mode-line (coq-eglot--goals-name) nil)
+        (coq-eglot--set-buffer-text (coq-eglot--conclusion-name)
                                     #'coq-eglot-goals-mode (cdr parts))
-        (coq-eglot--set-separator coq-eglot-conclusion-buffer-name)))
+        (coq-eglot--set-separator (coq-eglot--conclusion-name))))
     (coq-hyps-decorate new)
     (coq-eglot--scroll-goals)
     ;; the windows may have been created or resized meanwhile
@@ -1223,12 +1295,12 @@ See `coq-eglot-split-goals'."
   "The goals buffer holding the goals after the first one, or nil.
 The conclusion buffer if `coq-eglot-split-goals'.  This is
 `coq-goals-buffer-function' for the Eglot backend."
-  (get-buffer (if coq-eglot-split-goals coq-eglot-conclusion-buffer-name
-                coq-eglot-goals-buffer-name)))
+  (get-buffer (if coq-eglot-split-goals (coq-eglot--conclusion-name)
+                (coq-eglot--goals-name))))
 
 (setq coq-goals-buffer-function #'coq-eglot--goals-buffer)
 (setq coq-response-buffer-function
-      (lambda () (get-buffer coq-eglot-response-buffer-name)))
+      (lambda () (get-buffer (coq-eglot--response-name))))
 
 (defun coq-eglot--hyps-window-start (window)
   "Start of WINDOW showing the last hypotheses at its bottom.
@@ -1245,8 +1317,8 @@ For the goals buffer when the conclusion is apart."
 Like in Proof General, see `coq-goals-show-first-goal'.  With the
 conclusion apart, the goals window shows the last hypotheses, the
 conclusion window starts at the top."
-  (let ((goals (get-buffer coq-eglot-goals-buffer-name))
-        (conclusion (get-buffer coq-eglot-conclusion-buffer-name)))
+  (let ((goals (get-buffer (coq-eglot--goals-name)))
+        (conclusion (get-buffer (coq-eglot--conclusion-name))))
     (when goals
       (if (not coq-eglot-split-goals)
           (coq-goals-show-first-goal goals)
@@ -1283,7 +1355,7 @@ See `coq-eglot-split-goals'."
   (interactive)
   (setq coq-eglot-split-goals (not coq-eglot-split-goals))
   (unless coq-eglot-split-goals
-    (let ((buffer (get-buffer coq-eglot-conclusion-buffer-name)))
+    (let ((buffer (get-buffer (coq-eglot--conclusion-name))))
       (when buffer
         (dolist (window (get-buffer-window-list buffer nil t))
           (if (frame-root-window-p window)
@@ -1292,14 +1364,15 @@ See `coq-eglot-split-goals'."
                 (delete-frame (window-frame window)))
             (delete-window window)))
         (kill-buffer buffer))))
-  (coq-eglot--show-goals (list :goals coq-eglot--displayed-goals
-                               :printing-width coq-eglot--displayed-width
-                               :printing-flags coq-eglot--displayed-flags))
+  (let ((output (coq-eglot--output)))
+    (coq-eglot--show-goals (list :goals (coq-eglot--output-goals output)
+                                 :printing-width (coq-eglot--output-width output)
+                                 :printing-flags (coq-eglot--output-flags output))))
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
 
 (defun coq-eglot--show-response (text)
   "Display TEXT in the response buffer."
-  (coq-eglot--set-buffer-text coq-eglot-response-buffer-name
+  (coq-eglot--set-buffer-text (coq-eglot--response-name)
                               #'coq-eglot-response-mode text))
 
 (defun coq-eglot--show-answer (answer)

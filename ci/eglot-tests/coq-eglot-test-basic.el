@@ -418,7 +418,7 @@ buffers, on the active script buffer, like in Proof General."
   ;; no active script buffer: nothing to act on
   (with-temp-buffer
     (coq-eglot-goals-mode)
-    (let ((coq-eglot--active-buffer nil))
+    (cl-letf (((coq-eglot--output-active coq-eglot--default-output) nil))
       (should-error (coq-eglot-assert-next-command) :type 'user-error))))
 
 (defun face-of (buffer text)
@@ -1268,7 +1268,49 @@ its goals.  The processed part of the others is grayed."
         ;; the position of the other buffer did not move
         (should (position-at-marker-p "proof"))))
     ;; killing another buffer keeps the active one
-    (should (eq coq-eglot--active-buffer (current-buffer)))))
+    (should (eq (coq-eglot--active-buffer) (current-buffer)))))
+
+(ert-deftest coq-eglot-two-outputs ()
+  "Two script buffers with outputs of their own display their goals at
+the same time, in their own goals buffers, and both stay active."
+  (let ((output (coq-eglot--make-output "<2>"))
+        (second nil))
+    (unwind-protect
+        (with-test-file
+          (goto-marker "split")
+          (run #'coq-eglot-goto-point)
+          (let ((first (current-buffer)))
+            (setq second (find-file-noselect "eglot_other.v"))
+            (with-current-buffer second
+              (should coq-eglot-mode)
+              (setq coq-eglot--buffer-output output)
+              (goto-marker "proof")
+              (run #'coq-eglot-goto-point)
+              (should (position-at-marker-p "proof"))
+              (should (eq (locked-face) 'proof-locked-face))
+              (should (eq (coq-eglot--active-buffer) second)))
+            (should (string-match-p "other = 0" (buffer-text "*goals*<2>")))
+            ;; the first buffer is still active, its goals still displayed
+            (should (eq (locked-face) 'proof-locked-face))
+            (should (eq (coq-eglot--active-buffer) first))
+            (should (string-match-p "n : nat" (buffer-text "*goals*")))
+            (should-not (string-match-p "other = 0" (buffer-text "*goals*")))
+            ;; each one moves on its own
+            (run #'coq-eglot-assert-next-command)
+            (should (string-match-p "n : nat" (buffer-text "*goals*")))
+            (should (string-match-p "other = 0" (buffer-text "*goals*<2>")))
+            ;; the goals buffers know their output
+            (with-current-buffer "*goals*<2>"
+              (should (eq (coq-eglot--output) output))
+              (should (eq (coq-eglot--script-buffer) second)))
+            (with-current-buffer "*goals*"
+              (should (eq (coq-eglot--output) coq-eglot--default-output))
+              (should (eq (coq-eglot--script-buffer) first)))))
+      (when (buffer-live-p second)
+        (with-current-buffer second (set-buffer-modified-p nil))
+        (kill-buffer second))
+      (dolist (name '("*goals*<2>" "*conclusion*<2>" "*response*<2>"))
+        (when (get-buffer name) (kill-buffer name))))))
 
 (ert-deftest coq-eglot-inactive-color ()
   "Inactive buffers use the color of `proof-locked-face', grayed."
@@ -1921,11 +1963,11 @@ hybrid layout."
   "Make the goals window COLUMNS wider, print its goals again.
 Narrower if COLUMNS is negative.  Wait for the goals printed at the new
 width.  Batch mode has no redisplay to run `window-size-change-functions'."
-  (let ((width coq-eglot--displayed-width))
+  (let ((width (coq-eglot--displayed-width)))
     (with-selected-window (get-buffer-window "*goals*")
       (enlarge-window-horizontally columns))
     (coq-eglot--refresh-width)
-    (wait-until (lambda () (not (eql coq-eglot--displayed-width width))) 10)))
+    (wait-until (lambda () (not (eql (coq-eglot--displayed-width) width))) 10)))
 
 (ert-deftest coq-eglot-printing-width-goals ()
   "The goals are printed at the width of their window, and again when it
@@ -1934,17 +1976,17 @@ changes, like with `coq-auto-adapt-printing-width' in Proof General."
     (goto-marker "intros")
     (run #'coq-eglot-goto-point)
     ;; printed again once displayed
-    (wait-until (lambda () coq-eglot--displayed-width) 10)
-    (should (= coq-eglot--displayed-width
+    (wait-until (lambda () (coq-eglot--displayed-width)) 10)
+    (should (= (coq-eglot--displayed-width)
                (- (window-max-chars-per-line (get-buffer-window "*goals*"))
                   coq-eglot--hyp-indentation
                   coq-eglot--printing-width-margin)))
     (should (string-match-p "Hyp_with_long_name :\n    aaaaaaaa"
                             (buffer-text "*goals*")))
     (should (lines-fit-p "*goals*"))
-    (let ((width coq-eglot--displayed-width))
+    (let ((width (coq-eglot--displayed-width)))
       (resize-goals-window -2)
-      (should (= coq-eglot--displayed-width (- width 2)))
+      (should (= (coq-eglot--displayed-width) (- width 2)))
       (should (lines-fit-p "*goals*")))
     ;; column by column: the lines as wide as the window fit too, down
     ;; to the width of the separator line
@@ -1959,12 +2001,12 @@ changes, like with `coq-auto-adapt-printing-width' in Proof General."
       (resize-goals-window 1)
       (should (lines-fit-p "*goals*")))
     ;; the answer kept for the proof position is printed again
-    (let ((width coq-eglot--displayed-width))
+    (let ((width (coq-eglot--displayed-width)))
       (with-selected-window (get-buffer-window "*goals*")
         (enlarge-window-horizontally 4))
       (coq-eglot--goals-at-position)
-      (wait-until (lambda () (eql coq-eglot--displayed-width (+ width 4))) 10)
-      (should (= coq-eglot--displayed-width (+ width 4))))))
+      (wait-until (lambda () (eql (coq-eglot--displayed-width) (+ width 4))) 10)
+      (should (= (coq-eglot--displayed-width) (+ width 4))))))
 
 (ert-deftest coq-eglot-printing-width-split-goals ()
   "With the conclusion apart, the goals are printed at the width of the
@@ -1973,10 +2015,10 @@ narrowest of the goals and conclusion windows."
     (let ((coq-eglot-split-goals t))
       (goto-marker "intros")
       (run #'coq-eglot-goto-point)
-      (wait-until (lambda () coq-eglot--displayed-width) 10)
+      (wait-until (lambda () (coq-eglot--displayed-width)) 10)
       (should (lines-fit-p "*goals*"))
       (should (lines-fit-p "*conclusion*"))
-      (should (= coq-eglot--displayed-width
+      (should (= (coq-eglot--displayed-width)
                  (- (min (window-max-chars-per-line (get-buffer-window "*goals*"))
                          (window-max-chars-per-line
                           (get-buffer-window "*conclusion*")))
@@ -1991,7 +2033,7 @@ default width of Coq."
       (goto-marker "intros")
       (run #'coq-eglot-goto-point)
       (should (string-match-p "1 goal" (buffer-text "*goals*")))
-      (should-not coq-eglot--displayed-width)
+      (should-not (coq-eglot--displayed-width))
       (should-not (coq-eglot--goals-printing-width))
       (should-not (coq-eglot--query-printing-width)))))
 
@@ -2023,30 +2065,30 @@ in Proof General, until the goals window changes width."
   (with-width-file
     (goto-marker "intros")
     (run #'coq-eglot-goto-point)
-    (wait-until (lambda () coq-eglot--displayed-width) 10)
+    (wait-until (lambda () (coq-eglot--displayed-width)) 10)
     (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-ask-printing-width))
     (should (eq coq-ask-printing-width-function #'coq-eglot-ask-printing-width))
     (with-current-buffer "*goals*"
       (should (eq (key-binding (kbd "C-c C-a C-w")) #'coq-ask-printing-width))
       (should (eq coq-ask-printing-width-function
                   #'coq-eglot-ask-printing-width)))
-    (let ((auto coq-eglot--displayed-width))
+    (let ((auto (coq-eglot--displayed-width)))
       (unwind-protect
           (progn
             (cl-letf (((symbol-function 'read-number) (lambda (&rest _) 25)))
               (call-interactively #'coq-ask-printing-width))
-            (wait-until (lambda () (eql coq-eglot--displayed-width 25)) 10)
-            (should (eql coq-eglot--displayed-width 25))
+            (wait-until (lambda () (eql (coq-eglot--displayed-width) 25)) 10)
+            (should (eql (coq-eglot--displayed-width) 25))
             (should (string-match-p "\\b25\\b" (query #'coq-eglot-run-query
                                                       "Test Printing Width")))
             ;; the next goals too
             (run #'coq-eglot-assert-next-command)
-            (should (eql coq-eglot--displayed-width 25))
+            (should (eql (coq-eglot--displayed-width) 25))
             (run #'coq-eglot-undo-last-command)
             ;; the window changes: the width follows it again
             (resize-goals-window -2)
-            (should (= coq-eglot--displayed-width (- auto 2))))
-        (setq coq-eglot--asked-width nil)))))
+            (should (= (coq-eglot--displayed-width) (- auto 2))))
+        (setf (coq-eglot--output-asked-width coq-eglot--default-output) nil)))))
 
 (ert-deftest coq-eglot-set-flag ()
   "The printing flags of the common commands, like C-c C-a n, hold for
@@ -2396,7 +2438,7 @@ are written in the trace, the outputs in comments."
 (ert-deftest coq-eglot-format-hyp ()
   "A hypothesis is formatted like Coq does: on one line if it fits,
 otherwise the names on several lines and the type below them."
-  (let ((coq-eglot--displayed-width 21))  ; lines of 28 characters
+  (cl-letf (((coq-eglot--output-width coq-eglot--default-output) 21))  ; lines of 28 characters
     (should (equal (coq-eglot--format-hyp '(:names ["n" "m"] :ty "nat"))
                    "  n, m : nat"))
     (should (equal (coq-eglot--format-hyp
@@ -2431,7 +2473,7 @@ space Coq leaves before some line breaks: it would wrap in a line as
 wide as the window."
   (should (equal (coq-eglot--format-conclusion '(:ty "a /\\ \nb ") t)
                  "  a /\\\n  b\n"))
-  (let ((coq-eglot--displayed-width 21))
+  (cl-letf (((coq-eglot--output-width coq-eglot--default-output) 21))
     (should (equal (coq-eglot--format-hyp '(:names ["H"] :ty "a /\\ \nb"))
                    "  H :\n    a /\\\n    b"))))
 
