@@ -281,25 +281,28 @@ file, unless DIR has one, see `coq-eglot-lsp-check-load-path'."
   (let ((server (eglot-current-server)))
     (and (cl-typep server 'coq-eglot-lsp-server) server)))
 
-(defun coq-eglot-lsp-ensure-server ()
+(defun coq-eglot-lsp-ensure-server (&optional no-wait)
   "Return the Coq server of the current buffer, starting it if needed.
 Unlike `eglot-ensure', start it now, not after the current command.  If
 it is still connecting, started by another command or by Eglot, wait
 for it, at most `eglot-connect-timeout' seconds: do not start another
-one."
+one.  If NO-WAIT is non-nil, do not wait: return nil if it is not
+connected yet."
   (or (coq-eglot-lsp-current-server)
       (progn
         (unless (coq-eglot-lsp-connecting-servers)
           ;; with a prefix argument, like the one of the command that
           ;; starts the server, Eglot ignores the class of the contact:
           ;; the server would not be a `coq-eglot-lsp-server'
-          (let ((current-prefix-arg nil))
+          (let ((current-prefix-arg nil)
+                (eglot-sync-connect (and (not no-wait) eglot-sync-connect)))
             (apply #'eglot (eglot--guess-contact))))
-        ;; Eglot waits at most `eglot-sync-connect' seconds
-        (with-timeout ((or eglot-connect-timeout 30))
-          (while (and (not (coq-eglot-lsp-current-server))
-                      (coq-eglot-lsp-connecting-servers))
-            (accept-process-output nil 0.05)))
+        (unless no-wait
+          ;; Eglot waits at most `eglot-sync-connect' seconds
+          (with-timeout ((or eglot-connect-timeout 30))
+            (while (and (not (coq-eglot-lsp-current-server))
+                        (coq-eglot-lsp-connecting-servers))
+              (accept-process-output nil 0.05))))
         (coq-eglot-lsp-current-server))))
 
 (defun coq-eglot-lsp-connecting-servers ()
@@ -342,13 +345,18 @@ The new server knows nothing: it checks again on demand."
     (eglot--signal-textDocument/didChange)
     server))
 
+(defvar coq-eglot-lsp--in-request nil
+  "Non-nil while waiting for the answer to a synchronous request.
+See `coq-eglot-lsp-request'.")
+
 (defun coq-eglot-lsp-request (method params)
   "Send request METHOD with PARAMS to the server of the current buffer.
 Pending changes of the buffer are sent first.  Return the answer, or
 signal an error.  No timeout: checking may be long, \\[keyboard-quit]
 stops waiting."
-  (jsonrpc-request (coq-eglot-lsp--server-for-request) method params
-                   :timeout nil))
+  (let ((coq-eglot-lsp--in-request t))
+    (jsonrpc-request (coq-eglot-lsp--server-for-request) method params
+                     :timeout nil)))
 
 (defun coq-eglot-lsp-async-request (method params on-success on-error)
   "Send request METHOD with PARAMS to the server of the current buffer.
@@ -356,16 +364,19 @@ Pending changes of the buffer are sent first.  Return immediately the id
 of the request, for `coq-eglot-lsp-cancel'.  ON-SUCCESS is called with
 the answer, ON-ERROR with the error object, in the current buffer if
 still live.  They are called from a timer, not from the process filter,
-so that they can send synchronous requests."
+so that they can send synchronous requests.  Not while waiting for the
+answer to a synchronous request, maybe to another server: when it
+comes, `jsonrpc-request' would leave theirs, and them, unfinished."
   (let ((server (coq-eglot-lsp--server-for-request))
         (buffer (current-buffer)))
-    (cl-flet ((later (fn)
-                (lambda (arg)
-                  (run-at-time 0 nil
-                               (lambda ()
-                                 (when (buffer-live-p buffer)
-                                   (with-current-buffer buffer
-                                     (funcall fn arg))))))))
+    (cl-labels ((run (fn arg)
+                  (cond
+                   ((not (buffer-live-p buffer)))
+                   (coq-eglot-lsp--in-request
+                    (run-at-time 0.01 nil #'run fn arg))
+                   (t (with-current-buffer buffer (funcall fn arg)))))
+                (later (fn)
+                  (lambda (arg) (run-at-time 0 nil #'run fn arg))))
       ;; Internal, but `jsonrpc-async-request' does not return the id
       (car (jsonrpc--async-request-1 server method params
                                      :success-fn (later on-success)

@@ -309,7 +309,14 @@ vertical, see `coq-eglot--twin-layout-p'."
 ;; The alignment is computed again when needed, if one of the buffers
 ;; changed, and when idle after a change to update the highlighting.
 
-(defface coq-eglot-twin-changed '((t :inherit diff-changed :extend nil))
+(defface coq-eglot-twin-changed
+  ;; `diff-changed' has no attributes by default
+  '((default :inherit diff-changed :extend nil)
+    (((class color) (min-colors 88) (background light))
+     :background "#fff0c8")
+    (((class color) (min-colors 88) (background dark))
+     :background "#4a3c20")
+    (((class color)) :foreground "yellow"))
   "Face of the diverging sentences of a twin, when the other has some too.
 Not extended to the end of the line: the processed part remains visible."
   :group 'coq-eglot)
@@ -504,37 +511,56 @@ See `coq-eglot-twin--alignment'.  BUFFER defaults to the current one."
           (setq high middle))))
     (1- low)))
 
-(defun coq-eglot-twin--last-pair (pairs i)
-  "The last of PAIRS whose first index is at most I, or nil."
+(defun coq-eglot-twin--pairs-before (pairs i)
+  "Number of PAIRS whose first index is at most I."
   (let ((low 0) (high (length pairs)))
     (while (< low high)
       (let ((middle (/ (+ low high) 2)))
         (if (<= (car (aref pairs middle)) i)
             (setq low (1+ middle))
           (setq high middle))))
-    (and (> low 0) (aref pairs (1- low)))))
+    low))
 
 (defun coq-eglot-twin-position (pos &optional buffer)
   "Position in the twin of BUFFER corresponding to POS in BUFFER.
 BUFFER defaults to the current one.  In a sentence paired with one of
 the twin, the same offset in it, at most its end; at its end or after
-it, the end of the twin sentence.  In or after a diverging zone, the end of the
-last paired sentence before it, the beginning of the twin if none."
+it, the end of the twin sentence.  At the end of a diverging zone or
+after it, the end of the twin zone: both have checked their version of
+the zone.  Inside a diverging zone, or after one whose twin zone is
+empty, the end of the last paired sentence before it, the beginning of
+the twin if none."
   (with-current-buffer (or buffer (current-buffer))
     (let* ((sentences (coq-eglot-twin--sentences))
            (twin-sentences (coq-eglot-twin--sentences coq-eglot--twin))
+           (pairs (coq-eglot-twin--align))
            (i (coq-eglot-twin--last-sentence sentences pos))
-           (pair (coq-eglot-twin--last-pair (coq-eglot-twin--align) i)))
-      (if (null pair)
-          (with-current-buffer coq-eglot--twin (point-min))
+           (k (coq-eglot-twin--pairs-before pairs i))
+           (pair (and (> k 0) (aref pairs (1- k))))
+           ;; the next pair, after the end of the buffers if none
+           (next (if (< k (length pairs)) (aref pairs k)
+                   (cons (length sentences) (length twin-sentences))))
+           ;; the last sentence of the twin zone, if any
+           (last-twin (1- (cdr next)))
+           (this (and (>= i 0) (aref sentences i))))
+      (cond
+       ;; in or after a paired sentence
+       ((and pair (= (car pair) i))
         (let ((twin (aref twin-sentences (cdr pair))))
-          (let ((this (aref sentences i)))
-            (if (and (= (car pair) i)
-                     (< pos (coq-eglot-twin--sentence-end this)))
-                (min (+ (coq-eglot-twin--sentence-start twin)
-                        (- pos (coq-eglot-twin--sentence-start this)))
-                     (coq-eglot-twin--sentence-end twin))
-              (coq-eglot-twin--sentence-end twin))))))))
+          (if (< pos (coq-eglot-twin--sentence-end this))
+              (min (+ (coq-eglot-twin--sentence-start twin)
+                      (- pos (coq-eglot-twin--sentence-start this)))
+                   (coq-eglot-twin--sentence-end twin))
+            (coq-eglot-twin--sentence-end twin))))
+       ;; at the end of a diverging zone, the twin zone not empty
+       ((and this
+             (= (1+ i) (car next))
+             (>= pos (coq-eglot-twin--sentence-end this))
+             (> last-twin (if pair (cdr pair) -1)))
+        (coq-eglot-twin--sentence-end (aref twin-sentences last-twin)))
+       (pair
+        (coq-eglot-twin--sentence-end (aref twin-sentences (cdr pair))))
+       (t (with-current-buffer coq-eglot--twin (point-min)))))))
 
 (defun coq-eglot-twin--zones (&optional buffer)
   "The diverging zones of BUFFER and of its twin.
@@ -697,7 +723,8 @@ position moves, see `coq-eglot-position-hook'."
     (add-hook 'after-change-functions #'coq-eglot-twin--after-change nil t)
     (add-hook 'coq-eglot-position-hook #'coq-eglot-twin--position-changed nil t)
     (add-hook 'coq-eglot-position-hook #'coq-eglot-twin--update-blend nil t)
-    (add-hook 'coq-eglot-error-hook #'coq-eglot-twin--show-error nil t))
+    (add-hook 'coq-eglot-error-hook #'coq-eglot-twin--show-error nil t)
+    (add-hook 'coq-eglot-output-hook #'coq-eglot-twin--output-changed nil t))
   (coq-eglot-twin--highlight buffer))
 
 (defun coq-eglot-twin--stop-alignment (buffer)
@@ -708,6 +735,8 @@ position moves, see `coq-eglot-position-hook'."
       (remove-hook 'coq-eglot-position-hook #'coq-eglot-twin--position-changed t)
       (remove-hook 'coq-eglot-position-hook #'coq-eglot-twin--update-blend t)
       (remove-hook 'coq-eglot-error-hook #'coq-eglot-twin--show-error t)
+      (remove-hook 'coq-eglot-output-hook #'coq-eglot-twin--output-changed t)
+      (coq-eglot-twin--uncompare-outputs)
       (when coq-eglot-twin--follow-timer
         (cancel-timer coq-eglot-twin--follow-timer)
         (setq coq-eglot-twin--follow-timer nil))
@@ -816,7 +845,15 @@ Once for several moves, see `coq-eglot-twin--show-position'."
                  (buffer-live-p coq-eglot--twin)
                  (not (coq-eglot-twin--leader-p)))
         (condition-case err
-            (coq-eglot-twin--move (coq-eglot-twin--target))
+            (cond
+             ((coq-eglot-lsp-ensure-server t)
+              (coq-eglot-twin--move (coq-eglot-twin--target)))
+             ;; later: waiting for its server here would block the
+             ;; answers to the leader
+             ((coq-eglot-lsp-connecting-servers)
+              (setq coq-eglot-twin--follow-timer
+                    (run-at-time 0.1 nil #'coq-eglot-twin--follow buffer)))
+             (t (error "No Coq language server")))
           (error (setq coq-eglot-twin--following nil)
                  (message "Coq: %s does not follow its twin: %s"
                           (buffer-name) (error-message-string err))))))))
@@ -873,6 +910,174 @@ In its window, if any.  See `coq-eglot-twin-position'."
           (progn (select-window window) (goto-char pos))
         (pop-to-buffer twin)
         (goto-char pos)))))
+
+;;; Comparison of the goals and messages
+;;
+;; When the proof positions of the twins correspond, their goals and
+;; their messages are compared like their scripts: the lines without a
+;; match in the other twin are highlighted, and in the changed ones the
+;; words that differ.  The hypotheses are on their own lines, see
+;; `coq-eglot--format-hyps': a changed hypothesis is a changed line.
+
+(defcustom coq-eglot-twin-compare-outputs t
+  "If non-nil, highlight the differences of the goals and messages of twins.
+When their proof positions correspond, see `coq-eglot-twin-position'."
+  :type 'boolean
+  :group 'coq-eglot)
+
+(defface coq-eglot-twin-refine '((t :inherit diff-refine-changed))
+  "Face of the words that differ in the changed lines of the goals of twins."
+  :group 'coq-eglot)
+
+(defvar coq-eglot-twin--compare-timer nil
+  "Timer comparing the goals and messages of the twins, or nil.")
+
+(defvar-local coq-eglot-twin--output-overlays nil
+  "Overlays of the differences in a goals or response buffer.")
+
+(defun coq-eglot-twin--output-changed ()
+  "Compare the outputs of the twins after the current command.
+Once for several changes, see `coq-eglot-output-hook'."
+  (when (and coq-eglot-twin-compare-outputs
+             (buffer-live-p coq-eglot--twin)
+             (not coq-eglot-twin--compare-timer))
+    (setq coq-eglot-twin--compare-timer
+          (run-at-time 0 nil #'coq-eglot-twin--compare-all))))
+
+(defun coq-eglot-twin--compare-all ()
+  "Compare the outputs of all the twins."
+  (setq coq-eglot-twin--compare-timer nil)
+  (dolist (buffer (buffer-list))
+    (when (and (buffer-live-p (buffer-local-value 'coq-eglot--twin buffer))
+               (buffer-local-value 'coq-eglot--buffer-output buffer))
+      ;; once per pair: from the one with an output of its own
+      (coq-eglot-twin--compare-outputs buffer))))
+
+(defun coq-eglot-twin--output-buffers ()
+  "The goals and response buffers of the current script buffer."
+  (mapcar (lambda (name) (and name (get-buffer name)))
+          (list (coq-eglot--goals-name)
+                (and coq-eglot-split-goals (coq-eglot--conclusion-name))
+                (coq-eglot--response-name))))
+
+(defun coq-eglot-twin--corresponding-p (buffer)
+  "Non-nil if the proof positions of BUFFER and its twin correspond.
+And none is checking."
+  (with-current-buffer buffer
+    (let ((twin coq-eglot--twin))
+      (and (not coq-eglot--running)
+           (not (buffer-local-value 'coq-eglot--running twin))
+           (let ((this-pos (coq-eglot-position))
+                 (twin-pos (with-current-buffer twin (coq-eglot-position))))
+             (or (= (coq-eglot-twin-position this-pos) twin-pos)
+                 (= (coq-eglot-twin-position twin-pos twin) this-pos)))))))
+
+(defun coq-eglot-twin--uncompare (buffer)
+  "Remove the highlighting of the differences in output BUFFER, if live."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (mapc #'delete-overlay coq-eglot-twin--output-overlays)
+      (setq coq-eglot-twin--output-overlays nil))))
+
+(defun coq-eglot-twin--uncompare-outputs ()
+  "Remove the highlighting of the differences of the outputs of the buffer."
+  (mapc #'coq-eglot-twin--uncompare (coq-eglot-twin--output-buffers)))
+
+(defun coq-eglot-twin--compare-outputs (buffer)
+  "Compare the goals and messages of BUFFER and of its twin.
+If their proof positions do not correspond, only remove the highlighting."
+  (let* ((twin (buffer-local-value 'coq-eglot--twin buffer))
+         (outputs (with-current-buffer buffer (coq-eglot-twin--output-buffers)))
+         (twin-outputs (with-current-buffer twin (coq-eglot-twin--output-buffers)))
+         (compare (and coq-eglot-twin-compare-outputs
+                       (coq-eglot-twin--corresponding-p buffer))))
+    (cl-mapc (lambda (output twin-output)
+               (coq-eglot-twin--uncompare output)
+               (coq-eglot-twin--uncompare twin-output)
+               (when (and compare (buffer-live-p output)
+                          (buffer-live-p twin-output))
+                 (coq-eglot-twin--compare-buffers output twin-output)))
+             outputs twin-outputs)))
+
+(defun coq-eglot-twin--pieces (buffer regexp &optional start end)
+  "Vector of the matches of REGEXP in BUFFER, between START and END.
+Each one (START END . TEXT)."
+  (with-current-buffer buffer
+    (save-excursion
+      (goto-char (or start (point-min)))
+      (let ((pieces nil))
+        (while (re-search-forward regexp (or end (point-max)) t)
+          (push (cons (match-beginning 0)
+                      (cons (match-end 0) (match-string-no-properties 0)))
+                pieces))
+        (vconcat (nreverse pieces))))))
+
+(defun coq-eglot-twin--unmatched (a b)
+  "The runs of the pieces of A and B without match in the other one.
+A list of (RANGE-A . RANGE-B), each (FIRST . END), END excluded, or nil
+if the run is empty on this side.  A and B are vectors of pieces, see
+`coq-eglot-twin--pieces'."
+  (let ((pairs (coq-eglot-twin--common-subsequence
+                (cl-map 'vector #'cddr a) (cl-map 'vector #'cddr b)))
+        (runs nil) (i 0) (j 0))
+    (dolist (pair (append pairs (list (cons (length a) (length b)))))
+      (when (or (< i (car pair)) (< j (cdr pair)))
+        (push (cons (and (< i (car pair)) (cons i (car pair)))
+                    (and (< j (cdr pair)) (cons j (cdr pair))))
+              runs))
+      (setq i (1+ (car pair)) j (1+ (cdr pair))))
+    (nreverse runs)))
+
+(defun coq-eglot-twin--mark (buffer pieces range face priority)
+  "Highlight the PIECES of BUFFER in RANGE with FACE, at PRIORITY.
+Line by line.  Return the bounds (START . END) of the range."
+  (with-current-buffer buffer
+    (let ((i (car range)))
+      (while (< i (cdr range))
+        (let ((start (car (aref pieces i)))
+              (end (cadr (aref pieces i))))
+          ;; the next pieces on the same line
+          (while (and (< (1+ i) (cdr range))
+                      (not (string-search
+                            "\n" (buffer-substring-no-properties
+                                   end (car (aref pieces (1+ i)))))))
+            (setq i (1+ i) end (cadr (aref pieces i))))
+          (let ((overlay (make-overlay start end nil nil nil)))
+            (overlay-put overlay 'face face)
+            (overlay-put overlay 'priority priority)
+            (overlay-put overlay 'coq-eglot-twin t)
+            (push overlay coq-eglot-twin--output-overlays))
+          (setq i (1+ i))))))
+  (cons (car (aref pieces (car range)))
+        (cadr (aref pieces (1- (cdr range))))))
+
+(defun coq-eglot-twin--compare-buffers (a b)
+  "Highlight the lines of buffers A and B without match in the other one.
+In the changed lines, the words that differ."
+  (let ((lines-a (coq-eglot-twin--pieces a "^.+$"))
+        (lines-b (coq-eglot-twin--pieces b "^.+$"))
+        (word "\\(?:\\w\\|\\s_\\)+\\|[^ \t\n]"))
+    (pcase-dolist (`(,range-a . ,range-b)
+                   (coq-eglot-twin--unmatched lines-a lines-b))
+      (let ((face (if (and range-a range-b) 'coq-eglot-twin-changed
+                    'coq-eglot-twin-added))
+            (bounds-a nil) (bounds-b nil))
+        (when range-a
+          (setq bounds-a (coq-eglot-twin--mark a lines-a range-a face 10)))
+        (when range-b
+          (setq bounds-b (coq-eglot-twin--mark b lines-b range-b face 10)))
+        (when (and bounds-a bounds-b)
+          (let ((words-a (coq-eglot-twin--pieces a word (car bounds-a)
+                                                 (cdr bounds-a)))
+                (words-b (coq-eglot-twin--pieces b word (car bounds-b)
+                                                 (cdr bounds-b))))
+            (pcase-dolist (`(,run-a . ,run-b)
+                           (coq-eglot-twin--unmatched words-a words-b))
+              (when run-a
+                (coq-eglot-twin--mark a words-a run-a 'coq-eglot-twin-refine 11))
+              (when run-b
+                (coq-eglot-twin--mark b words-b run-b
+                                      'coq-eglot-twin-refine 11)))))))))
 
 (provide 'coq-eglot-twin)
 

@@ -1306,9 +1306,13 @@ Return the empty string if GOALS is nil (outside of proofs)."
   (mapconcat (lambda (m) (if (stringp m) m (plist-get m :text)))
              messages "\n"))
 
+(defvar coq-eglot-output-hook nil
+  "Hook run in a script buffer when it displayed its goals or messages.
+See `coq-eglot--show-goals' and `coq-eglot--show-response'.")
+
 (defun coq-eglot--show-goals (answer)
   "Display the goals of ANSWER of the server.
-See `coq-eglot-split-goals'."
+See `coq-eglot-split-goals'.  Run `coq-eglot-output-hook'."
   (let* ((output (coq-eglot--output))
          (goals (plist-get answer :goals))
          (new (not (equal goals (coq-eglot--output-goals output)))))
@@ -1333,7 +1337,8 @@ See `coq-eglot-split-goals'."
     (coq-hyps-decorate new)
     (coq-eglot--scroll-goals)
     ;; the windows may have been created or resized meanwhile
-    (coq-eglot--schedule-width-refresh)))
+    (coq-eglot--schedule-width-refresh)
+    (run-hooks 'coq-eglot-output-hook)))
 
 (defun coq-eglot--goals-buffer ()
   "The goals buffer holding the goals after the first one, or nil.
@@ -1415,9 +1420,11 @@ See `coq-eglot-split-goals'."
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
 
 (defun coq-eglot--show-response (text)
-  "Display TEXT in the response buffer."
+  "Display TEXT in the response buffer.
+Run `coq-eglot-output-hook'."
   (coq-eglot--set-buffer-text (coq-eglot--response-name)
-                              #'coq-eglot-response-mode text))
+                              #'coq-eglot-response-mode text)
+  (run-hooks 'coq-eglot-output-hook))
 
 (defun coq-eglot--show-answer (answer)
   "Display the goals and the messages of ANSWER of the server."

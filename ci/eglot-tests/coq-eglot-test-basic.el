@@ -1672,6 +1672,37 @@ Check l."
       (delete-region (line-beginning-position) (point)))
     (should (equal (coq-eglot-twin--zones) '(((2 . 3)))))))
 
+(ert-deftest coq-eglot-twin-zone-end ()
+  "At the end of a diverging zone, the end of the twin zone: both have
+checked their version.  Inside, the end of the last paired sentence."
+  (with-twin-texts "Check 1. Check 2. Check 3." "Check 1. Check 20. Check 3."
+    (should (= (coq-eglot-twin-position (search-position "Check 2."))
+               (search-position "Check 20." twin)))
+    (should (= (coq-eglot-twin-position (search-position "Check 20." twin) twin)
+               (search-position "Check 2.")))
+    ;; after it, before the next sentence
+    (should (= (coq-eglot-twin-position (1+ (search-position "Check 2.")))
+               (search-position "Check 20." twin)))
+    ;; inside
+    (should (= (coq-eglot-twin-position (search-position "Check 2"))
+               (search-position "Check 1." twin))))
+  ;; at the beginning of the buffers
+  (with-twin-texts "Check 0. Check 1." "Check 5. Check 6. Check 1."
+    (should (= (coq-eglot-twin-position (search-position "Check 0."))
+               (search-position "Check 6." twin)))
+    (should (= (coq-eglot-twin-position (search-position "Check 5." twin) twin)
+               (point-min)))
+    (should (= (coq-eglot-twin-position (search-position "Check 6." twin) twin)
+               (search-position "Check 0."))))
+  ;; the twin zone is empty: the end of the last paired sentence
+  (with-twin-texts "Check 1. Check 2. Check 3." "Check 1. Check 3."
+    (should (= (coq-eglot-twin-position (search-position "Check 2."))
+               (search-position "Check 1." twin))))
+  ;; at the end of the buffers
+  (with-twin-texts "Check 1. Check 2." "Check 1. Check 20."
+    (should (= (coq-eglot-twin-position (search-position "Check 2."))
+               (search-position "Check 20." twin)))))
+
 (ert-deftest coq-eglot-twin-highlight ()
   "The diverging sentences of both twins are highlighted, contiguous
 ones together, and updated when idle after a change."
@@ -1840,7 +1871,8 @@ In two directories, so two servers.  The twin is bound to `twin'."
                       (with-current-buffer buffer
                         (or coq-eglot--running coq-eglot-twin--follow-timer
                             coq-eglot-twin--following
-                            coq-eglot-twin--show-timer)))
+                            coq-eglot-twin--show-timer
+                            coq-eglot-twin--compare-timer)))
                     (list (current-buffer) coq-eglot--twin))
       (accept-process-output nil 0.02))))
 
@@ -1894,6 +1926,80 @@ diverging zone.  The leader is the last one with a command."
       (run-hooks 'post-command-hook))
     (wait-for-twins)
     (should (position-at-marker-p "l2 proof"))))
+
+(defun twin-differences (buffer)
+  "The texts highlighted as differences in BUFFER, with their faces."
+  (with-current-buffer buffer
+    (mapcar (lambda (overlay)
+              (cons (buffer-substring-no-properties (overlay-start overlay)
+                                                    (overlay-end overlay))
+                    (overlay-get overlay 'face)))
+            (sort (copy-sequence coq-eglot-twin--output-overlays)
+                  (lambda (o1 o2)
+                    (or (< (overlay-start o1) (overlay-start o2))
+                        (and (= (overlay-start o1) (overlay-start o2))
+                             (< (overlay-priority-value o1)
+                                (overlay-priority-value o2)))))))))
+
+(defun overlay-priority-value (overlay)
+  "The priority of OVERLAY, a number."
+  (or (overlay-get overlay 'priority) 0))
+
+(ert-deftest coq-eglot-twin-compare-buffers ()
+  "The lines without a match in the other buffer are highlighted, and
+in the changed ones the words that differ."
+  (let ((a (generate-new-buffer "a"))
+        (b (generate-new-buffer "b")))
+    (unwind-protect
+        (progn
+          (with-current-buffer a
+            (insert "1 goal\n\n  n : nat\n  H : n = 0\n  ============================\n  n + 0 = n\n"))
+          (with-current-buffer b
+            (insert "1 goal\n\n  n : nat\n  H : n = 1\n  H2 : True\n  ============================\n  n + 0 = n\n"))
+          (coq-eglot-twin--compare-buffers a b)
+          (should (equal (twin-differences a)
+                         '(("  H : n = 0" . coq-eglot-twin-changed)
+                           ("0" . coq-eglot-twin-refine))))
+          (should (equal (twin-differences b)
+                         '(("  H : n = 1" . coq-eglot-twin-changed)
+                           ("1" . coq-eglot-twin-refine)
+                           ;; line by line
+                           ("  H2 : True" . coq-eglot-twin-changed)
+                           ("H2 : True" . coq-eglot-twin-refine))))
+          (coq-eglot-twin--uncompare a)
+          (should-not (twin-differences a)))
+      (kill-buffer a)
+      (kill-buffer b))))
+
+(ert-deftest coq-eglot-twin-compare-goals ()
+  "At corresponding positions, the differences of the goals of the
+twins are highlighted; not while they are at other positions."
+  (with-sync-twins (string-replace "1 = 1" "2 = 2" sync-twin-text)
+    (goto-marker "l2 proof")
+    (run #'coq-eglot-goto-point)
+    (wait-for-twins)
+    (let ((goals (get-buffer (coq-eglot--goals-name)))
+          (twin-goals (with-current-buffer twin
+                        (get-buffer (coq-eglot--goals-name)))))
+      ;; the goals come after the check
+      (should (wait-until (lambda ()
+                            (and (with-current-buffer goals
+                                   (string-search "1 = 1" (buffer-string)))
+                                 (with-current-buffer twin-goals
+                                   (string-search "2 = 2" (buffer-string)))))
+                          10))
+      (wait-for-twins)
+      (should (member '("1" . coq-eglot-twin-refine) (twin-differences goals)))
+      (should (member '("2" . coq-eglot-twin-refine)
+                      (twin-differences twin-goals)))
+      ;; the same hypotheses and number of goals: not highlighted
+      (should-not (assoc "1 goal" (twin-differences goals)))
+      ;; not compared when the positions do not correspond
+      (let ((coq-eglot-twin-synchronize nil))
+        (run #'coq-eglot-retract-buffer)
+        (wait-for-twins)
+        (should-not (twin-differences goals))
+        (should-not (twin-differences twin-goals))))))
 
 (ert-deftest coq-eglot-twin-synchronize-error ()
   "An error of the follower stops it, not the leader; off, the
