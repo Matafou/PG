@@ -248,6 +248,19 @@ For timers and callbacks, which may run in any buffer."
   "Non-nil if the current buffer is the active script buffer of its output."
   (eq (current-buffer) (coq-eglot--active-buffer)))
 
+(defvar-local coq-eglot--twin nil
+  "The twin of the current script buffer, or nil.
+See `coq-eglot-twin-pair'.")
+(put 'coq-eglot--twin 'permanent-local t)
+
+(defun coq-eglot--twin-layout-p ()
+  "Non-nil if the active script buffer of the current output has a twin.
+Then its goals and messages have windows of their own below it, see
+`coq-eglot-twin-layout'."
+  (let ((active (coq-eglot--active-buffer)))
+    (and (buffer-live-p active)
+         (buffer-live-p (buffer-local-value 'coq-eglot--twin active)))))
+
 (defun coq-eglot--activate ()
   "Make the current buffer the active script buffer.
 Gray the processed part of the previous one, display the goals of the
@@ -452,9 +465,15 @@ active script buffer."
 (defun coq-eglot--three-windows-p ()
   "Non-nil if the goals and the messages have windows of their own.
 Like in Proof General: if `proof-three-window-enable' is non-nil and the
-frame is high enough."
-  (and proof-three-window-enable
+frame is high enough.  Always for twins, see `coq-eglot--twin-layout-p'."
+  (and (or proof-three-window-enable (coq-eglot--twin-layout-p))
        (> (frame-height) (* 4 window-min-height))))
+
+(defun coq-eglot--multiple-frames-p ()
+  "Non-nil if the goals and the messages have frames of their own.
+See `proof-multiple-frames-enable'.  Never for twins: they are side by
+side in one frame, see `coq-eglot-twin-layout'."
+  (and proof-multiple-frames-enable (not (coq-eglot--twin-layout-p))))
 
 (defun coq-eglot--main-window ()
   "The window of the script, next to which the output windows go."
@@ -477,8 +496,11 @@ The windows missing are created like in Proof General, see
 `proof-three-window-mode-policy': below the script (vertical), on its
 right (hybrid) or in three columns (horizontal).  With the conclusion
 apart, its window is below the goals window."
-  (let* ((policy (proof-guess-3win-display-policy
-                  proof-three-window-mode-policy))
+  (let* ((policy (if (coq-eglot--twin-layout-p)
+                     ;; below each twin
+                     'vertical
+                   (proof-guess-3win-display-policy
+                    proof-three-window-mode-policy)))
          (columns (eq policy 'horizontal))
          (goals (coq-eglot--output-buffer (coq-eglot--goals-name)
                                           #'coq-eglot-goals-mode))
@@ -582,7 +604,7 @@ See `proof-three-window-enable', `proof-three-window-mode-policy' and
 `display-buffer' choose."
   (let ((buffer (coq-eglot--output-buffer name mode)))
     (cond
-     (proof-multiple-frames-enable
+     ((coq-eglot--multiple-frames-p)
       (unless (get-buffer-window buffer t)
         (coq-eglot--display-in-frame buffer)))
      ((not (get-buffer-window buffer))
@@ -607,11 +629,11 @@ frames are deleted."
         (when (and (coq-eglot--output-window-p window)
                    (not (frame-root-window-p window)))
           (delete-window window)))
-      (unless proof-multiple-frames-enable
+      (unless (coq-eglot--multiple-frames-p)
         (mapc #'delete-frame (coq-eglot--frames)))
       (coq-eglot--display-buffer (coq-eglot--goals-name)
                                  #'coq-eglot-goals-mode)
-      (when (or proof-multiple-frames-enable (coq-eglot--three-windows-p))
+      (when (or (coq-eglot--multiple-frames-p) (coq-eglot--three-windows-p))
         (coq-eglot--display-buffer (coq-eglot--response-name)
                                    #'coq-eglot-response-mode))
       (when coq-eglot-split-goals
@@ -677,7 +699,7 @@ messages."
                               ;; also in their frames, see
                               ;; `proof-multiple-frames-enable'
                               (window-list-1 nil 'no-minibuffer
-                                             (and proof-multiple-frames-enable
+                                             (and (coq-eglot--multiple-frames-p)
                                                   t)))))
         (if (not window)
             (display-buffer buffer)
@@ -720,11 +742,11 @@ in Proof General, the buffer is displayed only if
 empty if `proof-delete-empty-windows'."
   (let* ((empty (string-empty-p text))
          (delete-empty (and proof-delete-empty-windows
-                            (not proof-multiple-frames-enable)))
+                            (not (coq-eglot--multiple-frames-p))))
          (delete (and empty delete-empty))
          (display (and proof-auto-raise-buffers
                        (not delete)
-                       (or proof-multiple-frames-enable
+                       (or (coq-eglot--multiple-frames-p)
                            (coq-eglot--three-windows-p)
                            (not (equal name (coq-eglot--response-name)))
                            (not empty)))))
@@ -784,7 +806,7 @@ heights in the same order, or nil if TOTAL is too small."
 See `coq-optimise-resp-windows-enable' and `proof-shrink-windows-tofit'.
 Not with `proof-multiple-frames-enable'."
   (when (and (or coq-optimise-resp-windows-enable proof-shrink-windows-tofit)
-             (not proof-multiple-frames-enable))
+             (not (coq-eglot--multiple-frames-p)))
     (coq-eglot-resize-windows-by-priority)))
 
 (defun coq-eglot-resize-windows-by-priority ()
@@ -2287,7 +2309,16 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
     "---"
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
-    ["Exit Server" coq-eglot-exit])
+    ["Exit Server" coq-eglot-exit]
+    "---"
+    ("Two Rocq"
+     ["Pair With..." coq-eglot-twin-pair
+      :active (not coq-eglot--twin)
+      :help "Check another script buffer side by side, a twin"]
+     ["Layout Side by Side" coq-eglot-twin-layout
+      :active coq-eglot--twin]
+     ["Unpair" coq-eglot-twin-unpair
+      :active coq-eglot--twin]))
   "Menu of the Eglot backend of Coq, see `easy-menu-define'.")
 
 (easy-menu-define coq-eglot-menu coq-eglot-mode-map
@@ -2392,6 +2423,10 @@ Warn if processed Require sentences load outdated libraries."
   "Set up the current `coq-mode' buffer for the Eglot backend."
   (coq-eglot-mode 1)
   (eglot-ensure))
+
+(autoload 'coq-eglot-twin-pair "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-unpair "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-layout "coq-eglot-twin" nil t)
 
 (provide 'coq-eglot)
 

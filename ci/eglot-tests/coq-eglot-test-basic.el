@@ -22,6 +22,7 @@
 (require 'coq-mode)
 (add-to-list 'load-path coq-eglot-directory)
 (require 'coq-eglot)
+(require 'coq-eglot-twin)
 
 (when (getenv "COQ_LSP")
   (setq coq-eglot-server-program (list (getenv "COQ_LSP"))))
@@ -1311,6 +1312,113 @@ the same time, in their own goals buffers, and both stay active."
         (kill-buffer second))
       (dolist (name '("*goals*<2>" "*conclusion*<2>" "*response*<2>"))
         (when (get-buffer name) (kill-buffer name))))))
+
+(defmacro with-twin (&rest body)
+  "Run BODY in eglot_test.v paired with eglot_other.v, its twin.
+In a frame showing only them, three windows mode off: the twins force
+it.  Unpair and kill eglot_other.v afterwards."
+  (declare (indent 0) (debug t))
+  `(let ((proof-three-window-enable nil)
+         (twin nil))
+     (with-test-file
+       (unwind-protect
+           (progn
+             (switch-to-buffer (current-buffer))
+             (delete-other-windows)
+             (setq twin (find-file-noselect "eglot_other.v"))
+             (with-current-buffer twin
+               (should coq-eglot-mode)
+               (coq-eglot-retract-buffer))
+             (coq-eglot-twin-pair twin)
+             ,@body)
+         (when (buffer-live-p twin)
+           (with-current-buffer twin (set-buffer-modified-p nil))
+           (kill-buffer twin))
+         (delete-other-windows)))))
+
+(ert-deftest coq-eglot-twin-layout ()
+  "Paired, the twins are side by side, each above its goals and messages,
+both active: each one displays in its own goals and response buffers."
+  (with-twin
+    (let ((this (current-buffer)))
+      (should (eq coq-eglot--twin twin))
+      (should (eq (buffer-local-value 'coq-eglot--twin twin) this))
+      (should (equal (coq-eglot--output-suffix
+                      (buffer-local-value 'coq-eglot--buffer-output twin))
+                     "<eglot_other.v>"))
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (with-current-buffer twin
+        (goto-marker "proof")
+        (run #'coq-eglot-goto-point))
+      (should (string-match-p "n : nat" (buffer-text "*goals*")))
+      (should (string-match-p "other = 0"
+                              (buffer-text "*goals*<eglot_other.v>")))
+      (should (eq (locked-face) 'proof-locked-face))
+      (with-current-buffer twin
+        (should (eq (locked-face) 'proof-locked-face)))
+      (pcase-let ((`(,script ,goals ,response ,twin-script ,twin-goals
+                             ,twin-response)
+                   (windows-of this "*goals*" "*response*" twin
+                               "*goals*<eglot_other.v>"
+                               "*response*<eglot_other.v>")))
+        ;; two columns
+        (should (= (window-left-column script) (window-left-column goals)
+                   (window-left-column response) 0))
+        (should (> (window-left-column twin-script) 0))
+        (should (= (window-left-column twin-script)
+                   (window-left-column twin-goals)
+                   (window-left-column twin-response)))
+        ;; each script above its goals above its messages
+        (should (< (window-top-line script) (window-top-line goals)
+                   (window-top-line response)))
+        (should (< (window-top-line twin-script) (window-top-line twin-goals)
+                   (window-top-line twin-response)))
+        (should (= (length (window-list nil 'no-minibuffer)) 6)))
+      ;; a step in one twin does not change what the other displays
+      (with-current-buffer twin
+        (run #'coq-eglot-assert-next-command))
+      (should (string-match-p "n : nat" (buffer-text "*goals*")))
+      ;; the layout again, from the goals of the twin
+      (delete-other-windows)
+      (with-current-buffer "*goals*<eglot_other.v>"
+        (coq-eglot-twin-layout))
+      (should (= (length (window-list nil 'no-minibuffer)) 6))
+      (should (eq (window-buffer (window-at 0 0)) twin)))))
+
+(ert-deftest coq-eglot-twin-unpair ()
+  "Unpaired, the twin goes back to the shared output: its goals and
+response buffers are killed.  Killing a twin unpairs."
+  (with-twin
+    (let ((this (current-buffer)))
+      (with-current-buffer twin
+        (goto-marker "proof")
+        (run #'coq-eglot-goto-point))
+      (should (get-buffer "*goals*<eglot_other.v>"))
+      (coq-eglot-twin-unpair)
+      (should-not coq-eglot--twin)
+      (should-not (buffer-local-value 'coq-eglot--twin twin))
+      (should-not (buffer-local-value 'coq-eglot--buffer-output twin))
+      (should-not (get-buffer "*goals*<eglot_other.v>"))
+      (should-not (get-buffer "*response*<eglot_other.v>"))
+      ;; they share an output again: one of them is active
+      (should (eq (coq-eglot--active-buffer) this))
+      (with-current-buffer twin
+        (should (eq (locked-face) 'coq-eglot-inactive-locked-face)))
+      (should-error (coq-eglot-twin-unpair) :type 'user-error)
+      ;; paired again, then the twin is killed
+      (coq-eglot-twin-pair twin)
+      (should (eq coq-eglot--twin twin))
+      (with-current-buffer twin (set-buffer-modified-p nil))
+      (kill-buffer twin)
+      (should-not coq-eglot--twin)
+      (should-not (get-buffer "*goals*<eglot_other.v>")))))
+
+(ert-deftest coq-eglot-twin-pair-errors ()
+  "A buffer has at most one twin, and it is not itself."
+  (with-twin
+    (should-error (coq-eglot-twin-pair (current-buffer)) :type 'user-error)
+    (should-error (coq-eglot-twin-pair twin) :type 'user-error)))
 
 (ert-deftest coq-eglot-inactive-color ()
   "Inactive buffers use the color of `proof-locked-face', grayed."
