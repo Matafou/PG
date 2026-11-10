@@ -601,6 +601,15 @@ zone is empty on this side.  BUFFER defaults to the current one."
 (defvar-local coq-eglot-twin--overlays nil
   "Overlays of the diverging sentences of the buffer.")
 
+(defvar-local coq-eglot-twin--blend-colors nil
+  "Alist of the blended colors, ((FACE . PART-FACE) . COLOR-OR-NONE).
+Emptied when the twins are highlighted again, see
+`coq-eglot-twin--update-blend'.")
+
+(defvar-local coq-eglot-twin--blend-state nil
+  "The parts the differences were blended with, see `coq-eglot-twin--update-blend'.
+A list of (START END FACE), or nil to blend them all again.")
+
 (defvar coq-eglot-twin--timer nil
   "Idle timer updating the highlighting of the twins, or nil.")
 
@@ -699,6 +708,12 @@ BUFFER defaults to the current one."
           (coq-eglot-twin--highlight-zones
            (mapcar (lambda (zone) (cons (cdr zone) (car zone))) zones)))
         (coq-eglot-twin--refine-zones zones (current-buffer) twin)
+        ;; the colors of the theme may have changed
+        (setq coq-eglot-twin--blend-colors nil
+              coq-eglot-twin--blend-state nil)
+        (with-current-buffer twin
+          (setq coq-eglot-twin--blend-colors nil
+                coq-eglot-twin--blend-state nil))
         (coq-eglot-twin--update-blend)
         (with-current-buffer twin (coq-eglot-twin--update-blend))))))
 
@@ -726,41 +741,81 @@ the property `face'."
                                 (color-name-to-rgb color2))
                      '(2))))))
 
+(defun coq-eglot-twin--blend-spec (overlay parts)
+  "Where and how OVERLAY of a difference is blended with PARTS.
+A list of (START END COLOR), see `coq-eglot-twin--update-blend'."
+  (delq nil
+        (mapcar
+         (lambda (part)
+           (let ((start (max (overlay-start overlay) (overlay-start part)))
+                 (end (min (overlay-end overlay) (overlay-end part))))
+             (when (< start end)
+               (let* ((key (cons (overlay-get overlay 'face)
+                                 (overlay-get part 'face)))
+                      (color (with-memoization
+                                 (alist-get key coq-eglot-twin--blend-colors
+                                            nil nil #'equal)
+                               (or (coq-eglot-twin--blend (car key) (cdr key))
+                                   'none))))
+                 (and (stringp color) (list start end color))))))
+         parts)))
+
 (defun coq-eglot-twin--update-blend ()
   "Blend the diverging zones with the processed and checked parts.
 Where they overlap, the background of a zone is the mean of its own and
 of the one of the part, so that both are visible.  Run when the proof
-position moves, see `coq-eglot-position-hook'."
-  (let ((parts (seq-filter
-                (lambda (overlay)
-                  (and (overlayp overlay) (overlay-buffer overlay)
-                       (< (overlay-start overlay) (overlay-end overlay))))
-                (list coq-eglot--locked-overlay coq-eglot--queue-overlay)))
-        (colors nil))
-    (dolist (overlay coq-eglot-twin--overlays)
-      (mapc #'delete-overlay (overlay-get overlay 'coq-eglot-twin-blend))
-      (overlay-put
-       overlay 'coq-eglot-twin-blend
-       (delq nil
-             (mapcar
-              (lambda (part)
-                (let* ((start (max (overlay-start overlay) (overlay-start part)))
-                       (end (min (overlay-end overlay) (overlay-end part)))
-                       (key (cons (overlay-get overlay 'face)
-                                  (overlay-get part 'face)))
-                       (color (and (< start end)
-                                   (with-memoization
-                                       (alist-get key colors nil nil #'equal)
-                                     (or (coq-eglot-twin--blend (car key) (cdr key))
-                                         'none)))))
-                  (when (stringp color)
-                    (let ((blend (make-overlay start end nil nil nil)))
-                      (overlay-put blend 'face (list :background color))
-                      ;; right above the overlay
-                      (overlay-put blend 'priority
-                                   (1+ (overlay-get overlay 'priority)))
-                      blend))))
-              parts))))))
+position moves, see `coq-eglot-position-hook': only the differences
+around the bounds that moved are blended again."
+  (let* ((parts (seq-filter
+                 (lambda (overlay)
+                   (and (overlayp overlay) (overlay-buffer overlay)
+                        (< (overlay-start overlay) (overlay-end overlay))))
+                 (list coq-eglot--locked-overlay coq-eglot--queue-overlay)))
+         (state (mapcar (lambda (part)
+                          (list (overlay-start part) (overlay-end part)
+                                (overlay-get part 'face)))
+                        parts))
+         (old coq-eglot-twin--blend-state)
+         (overlays
+          (if (or (null old) (not (equal (mapcar #'caddr old)
+                                         (mapcar #'caddr state))))
+              coq-eglot-twin--overlays
+            ;; the same faces: only around the bounds that moved
+            (let ((old-bounds (sort (flatten-tree
+                                     (mapcar (lambda (s) (list (car s) (cadr s))) old))
+                                    #'<))
+                  (new-bounds (sort (flatten-tree
+                                     (mapcar (lambda (s) (list (car s) (cadr s))) state))
+                                    #'<)))
+              (if (/= (length old-bounds) (length new-bounds))
+                  coq-eglot-twin--overlays
+                (delete-dups
+                 (seq-filter
+                  (lambda (overlay)
+                    (or (overlay-get overlay 'coq-eglot-twin)
+                        (overlay-get overlay 'coq-eglot-twin-refine)))
+                  (apply #'append
+                         (cl-mapcar (lambda (o n)
+                                      (unless (= o n)
+                                        (overlays-in (min o n) (max o n))))
+                                    old-bounds new-bounds)))))))))
+    (setq coq-eglot-twin--blend-state state)
+    (dolist (overlay overlays)
+      (let ((spec (coq-eglot-twin--blend-spec overlay parts)))
+        (unless (equal spec (overlay-get overlay 'coq-eglot-twin-blend-spec))
+          (mapc #'delete-overlay (overlay-get overlay 'coq-eglot-twin-blend))
+          (overlay-put overlay 'coq-eglot-twin-blend-spec spec)
+          (overlay-put
+           overlay 'coq-eglot-twin-blend
+           (mapcar (lambda (blend-spec)
+                     (pcase-let ((`(,start ,end ,color) blend-spec))
+                       (let ((blend (make-overlay start end nil nil nil)))
+                         (overlay-put blend 'face (list :background color))
+                         ;; right above the overlay
+                         (overlay-put blend 'priority
+                                      (1+ (overlay-get overlay 'priority)))
+                         blend)))
+                   spec)))))))
 
 (defun coq-eglot-twin--idle-update ()
   "Update the highlighting of the twins that changed."
