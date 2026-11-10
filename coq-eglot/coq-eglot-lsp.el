@@ -191,7 +191,9 @@ when Eglot starts managing the buffer."
   (let ((server (and (bound-and-true-p eglot--managed-mode)
                      (eglot-current-server))))
     (when (cl-typep server 'coq-eglot-lsp-server)
-      (let ((args (ignore-errors (coq-eglot-lsp-load-path-args))))
+      (let ((args (append (coq-eglot-lsp--root-load-path-args
+                           (project-root (eglot--project server)))
+                          (ignore-errors (coq-eglot-lsp-load-path-args)))))
         (unless (equal args (coq-eglot-lsp--server-load-path-args server))
           (display-warning
            'coq-eglot
@@ -209,14 +211,31 @@ command starts it with the load path of %s."
            (format "coq-use-project-file is nil, but the language server \
 reads the project file of %s anyway." root)))))))
 
-(defun coq-eglot-lsp--contact (&optional _interactive)
+(defun coq-eglot-lsp--root-load-path-args (root)
+  "Option -Q of ROOT, the root of the server, if it has no project file.
+Like coqtop, which binds its current directory to the empty logical
+path, so that a file can require the files next to it: coq-lsp binds
+nothing without a project file.  The -Q of coq-lsp is recursive."
+  (unless (seq-some (lambda (name) (file-exists-p (expand-file-name name root)))
+                    '("_CoqProject" "_RocqProject"))
+    (list "-Q" (concat (directory-file-name (expand-file-name root)) ","))))
+
+(defun coq-eglot-lsp--contact (&optional _interactive project)
   "Eglot contact for Coq: our server class and its command line.
 With the load path of the current buffer, see
 `coq-eglot-lsp-load-path-args': coq-lsp adds it to the one of the
-project file it finds in its root directory, if any."
-  (let ((command (coq-eglot-lsp-server-command)))
+project file it finds in its root directory, if any.  Without a project
+file, the root directory of PROJECT is bound to the empty logical path,
+see `coq-eglot-lsp--root-load-path-args'."
+  (let* ((command (coq-eglot-lsp-server-command))
+         (root (if project (project-root project) default-directory))
+         (root-args (coq-eglot-lsp--root-load-path-args root)))
+    (when root-args
+      (message "Coq: no project file found in %s, assuming -Q . \"\""
+               (abbreviate-file-name root)))
     (cons 'coq-eglot-lsp-server
           (append command
+                  root-args
                   (coq-eglot-lsp-load-path-args)
                   (when coq-eglot-server-idle-delay
                     (list (format "--idle-delay=%s"

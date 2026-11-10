@@ -1929,6 +1929,38 @@ libraries loaded by the previous tests."
                    (file-name-directory
                     (executable-find (car (coq-eglot-lsp-server-command))))))))
 
+(ert-deftest coq-eglot-compile-no-project-file ()
+  "Without project file, a file requires the files next to it, like
+with coqtop: the server binds its root to the empty logical path."
+  (skip-unless-server)
+  (let* ((dir (file-name-as-directory (make-temp-file "coq-eglot-" t)))
+         (coq-compile-before-require t)
+         (buffer nil)
+         (warnings nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (_type message &rest _) (push message warnings))))
+          (with-temp-file (expand-file-name "b.v" dir)
+            (insert "Definition one := 1.\n"))
+          (with-temp-file (expand-file-name "x.v" dir)
+            (insert "Require b.\nDefinition two := b.one + 1.\n"))
+          (setq buffer (find-file-noselect (expand-file-name "x.v" dir)))
+          (with-current-buffer buffer
+            (should (member (concat (directory-file-name dir) ",")
+                            (cdr (coq-eglot-lsp--contact nil
+                                                         (project-current)))))
+            (run #'coq-eglot-process-buffer)
+            (should (file-exists-p (expand-file-name "b.vo" dir)))
+            (should (equal (buffer-text "*response*") "two is defined"))
+            ;; no warning about the load path
+            (should-not warnings)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (coq-eglot-lsp-shutdown)
+          (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-directory dir t))))
+
 (defconst load-path-directory (expand-file-name "loadpath/")
   "Directory of the tests of the load path, without project file.
 Its .dir-locals.el sets `coq-load-path'.")
