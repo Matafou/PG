@@ -14,6 +14,7 @@
 
 ;;; Code:
 
+(defvar coq-backend)                    ; before loading Proof General
 (setq coq-backend 'eglot)
 
 (require 'subr-x)
@@ -504,6 +505,19 @@ buffers, on the active script buffer, like in Proof General."
   ;; too small
   (should-not (coq-eglot--allocate-heights 10 '(5 6 4) 4)))
 
+(defmacro with-layout (three policy &rest body)
+  "Run BODY with `proof-three-window-enable' THREE and POLICY.
+From a frame showing only the current buffer, restored afterwards."
+  (declare (indent 2) (debug t))
+  `(let ((proof-three-window-enable ,three)
+         (proof-three-window-mode-policy ,policy))
+     (unwind-protect
+         (progn
+           (switch-to-buffer (current-buffer))
+           (delete-other-windows)
+           ,@body)
+       (delete-other-windows))))
+
 (ert-deftest coq-eglot-resize-windows ()
   "The response window gets the height it needs, the goals window the
 rest, like with `coq-optimise-resp-windows-enable' in Proof General."
@@ -588,19 +602,6 @@ their default width, like in Proof General."
       (should (eq (window-buffer (selected-window)) (get-buffer "*goals*"))))))
 
 ;;; window layouts, like in Proof General
-
-(defmacro with-layout (three policy &rest body)
-  "Run BODY with `proof-three-window-enable' THREE and POLICY.
-From a frame showing only the current buffer, restored afterwards."
-  (declare (indent 2) (debug t))
-  `(let ((proof-three-window-enable ,three)
-         (proof-three-window-mode-policy ,policy))
-     (unwind-protect
-         (progn
-           (switch-to-buffer (current-buffer))
-           (delete-other-windows)
-           ,@body)
-       (delete-other-windows))))
 
 (defun windows-of (&rest names)
   "Windows of the buffers NAMES, all displayed."
@@ -1441,6 +1442,9 @@ Nil if there is none."
                      (ignore-errors (coq-eglot-twin--switch-server switch))))
               '("rocq-9.2" "rocq-9.0"))))
 
+(defconst compile-directory (expand-file-name "compile/")
+  "Directory of the tests of the compilation, with a _CoqProject.")
+
 (ert-deftest coq-eglot-twin-opam-switch ()
   "Paired with an opam switch, the twin has the server of this switch,
 the other buffer keeps the one of the current switch.  The twin must be
@@ -1449,7 +1453,6 @@ in another project: compile/ has a _CoqProject."
   (let ((twin nil))
     (with-test-file
       (let ((switch (other-opam-switch))
-            (this (current-buffer))
             (program (car (coq-eglot-lsp-server-command))))
         (skip-unless switch)
         (unwind-protect
@@ -2437,9 +2440,6 @@ OCaml >= 5.3): set COQ_LSP_STRONG_INTERRUPT to run this test."
 
 
 ;;; compilation of the required libraries
-
-(defconst compile-directory (expand-file-name "compile/")
-  "Directory of the tests of the compilation, with a _CoqProject.")
 
 (defun clean-compiled ()
   "Delete the files produced by the compilation in `compile-directory'."
