@@ -2355,6 +2355,9 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
      ["Go to Twin Position" coq-eglot-twin-goto-twin-position
       :active coq-eglot--twin
       :help "The same place in the twin, after aligning their sentences"]
+     ["Swap Reference" coq-eglot-twin-swap-reference
+      :active coq-eglot--twin
+      :help "The differences of the other twin are shown as removed"]
      ["Synchronize Proof Positions" coq-eglot-twin-toggle-synchronize
       :style toggle :selected (bound-and-true-p coq-eglot-twin-synchronize)
       :help "The proof position of a twin follows the one of the other"]
@@ -2478,6 +2481,7 @@ Warn if processed Require sentences load outdated libraries."
 (autoload 'coq-eglot-twin-set-opam-switch "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-goto-twin-position "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-toggle-synchronize "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-swap-reference "coq-eglot-twin" nil t)
 
 (provide 'coq-eglot)
 

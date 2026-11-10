@@ -1574,7 +1574,8 @@ server, only their sentences and their alignment."
            (with-current-buffer twin
              (insert ,twin-text)
              (coq-mode)
-             (setq coq-eglot--twin this))
+             (setq coq-eglot--twin this)
+             (setq coq-eglot-twin--reference t))
            (with-current-buffer this
              (insert ,this-text)
              (coq-mode)
@@ -1722,16 +1723,43 @@ ones together, and updated when idle after a change."
                                                    (overlay-start o2))))))))
       (should (equal (highlighted (current-buffer)) '("Check 2. Check 3.")))
       (should (equal (highlighted twin) '("Check 20. Check 30." "Check 5.")))
-      ;; like a diff: changed, or added if nothing in front
-      (with-current-buffer twin
-        (should (equal (mapcar (lambda (overlay) (overlay-get overlay 'face))
-                               (sort (copy-sequence coq-eglot-twin--overlays)
-                                     (lambda (o1 o2) (< (overlay-start o1)
-                                                        (overlay-start o2)))))
-                       '(coq-eglot-twin-changed coq-eglot-twin-added))))
+      ;; like a diff: removed in the reference, added in the other
+      (cl-flet ((faces (buffer)
+                  (with-current-buffer buffer
+                    (mapcar (lambda (overlay) (overlay-get overlay 'face))
+                            (seq-filter (lambda (overlay)
+                                          (overlay-get overlay 'coq-eglot-twin))
+                                        coq-eglot-twin--overlays))))
+                (refined (buffer)
+                  (with-current-buffer buffer
+                    (mapcar (lambda (overlay)
+                              (cons (buffer-substring (overlay-start overlay)
+                                                      (overlay-end overlay))
+                                    (overlay-get overlay 'face)))
+                            (sort (seq-filter
+                                   (lambda (overlay)
+                                     (overlay-get overlay 'coq-eglot-twin-refine))
+                                   (copy-sequence coq-eglot-twin--overlays))
+                                  (lambda (o1 o2) (< (overlay-start o1)
+                                                     (overlay-start o2))))))))
+        (should (equal (faces twin)
+                       '(coq-eglot-twin-removed coq-eglot-twin-removed)))
+        (should (equal (faces (current-buffer)) '(coq-eglot-twin-added)))
+        ;; the words that differ, in the zones with sentences on both sides
+        (should (equal (refined (current-buffer))
+                       '(("2" . coq-eglot-twin-refine-added)
+                         ("3" . coq-eglot-twin-refine-added))))
+        (should (equal (refined twin)
+                       '(("20" . coq-eglot-twin-refine-removed)
+                         ("30" . coq-eglot-twin-refine-removed)))))
       ;; not to the end of the line: the processed part shows there
-      (should-not (face-attribute 'coq-eglot-twin-changed :extend nil t))
+      (should-not (face-attribute 'coq-eglot-twin-removed :extend nil t))
       (should-not (face-attribute 'coq-eglot-twin-added :extend nil t))
+      ;; the faces of the diffs of Coq
+      (should (eq (face-attribute 'coq-eglot-twin-added :inherit)
+                  'coq-diffs-added-bg-face))
+      (should (eq (face-attribute 'coq-eglot-twin-refine-removed :inherit)
+                  'coq-diffs-removed-face))
       (with-current-buffer twin
         (setq coq-eglot--buffer-output (coq-eglot--make-output "<twin>"))
         (add-hook 'after-change-functions #'coq-eglot-twin--after-change nil t)
@@ -1744,6 +1772,18 @@ ones together, and updated when idle after a change."
       (should (equal (highlighted twin) '("Check 20. Check 30.")))
       (coq-eglot-twin--stop-alignment twin)
       (should-not (highlighted twin)))))
+
+(ert-deftest coq-eglot-twin-refine-comments ()
+  "The words of the comments and the blanks are not compared."
+  (with-twin-texts "Check 1. Check (* a *)  2. Check 4." "Check 1. Check 3. Check 4."
+    (coq-eglot-twin--highlight)
+    (should (equal (mapcar (lambda (overlay)
+                             (buffer-substring (overlay-start overlay)
+                                               (overlay-end overlay)))
+                           (seq-filter (lambda (overlay)
+                                         (overlay-get overlay 'coq-eglot-twin-refine))
+                                       coq-eglot-twin--overlays))
+                   '("2")))))
 
 (ert-deftest coq-eglot-twin-blend ()
   "Over the processed part, the diverging zones have a background
@@ -1788,7 +1828,24 @@ blending theirs with the one of the processed part."
     (should (cl-some (lambda (overlay) (overlay-get overlay 'coq-eglot-twin))
                      (overlays-in (point-min) (point-max))))
     (should (memq #'coq-eglot-twin--after-change after-change-functions))
+    ;; the twin paired is the reference: removed there, added here
+    (should (buffer-local-value 'coq-eglot-twin--reference twin))
+    (should-not coq-eglot-twin--reference)
+    (cl-flet ((faces (buffer)
+                (delete-dups (mapcar (lambda (overlay) (overlay-get overlay 'face))
+                                     (seq-filter
+                                      (lambda (overlay)
+                                        (overlay-get overlay 'coq-eglot-twin))
+                                      (buffer-local-value
+                                       'coq-eglot-twin--overlays buffer))))))
+      (should (equal (faces (current-buffer)) '(coq-eglot-twin-added)))
+      (should (equal (faces twin) '(coq-eglot-twin-removed)))
+      (coq-eglot-twin-swap-reference)
+      (should coq-eglot-twin--reference)
+      (should (equal (faces (current-buffer)) '(coq-eglot-twin-removed)))
+      (should (equal (faces twin) '(coq-eglot-twin-added))))
     (coq-eglot-twin-unpair)
+    (should-not coq-eglot-twin--reference)
     (should-not (cl-some (lambda (overlay) (overlay-get overlay 'coq-eglot-twin))
                          (overlays-in (point-min) (point-max))))
     (should-not (memq #'coq-eglot-twin--after-change after-change-functions))
@@ -1956,16 +2013,16 @@ in the changed ones the words that differ."
             (insert "1 goal\n\n  n : nat\n  H : n = 0\n  ============================\n  n + 0 = n\n"))
           (with-current-buffer b
             (insert "1 goal\n\n  n : nat\n  H : n = 1\n  H2 : True\n  ============================\n  n + 0 = n\n"))
-          (coq-eglot-twin--compare-buffers a b)
+          (coq-eglot-twin--compare-buffers a b 'line-a 'word-a 'line-b 'word-b)
           (should (equal (twin-differences a)
-                         '(("  H : n = 0" . coq-eglot-twin-changed)
-                           ("0" . coq-eglot-twin-refine))))
+                         '(("  H : n = 0" . line-a)
+                           ("0" . word-a))))
           (should (equal (twin-differences b)
-                         '(("  H : n = 1" . coq-eglot-twin-changed)
-                           ("1" . coq-eglot-twin-refine)
+                         '(("  H : n = 1" . line-b)
+                           ("1" . word-b)
                            ;; line by line
-                           ("  H2 : True" . coq-eglot-twin-changed)
-                           ("H2 : True" . coq-eglot-twin-refine))))
+                           ("  H2 : True" . line-b)
+                           ("H2 : True" . word-b))))
           (coq-eglot-twin--uncompare a)
           (should-not (twin-differences a)))
       (kill-buffer a)
@@ -1989,8 +2046,10 @@ twins are highlighted; not while they are at other positions."
                                    (string-search "2 = 2" (buffer-string)))))
                           10))
       (wait-for-twins)
-      (should (member '("1" . coq-eglot-twin-refine) (twin-differences goals)))
-      (should (member '("2" . coq-eglot-twin-refine)
+      (should (member '("1" . coq-eglot-twin-refine-added)
+                      (twin-differences goals)))
+      ;; the twin is the reference
+      (should (member '("2" . coq-eglot-twin-refine-removed)
                       (twin-differences twin-goals)))
       ;; the same hypotheses and number of goals: not highlighted
       (should-not (assoc "1 goal" (twin-differences goals)))
