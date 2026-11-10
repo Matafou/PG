@@ -253,6 +253,10 @@ For timers and callbacks, which may run in any buffer."
 See `coq-eglot-twin-pair'.")
 (put 'coq-eglot--twin 'permanent-local t)
 
+(defvar-local coq-eglot--twin-label nil
+  "Label of the server of a twin in the mode line, like an opam switch.
+See `coq-eglot-twin-pair'.")
+
 (defun coq-eglot--twin-layout-p ()
   "Non-nil if the active script buffer of the current output has a twin.
 Then its goals and messages have windows of their own below it, see
@@ -2317,6 +2321,9 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
       :help "Check another script buffer side by side, a twin"]
      ["Layout Side by Side" coq-eglot-twin-layout
       :active coq-eglot--twin]
+     ["Twin Opam Switch..." coq-eglot-twin-set-opam-switch
+      :active coq-eglot--twin
+      :help "The server of the twin from another opam switch"]
      ["Unpair" coq-eglot-twin-unpair
       :active coq-eglot--twin]))
   "Menu of the Eglot backend of Coq, see `easy-menu-define'.")
@@ -2365,10 +2372,14 @@ buffer is set up, after the configuration of the user."
 (defun coq-eglot--lighter ()
   "Mode line indicator of `coq-eglot-mode'.
 Warn if processed Require sentences load outdated libraries."
-  (if coq-eglot-compile--outdated-p
-      (propertize " Coq-LSP!" 'face 'warning
-                  'help-echo "Some required libraries changed since loaded")
-    " Coq-LSP"))
+  (concat
+   (if coq-eglot-compile--outdated-p
+       (propertize " Coq-LSP!" 'face 'warning
+                   'help-echo "Some required libraries changed since loaded")
+     " Coq-LSP")
+   ;; which server, for twins
+   (and coq-eglot--twin coq-eglot--twin-label
+        (format "[%s]" coq-eglot--twin-label))))
 
 (define-minor-mode coq-eglot-mode
   "Interaction with Coq through a language server, like Proof General.
@@ -2427,6 +2438,7 @@ Warn if processed Require sentences load outdated libraries."
 (autoload 'coq-eglot-twin-pair "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-unpair "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-layout "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-set-opam-switch "coq-eglot-twin" nil t)
 
 (provide 'coq-eglot)
 

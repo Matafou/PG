@@ -1414,6 +1414,88 @@ response buffers are killed.  Killing a twin unpairs."
       (should-not coq-eglot--twin)
       (should-not (get-buffer "*goals*<eglot_other.v>")))))
 
+(ert-deftest coq-eglot-twin-server-label ()
+  "The mode line shows the opam switch of the server of a twin."
+  (should (equal (coq-eglot-twin--server-label
+                  "/home/u/.opam/rocq-9.2/bin/coq-lsp")
+                 "rocq-9.2"))
+  (should (equal (coq-eglot-twin--server-label "/p/proj/_opam/bin/rocq-lsp")
+                 "proj"))
+  (should (equal (coq-eglot-twin--server-label "/usr/bin/coq-lsp") "coq-lsp"))
+  (should (equal (coq-eglot-twin--server-label "coq-lsp") "coq-lsp")))
+
+(defun other-opam-switch ()
+  "An opam switch with coq-lsp, rocq-9.0 or rocq-9.2, not the current one.
+Nil if there is none."
+  (let ((current (file-name-nondirectory
+                  (directory-file-name
+                   (file-name-directory
+                    (directory-file-name
+                     (file-name-directory
+                      (executable-find
+                       (car (coq-eglot-lsp-server-command))))))))))
+    (seq-find (lambda (switch)
+                (and (not (equal switch current))
+                     (ignore-errors (coq-eglot-twin--switch-server switch))))
+              '("rocq-9.2" "rocq-9.0"))))
+
+(ert-deftest coq-eglot-twin-opam-switch ()
+  "Paired with an opam switch, the twin has the server of this switch,
+the other buffer keeps the one of the current switch.  The twin must be
+in another project: compile/ has a _CoqProject."
+  (skip-unless (executable-find "opam"))
+  (let ((twin nil))
+    (with-test-file
+      (let ((switch (other-opam-switch))
+            (this (current-buffer))
+            (program (car (coq-eglot-lsp-server-command))))
+        (skip-unless switch)
+        (unwind-protect
+            (progn
+              (setq twin (find-file-noselect
+                          (expand-file-name "eglot_compile_c.v"
+                                            compile-directory)))
+              (coq-eglot-twin-pair twin switch)
+              (with-current-buffer twin
+                (should (equal coq-eglot-server-program
+                               (coq-eglot-twin--switch-server switch)))
+                (should (string-match-p
+                         (format "/%s/" (regexp-quote switch))
+                         (car (process-command
+                               (jsonrpc--process (eglot-current-server))))))
+                (should (string-search (format "[%s]" switch)
+                                       (coq-eglot--lighter)))
+                (run #'coq-eglot-process-buffer)
+                (should (string-match-p
+                         (format "/%s/lib/" (regexp-quote switch))
+                         (car (coq-eglot-lsp-query
+                               (point-max)
+                               "Locate Library Corelib.Init.Prelude.")))))
+              ;; the other buffer keeps its server
+              (should (equal (executable-find
+                              (car (process-command
+                                    (jsonrpc--process (eglot-current-server)))))
+                             (executable-find program)))
+              (should (string-search
+                       (format "[%s]" (coq-eglot-twin--server-label
+                                       (executable-find program)))
+                       (coq-eglot--lighter)))
+              (should-not (eq (eglot-current-server)
+                              (with-current-buffer twin (eglot-current-server))))
+              ;; unpaired, the twin keeps its server, the label goes
+              (coq-eglot-twin-unpair)
+              (with-current-buffer twin
+                (should (equal coq-eglot-server-program
+                               (coq-eglot-twin--switch-server switch)))
+                (should-not (string-search "[" (coq-eglot--lighter)))))
+          (when (buffer-live-p twin)
+            (with-current-buffer twin
+              ;; the next tests of compile/ use the current switch
+              (coq-eglot-lsp-shutdown)
+              (set-buffer-modified-p nil))
+            (kill-buffer twin))
+          (delete-other-windows))))))
+
 (ert-deftest coq-eglot-twin-pair-errors ()
   "A buffer has at most one twin, and it is not itself."
   (with-twin
