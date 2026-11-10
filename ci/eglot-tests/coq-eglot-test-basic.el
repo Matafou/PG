@@ -1316,9 +1316,11 @@ the same time, in their own goals buffers, and both stay active."
 (defmacro with-twin (&rest body)
   "Run BODY in eglot_test.v paired with eglot_other.v, its twin.
 In a frame showing only them, three windows mode off: the twins force
-it.  Unpair and kill eglot_other.v afterwards."
+it.  Not synchronized: the two scripts are unrelated.  Unpair and kill
+eglot_other.v afterwards."
   (declare (indent 0) (debug t))
   `(let ((proof-three-window-enable nil)
+         (coq-eglot-twin-synchronize nil)
          (twin nil))
      (with-test-file
        (unwind-protect
@@ -1511,6 +1513,36 @@ ignores the class of the contact then."
                               'coq-eglot-lsp-server))))
       (coq-eglot-lsp-shutdown))))
 
+(ert-deftest coq-eglot-ensure-server-connecting ()
+  "With a server still connecting, the server is that one, once
+connected: no other one is started."
+  (with-file (expand-file-name "eglot_compile_c.v" compile-directory)
+    (unwind-protect
+        (progn
+          (coq-eglot-lsp-shutdown)
+          (let ((eglot-sync-connect nil))
+            (apply #'eglot (eglot--guess-contact)))
+          (let ((connecting (coq-eglot-lsp-connecting-servers)))
+            (should (= (length connecting) 1))
+            (should (eq (coq-eglot-lsp-ensure-server) (car connecting))))
+          (should-not (coq-eglot-lsp-connecting-servers))
+          (should (= (length (gethash (eglot--current-project)
+                                      eglot--servers-by-project))
+                     1)))
+      (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
+      (coq-eglot-lsp-shutdown))))
+
+(ert-deftest coq-eglot-request-not-sent ()
+  "A check whose request cannot be sent, like without server, is not
+running: the buffer is not busy afterwards."
+  (with-test-file
+    (cl-letf (((symbol-function 'coq-eglot-lsp-ensure-server) #'ignore))
+      (goto-marker "split")
+      (should-error (coq-eglot-goto-point) :type 'user-error)
+      (should-not coq-eglot--running))
+    (run #'coq-eglot-goto-point)
+    (should (position-at-marker-p "split"))))
+
 (ert-deftest coq-eglot-connecting-servers ()
   "A server still connecting is not the current server, but
 `coq-eglot-lsp-connecting-servers' finds it."
@@ -1529,6 +1561,367 @@ ignores the class of the contact then."
           (should-not (coq-eglot-lsp-connecting-servers)))
       (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
       (coq-eglot-lsp-shutdown))))
+
+(defmacro with-twin-texts (this-text twin-text &rest body)
+  "Run BODY in a Coq buffer of THIS-TEXT, paired with one of TWIN-TEXT.
+Bound to `twin' in BODY.  Not script buffers of the Eglot backend: no
+server, only their sentences and their alignment."
+  (declare (indent 2) (debug t))
+  `(let ((twin (generate-new-buffer "twin"))
+         (this (generate-new-buffer "this")))
+     (unwind-protect
+         (progn
+           (with-current-buffer twin
+             (insert ,twin-text)
+             (coq-mode)
+             (setq coq-eglot--twin this))
+           (with-current-buffer this
+             (insert ,this-text)
+             (coq-mode)
+             (setq coq-eglot--twin twin)
+             ,@body))
+       (kill-buffer this)
+       (kill-buffer twin))))
+
+(defun sentence-texts (&optional buffer)
+  "Normalized texts of the sentences of BUFFER."
+  (cl-map 'list #'coq-eglot-twin--sentence-text
+          (coq-eglot-twin--sentences buffer)))
+
+(defun search-position (string &optional buffer)
+  "Position after the first STRING in BUFFER."
+  (with-current-buffer (or buffer (current-buffer))
+    (save-excursion
+      (goto-char (point-min))
+      (search-forward string)
+      (point))))
+
+(ert-deftest coq-eglot-twin-sentences ()
+  "The sentences are delimited locally, their texts without comments
+and with blanks compacted."
+  (with-twin-texts "(* header *)
+Lemma l :   (* a. comment *)  True.
+Proof.
+  - { exact I. }
+Qed.
+Definition s := \"a (* not a comment *) . string\"." ""
+    (should (equal (sentence-texts)
+                   '("Lemma l : True." "Proof." "-" "{" "exact I." "}" "Qed."
+                     "Definition s := \"a (* not a comment *) . string\".")))
+    ;; computed again after a change only
+    (let ((sentences (coq-eglot-twin--sentences)))
+      (should (eq (coq-eglot-twin--sentences) sentences))
+      (goto-char (point-max))
+      (insert "\nCheck s.")
+      (should (equal (car (last (sentence-texts))) "Check s.")))))
+
+(ert-deftest coq-eglot-twin-common-subsequence ()
+  "The longest common subsequence of two vectors, as pairs of indices."
+  (should (equal (coq-eglot-twin--common-subsequence [] []) nil))
+  (should (equal (coq-eglot-twin--common-subsequence [a b c] [a b c])
+                 '((0 . 0) (1 . 1) (2 . 2))))
+  (should (equal (coq-eglot-twin--common-subsequence [a b c d] [a x c d y])
+                 '((0 . 0) (2 . 2) (3 . 3))))
+  (should (equal (coq-eglot-twin--common-subsequence [a b c] [x a y c])
+                 '((0 . 1) (2 . 3))))
+  ;; too many differences in the middle: only the beginning and end
+  (let ((coq-eglot-twin-max-differences 2))
+    (should (equal (coq-eglot-twin--common-subsequence
+                    [s a b c e] [s x y z a e])
+                   '((0 . 0) (4 . 5))))))
+
+(ert-deftest coq-eglot-twin-alignment ()
+  "Sentences differing by comments and blanks only are paired, the
+others diverge.  Positions in paired sentences have the same offset in
+the twin, the others the end of the last paired sentence before."
+  (with-twin-texts "Lemma l : True.
+Proof.
+  idtac. exact I.
+Qed.
+Check l." "Lemma l :  (* same *)
+  True.
+Proof.
+  exact I.
+  idtac \"new\".
+Qed.
+Check l."
+    ;; idtac., then idtac "new".
+    (should (equal (coq-eglot-twin--zones) '(((2 . 3) . nil) (nil . (3 . 4)))))
+    ;; the other way
+    (should (equal (coq-eglot-twin--zones twin)
+                   '((nil . (2 . 3)) ((3 . 4) . nil))))
+    ;; in a paired sentence
+    (should (= (coq-eglot-twin-position (search-position "Pro"))
+               (search-position "Pro" twin)))
+    (should (= (coq-eglot-twin-position (search-position "exact I."))
+               (search-position "exact I." twin)))
+    ;; at the end of a sentence paired with a longer one
+    (should (= (coq-eglot-twin-position (search-position "Lemma l : True."))
+               (search-position "True." twin)))
+    ;; in a diverging sentence: the end of the last paired one
+    (should (= (coq-eglot-twin-position (search-position "idta"))
+               (search-position "Proof." twin)))
+    (should (= (coq-eglot-twin-position (search-position "idta" twin) twin)
+               (search-position "exact I.")))
+    ;; before the first sentence
+    (should (= (coq-eglot-twin-position (point-min))
+               (with-current-buffer twin (point-min))))
+    ;; aligned again after a change of the twin
+    (with-current-buffer twin
+      (goto-char (search-position "idtac \"new\"."))
+      (delete-region (line-beginning-position) (point)))
+    (should (equal (coq-eglot-twin--zones) '(((2 . 3)))))))
+
+(ert-deftest coq-eglot-twin-highlight ()
+  "The diverging sentences of both twins are highlighted, contiguous
+ones together, and updated when idle after a change."
+  (with-twin-texts "Check 1. Check 2. Check 3. Check 4."
+      "Check 1. Check 20. Check 30. Check 4. Check 5."
+    (coq-eglot-twin--highlight)
+    (cl-flet ((highlighted (buffer)
+                (with-current-buffer buffer
+                  (mapcar (lambda (overlay)
+                            (buffer-substring (overlay-start overlay)
+                                              (overlay-end overlay)))
+                          (sort (seq-filter
+                                 (lambda (overlay)
+                                   (overlay-get overlay 'coq-eglot-twin))
+                                 (overlays-in (point-min) (point-max)))
+                                (lambda (o1 o2) (< (overlay-start o1)
+                                                   (overlay-start o2))))))))
+      (should (equal (highlighted (current-buffer)) '("Check 2. Check 3.")))
+      (should (equal (highlighted twin) '("Check 20. Check 30." "Check 5.")))
+      ;; like a diff: changed, or added if nothing in front
+      (with-current-buffer twin
+        (should (equal (mapcar (lambda (overlay) (overlay-get overlay 'face))
+                               (sort (copy-sequence coq-eglot-twin--overlays)
+                                     (lambda (o1 o2) (< (overlay-start o1)
+                                                        (overlay-start o2)))))
+                       '(coq-eglot-twin-changed coq-eglot-twin-added))))
+      ;; not to the end of the line: the processed part shows there
+      (should-not (face-attribute 'coq-eglot-twin-changed :extend nil t))
+      (should-not (face-attribute 'coq-eglot-twin-added :extend nil t))
+      (with-current-buffer twin
+        (setq coq-eglot--buffer-output (coq-eglot--make-output "<twin>"))
+        (add-hook 'after-change-functions #'coq-eglot-twin--after-change nil t)
+        (goto-char (point-max))
+        (delete-region (search-position "Check 4.") (point-max)))
+      (should coq-eglot-twin--timer)
+      (cancel-timer coq-eglot-twin--timer)
+      (coq-eglot-twin--idle-update)
+      (should-not coq-eglot-twin--timer)
+      (should (equal (highlighted twin) '("Check 20. Check 30.")))
+      (coq-eglot-twin--stop-alignment twin)
+      (should-not (highlighted twin)))))
+
+(ert-deftest coq-eglot-twin-blend ()
+  "Over the processed part, the diverging zones have a background
+blending theirs with the one of the processed part."
+  (should (equal (coq-eglot-twin--background '((:foreground "red")
+                                               (:background "#000000")))
+                 "#000000"))
+  (should-not (coq-eglot-twin--blend '(:background "#000000") 'default))
+  (with-twin-texts "Check 1. Check 2. Check 3. Check 4." "Check 1. Check 4."
+    (cl-letf (((symbol-function 'coq-eglot-twin--blend)
+               (lambda (face1 face2)
+                 (and (eq face1 'coq-eglot-twin-added)
+                      (eq face2 'proof-locked-face)
+                      "#808080"))))
+      (setq coq-eglot--locked-overlay
+            (make-overlay (point-min) (search-position "Check 2")))
+      (overlay-put coq-eglot--locked-overlay 'face 'proof-locked-face)
+      (coq-eglot-twin--highlight)
+      (cl-flet ((blends ()
+                  (mapcar (lambda (overlay)
+                            (list (buffer-substring (overlay-start overlay)
+                                                    (overlay-end overlay))
+                                  (overlay-get overlay 'face)))
+                          (overlay-get (car coq-eglot-twin--overlays)
+                                       'coq-eglot-twin-blend))))
+        (should (equal (blends) '(("Check 2" (:background "#808080")))))
+        ;; when the proof position moves
+        (move-overlay coq-eglot--locked-overlay (point-min) (point-max))
+        (coq-eglot-twin--update-blend)
+        (should (equal (blends) '(("Check 2. Check 3." (:background "#808080")))))
+        (move-overlay coq-eglot--locked-overlay (point-min) (point-min))
+        (coq-eglot-twin--update-blend)
+        (should-not (blends))
+        (coq-eglot-twin--unhighlight)
+        (should-not (cl-some (lambda (overlay) (overlay-get overlay 'face))
+                             (overlays-in (search-position "Check 2")
+                                          (search-position "Check 3."))))))))
+
+(ert-deftest coq-eglot-twin-pair-alignment ()
+  "Paired, the twins are aligned and highlighted; unpaired, no more."
+  (with-twin
+    (should (cl-some (lambda (overlay) (overlay-get overlay 'coq-eglot-twin))
+                     (overlays-in (point-min) (point-max))))
+    (should (memq #'coq-eglot-twin--after-change after-change-functions))
+    (coq-eglot-twin-unpair)
+    (should-not (cl-some (lambda (overlay) (overlay-get overlay 'coq-eglot-twin))
+                         (overlays-in (point-min) (point-max))))
+    (should-not (memq #'coq-eglot-twin--after-change after-change-functions))
+    (with-current-buffer twin
+      (should-not coq-eglot-twin--overlays))))
+
+(defconst sync-this-text "Lemma l1 : True.
+Proof.
+  exact I.
+Qed. (* marker l1 *)
+Lemma l2 : 1 = 1.
+Proof. (* marker l2 proof *)
+  reflexivity.
+Qed. (* marker l2 *)
+Lemma l3 : True.
+Proof. exact I. Qed. (* marker l3 *)
+"
+  "Script of the leader in the tests of the synchronization.")
+
+(defconst sync-twin-text "Lemma l1 : True.
+Proof.
+  exact I.
+Qed.
+Lemma l2 : 1 = 1.
+Proof.
+  idtac.
+  reflexivity.
+Qed.
+Lemma l3 : True.
+Proof.
+  exact I.
+Qed.
+"
+  "Script of the follower: the proof of l2 diverges.")
+
+(defmacro with-sync-twins (twin-text &rest body)
+  "Run BODY in a script of `sync-this-text' paired with one of TWIN-TEXT.
+In two directories, so two servers.  The twin is bound to `twin'."
+  (declare (indent 1) (debug t))
+  `(progn
+     (skip-unless-server)
+     (let* ((proof-three-window-enable nil)
+            (dirs (list (make-temp-file "coq-eglot-this-" t)
+                        (make-temp-file "coq-eglot-twin-" t)))
+            (files (cl-mapcar (lambda (dir text)
+                                (let ((file (expand-file-name "s.v" dir)))
+                                  (with-temp-file file (insert text))
+                                  file))
+                              dirs (list sync-this-text ,twin-text)))
+            (this (find-file-noselect (car files)))
+            (twin (find-file-noselect (cadr files))))
+       (unwind-protect
+           (with-current-buffer this
+             (switch-to-buffer this)
+             (delete-other-windows)
+             (coq-eglot-twin-pair twin)
+             ,@body)
+         (dolist (buffer (list this twin))
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (coq-eglot-lsp-shutdown)
+               (set-buffer-modified-p nil))
+             (kill-buffer buffer)))
+         (dolist (dir dirs) (delete-directory dir t))
+         (delete-other-windows)))))
+
+(defun wait-for-twins ()
+  "Wait until both twins finished their checks and their moves."
+  (with-timeout (30 (error "Twins still busy: %S"
+                            (mapcar (lambda (buffer)
+                                      (with-current-buffer buffer
+                                        (list (buffer-name)
+                                              :running coq-eglot--running
+                                              :timer (and coq-eglot-twin--follow-timer t)
+                                              :position (coq-eglot-position)
+                                              :out-of-sync coq-eglot-twin--out-of-sync
+                                              :leader (coq-eglot-twin--leader-p))))
+                                    (list (current-buffer) coq-eglot--twin))))
+    (while (cl-some (lambda (buffer)
+                      (with-current-buffer buffer
+                        (or coq-eglot--running coq-eglot-twin--follow-timer
+                            coq-eglot-twin--following
+                            coq-eglot-twin--show-timer)))
+                    (list (current-buffer) coq-eglot--twin))
+      (accept-process-output nil 0.02))))
+
+(defun twin-window-point ()
+  "Point of the window of the twin."
+  (window-point (get-buffer-window coq-eglot--twin)))
+
+(defun twin-position-at (marker)
+  "Position of the twin after the sentence of MARKER in this buffer.
+The end of the twin sentence of the one before the comment MARKER."
+  (coq-eglot-twin-position
+   (save-excursion (goto-marker marker) (coq-eglot--skip-backward (point)))))
+
+(ert-deftest coq-eglot-twin-synchronize ()
+  "The proof position of the twin follows the one of the leader,
+forward and back, to the end of the last paired sentence in a
+diverging zone.  The leader is the last one with a command."
+  (with-sync-twins sync-twin-text
+    (should coq-eglot-twin-synchronize)
+    ;; forward, past the diverging proof
+    (goto-marker "l2")
+    (run #'coq-eglot-goto-point)
+    (wait-for-twins)
+    (should (position-at-marker-p "l2"))
+    (should (= (with-current-buffer twin (coq-eglot-position))
+               (with-current-buffer twin (search-position "1 = 1.\nProof.\n  idtac.\n  reflexivity.\nQed."))))
+    (should (= (with-current-buffer twin (coq-eglot-position))
+               (twin-position-at "l2")))
+    ;; the window of the follower shows its new position
+    (should (= (twin-window-point) (twin-position-at "l2")))
+    ;; back, into the diverging proof: after its Proof
+    (goto-marker "l2 proof")
+    (run #'coq-eglot-goto-point)
+    (wait-for-twins)
+    (should (= (with-current-buffer twin (coq-eglot-position))
+               (search-position "1 = 1.\nProof." twin)))
+    (should (= (twin-window-point) (search-position "1 = 1.\nProof." twin)))
+    ;; the twin leads, the other one follows
+    (with-current-buffer twin
+      (goto-char (point-max))
+      (run #'coq-eglot-goto-point))
+    (wait-for-twins)
+    (should (= (with-current-buffer twin (coq-eglot-position))
+               (with-current-buffer twin
+                 (coq-eglot--skip-backward (point-max)))))
+    (should (position-at-marker-p "l3"))
+    ;; an edition of the leader moves the follower back
+    (with-current-buffer twin
+      (goto-char (search-position "  idtac." twin))
+      (insert " idtac.")
+      (run-hooks 'post-command-hook))
+    (wait-for-twins)
+    (should (position-at-marker-p "l2 proof"))))
+
+(ert-deftest coq-eglot-twin-synchronize-error ()
+  "An error of the follower stops it, not the leader; off, the
+synchronization does not move the twin."
+  (with-sync-twins (string-replace "idtac." "exact 0." sync-twin-text)
+    (goto-char (point-max))
+    (run #'coq-eglot-process-buffer)
+    (wait-for-twins)
+    (should (position-at-marker-p "l3"))
+    (with-current-buffer twin
+      ;; stopped before the error
+      (should (= (coq-eglot-position) (search-position "1 = 1.\nProof.")))
+      ;; the sentence that failed
+      (should (cl-some (lambda (overlay)
+                         (equal (buffer-substring (overlay-start overlay)
+                                                  (overlay-end overlay))
+                                "exact 0."))
+                       coq-eglot--error-overlays))
+      ;; its window shows the error
+      (should (<= (- (search-position "exact 0.") (length "exact 0."))
+                  (window-point (get-buffer-window twin))
+                  (search-position "exact 0."))))
+    (let ((coq-eglot-twin-synchronize nil)
+          (before (with-current-buffer twin (coq-eglot-position))))
+      (run #'coq-eglot-retract-buffer)
+      (wait-for-twins)
+      (should (= (coq-eglot-position) (point-min)))
+      (should (= (with-current-buffer twin (coq-eglot-position)) before)))))
 
 (ert-deftest coq-eglot-twin-pair-errors ()
   "A buffer has at most one twin, and it is not itself."

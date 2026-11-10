@@ -283,13 +283,23 @@ file, unless DIR has one, see `coq-eglot-lsp-check-load-path'."
 
 (defun coq-eglot-lsp-ensure-server ()
   "Return the Coq server of the current buffer, starting it if needed.
-Unlike `eglot-ensure', start it now, not after the current command."
+Unlike `eglot-ensure', start it now, not after the current command.  If
+it is still connecting, started by another command or by Eglot, wait
+for it, at most `eglot-connect-timeout' seconds: do not start another
+one."
   (or (coq-eglot-lsp-current-server)
-      ;; with a prefix argument, like the one of the command that
-      ;; starts the server, Eglot ignores the class of the contact: the
-      ;; server would not be a `coq-eglot-lsp-server'
-      (let ((current-prefix-arg nil))
-        (apply #'eglot (eglot--guess-contact))
+      (progn
+        (unless (coq-eglot-lsp-connecting-servers)
+          ;; with a prefix argument, like the one of the command that
+          ;; starts the server, Eglot ignores the class of the contact:
+          ;; the server would not be a `coq-eglot-lsp-server'
+          (let ((current-prefix-arg nil))
+            (apply #'eglot (eglot--guess-contact))))
+        ;; Eglot waits at most `eglot-sync-connect' seconds
+        (with-timeout ((or eglot-connect-timeout 30))
+          (while (and (not (coq-eglot-lsp-current-server))
+                      (coq-eglot-lsp-connecting-servers))
+            (accept-process-output nil 0.05)))
         (coq-eglot-lsp-current-server))))
 
 (defun coq-eglot-lsp-connecting-servers ()

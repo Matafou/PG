@@ -294,6 +294,7 @@ goals and response buffers, like in Proof General."
 See `coq-eglot--script-buffer'."
   (declare (indent 0) (debug t))
   `(with-current-buffer (coq-eglot--script-buffer)
+     (setq coq-eglot--command-buffer (current-buffer))
      (coq-eglot--activate)
      ,@body))
 
@@ -302,8 +303,19 @@ See `coq-eglot--script-buffer'."
   (when (coq-eglot--active-p)
     (setf (coq-eglot--output-active (coq-eglot--output)) nil)))
 
+(defvar coq-eglot-position-hook nil
+  "Hook run in a script buffer when its proof position may have moved.
+Or the part being checked: run when their overlays are updated, see
+`coq-eglot--update-overlays'.")
+
+(defvar coq-eglot--command-buffer nil
+  "Script buffer of the last command of the backend, or of the last edition.
+Not of the cursor moves: the buffer where the user works, see
+`coq-eglot--with-script' and `coq-eglot--after-change'.")
+
 (defun coq-eglot--update-overlays ()
-  "Update the overlays of the processed part and of the checked part."
+  "Update the overlays of the processed part and of the checked part.
+Run `coq-eglot-position-hook'."
   (unless (overlayp coq-eglot--locked-overlay)
     (setq coq-eglot--locked-overlay (make-overlay (point-min) (point-min))))
   (overlay-put coq-eglot--locked-overlay 'face
@@ -320,7 +332,8 @@ See `coq-eglot--script-buffer'."
       (overlay-put coq-eglot--queue-overlay 'face 'proof-queue-face))
     (move-overlay coq-eglot--queue-overlay (coq-eglot-position)
                   (max (coq-eglot-position)
-                       (plist-get coq-eglot--running :target)))))
+                       (plist-get coq-eglot--running :target))))
+  (run-hooks 'coq-eglot-position-hook))
 
 (defun coq-eglot--pop-ends (pos)
   "Forget the processed sentences ending after POS."
@@ -399,11 +412,15 @@ already."
     (overlay-put ov 'priority priority)
     (push ov coq-eglot--error-overlays)))
 
+(defvar coq-eglot-error-hook nil
+  "Hook run in a script buffer when it highlights an error.
+Point is at the error, see `coq-eglot--highlight-error'.")
+
 (defun coq-eglot--highlight-error (start end)
   "Highlight the sentence between START and END, which failed.
 Like Proof General: the sentence with `proof-boring-face', the location
 of the error, if known, with `proof-warning-face'.  Move point to the
-error."
+error.  Run `coq-eglot-error-hook'."
   (coq-eglot--clear-error)
   (coq-eglot--error-overlay start end 'proof-boring-face 0)
   (let ((range (coq-eglot-lsp-error-range start end)))
@@ -413,7 +430,8 @@ error."
   (when coq-eglot-error-highlight-duration
     (setq coq-eglot--error-timer
           (run-at-time coq-eglot-error-highlight-duration nil
-                       #'coq-eglot--clear-error-in (current-buffer)))))
+                       #'coq-eglot--clear-error-in (current-buffer))))
+  (run-hooks 'coq-eglot-error-hook))
 
 ;;; Display
 
@@ -1467,14 +1485,19 @@ ON-SUCCESS is called with the answer.  The answer is ignored if the
 check was interrupted meanwhile: an answer or an error may still come
 for a cancelled request."
   (let ((running coq-eglot--running))
-    (plist-put running :id
-               (funcall request-fn pos
-                        (lambda (answer)
-                          (when (eq coq-eglot--running running)
-                            (funcall on-success answer)))
-                        (lambda (err)
-                          (when (eq coq-eglot--running running)
-                            (coq-eglot--failed-request err)))))))
+    (condition-case err
+        (plist-put running :id
+                   (funcall request-fn pos
+                            (lambda (answer)
+                              (when (eq coq-eglot--running running)
+                                (funcall on-success answer)))
+                            (lambda (err)
+                              (when (eq coq-eglot--running running)
+                                (coq-eglot--failed-request err)))))
+      ;; not sent, like without server: the check is not running
+      (error (when (eq coq-eglot--running running)
+               (coq-eglot--stop))
+             (signal (car err) (cdr err))))))
 
 (defun coq-eglot--stop ()
   "Mark the running check as finished.
@@ -1968,6 +1991,7 @@ Typing right at the proof position does not move it.  Editing the
 processed part, or the part being checked, interrupts the server: all
 pending requests are cancelled, and the edition is sent to the server
 at the end of the command (not here, see `coq-eglot-lsp-send-changes')."
+  (setq coq-eglot--command-buffer (current-buffer))
   (when (< beg (if coq-eglot--running
                    (plist-get coq-eglot--running :target)
                  (coq-eglot-position)))
@@ -2321,6 +2345,12 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
       :help "Check another script buffer side by side, a twin"]
      ["Layout Side by Side" coq-eglot-twin-layout
       :active coq-eglot--twin]
+     ["Go to Twin Position" coq-eglot-twin-goto-twin-position
+      :active coq-eglot--twin
+      :help "The same place in the twin, after aligning their sentences"]
+     ["Synchronize Proof Positions" coq-eglot-twin-toggle-synchronize
+      :style toggle :selected (bound-and-true-p coq-eglot-twin-synchronize)
+      :help "The proof position of a twin follows the one of the other"]
      ["Twin Opam Switch..." coq-eglot-twin-set-opam-switch
       :active coq-eglot--twin
       :help "The server of the twin from another opam switch"]
@@ -2439,6 +2469,8 @@ Warn if processed Require sentences load outdated libraries."
 (autoload 'coq-eglot-twin-unpair "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-layout "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-set-opam-switch "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-goto-twin-position "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-toggle-synchronize "coq-eglot-twin" nil t)
 
 (provide 'coq-eglot)
 
