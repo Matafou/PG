@@ -1455,8 +1455,11 @@ in another project: compile/ has a _CoqProject."
               (setq twin (find-file-noselect
                           (expand-file-name "eglot_compile_c.v"
                                             compile-directory)))
-              (coq-eglot-twin-pair twin switch)
+              ;; like C-u M-x coq-eglot-twin-pair
+              (let ((current-prefix-arg '(4)))
+                (coq-eglot-twin-pair twin switch))
               (with-current-buffer twin
+                (should (coq-eglot-lsp-current-server))
                 (should (equal coq-eglot-server-program
                                (coq-eglot-twin--switch-server switch)))
                 (should (string-match-p
@@ -1495,6 +1498,37 @@ in another project: compile/ has a _CoqProject."
               (set-buffer-modified-p nil))
             (kill-buffer twin))
           (delete-other-windows))))))
+
+(ert-deftest coq-eglot-ensure-server-prefix ()
+  "With a prefix argument, the server started is a Coq server: Eglot
+ignores the class of the contact then."
+  (with-file (expand-file-name "eglot_compile_c.v" compile-directory)
+    (unwind-protect
+        (progn
+          (coq-eglot-lsp-shutdown)
+          (let ((current-prefix-arg '(4)))
+            (should (cl-typep (coq-eglot-lsp-ensure-server)
+                              'coq-eglot-lsp-server))))
+      (coq-eglot-lsp-shutdown))))
+
+(ert-deftest coq-eglot-connecting-servers ()
+  "A server still connecting is not the current server, but
+`coq-eglot-lsp-connecting-servers' finds it."
+  (with-file (expand-file-name "eglot_compile_c.v" compile-directory)
+    (unwind-protect
+        (progn
+          (coq-eglot-lsp-shutdown)
+          (should-not (coq-eglot-lsp-connecting-servers))
+          (let ((eglot-sync-connect nil))
+            (apply #'eglot (eglot--guess-contact)))
+          ;; no process output read since: not connected yet
+          (should-not (eglot-current-server))
+          (let ((servers (coq-eglot-lsp-connecting-servers)))
+            (should (= (length servers) 1))
+            (jsonrpc-shutdown (car servers)))
+          (should-not (coq-eglot-lsp-connecting-servers)))
+      (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
+      (coq-eglot-lsp-shutdown))))
 
 (ert-deftest coq-eglot-twin-pair-errors ()
   "A buffer has at most one twin, and it is not itself."

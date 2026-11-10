@@ -266,9 +266,28 @@ file, unless DIR has one, see `coq-eglot-lsp-check-load-path'."
   "Return the Coq server of the current buffer, starting it if needed.
 Unlike `eglot-ensure', start it now, not after the current command."
   (or (coq-eglot-lsp-current-server)
-      (progn
+      ;; with a prefix argument, like the one of the command that
+      ;; starts the server, Eglot ignores the class of the contact: the
+      ;; server would not be a `coq-eglot-lsp-server'
+      (let ((current-prefix-arg nil))
         (apply #'eglot (eglot--guess-contact))
         (coq-eglot-lsp-current-server))))
+
+(defun coq-eglot-lsp-connecting-servers ()
+  "Servers of the project of the current buffer still connecting.
+Eglot registers a server in its project once connected only: until
+then, `eglot-current-server' does not find it."
+  (let* ((project (eglot--current-project))
+         (connected (gethash project eglot--servers-by-project)))
+    (seq-filter (lambda (server)
+                  (and (cl-typep server 'eglot-lsp-server)
+                       (equal (eglot--project server) project)
+                       (not (memq server connected))
+                       (jsonrpc-running-p server)))
+                (delete-dups
+                 (delq nil (mapcar (lambda (process)
+                                     (process-get process 'jsonrpc-connection))
+                                   (process-list)))))))
 
 (defun coq-eglot-lsp-shutdown ()
   "Stop the server of the current buffer, even if it is busy.

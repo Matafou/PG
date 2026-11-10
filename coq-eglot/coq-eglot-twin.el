@@ -178,6 +178,9 @@ See `coq-eglot-twin-set-opam-switch'."
       ;; the proof positions of the buffers of the server go back
       (when (coq-eglot-lsp-current-server)
         (coq-eglot-exit))
+      ;; a server still connecting, started when the twin was visited:
+      ;; killed, like Eglot does when the connection is canceled
+      (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
       (setq-local coq-eglot-server-program command)
       (coq-eglot-lsp-ensure-server))
     (coq-eglot-twin--update-label)))
