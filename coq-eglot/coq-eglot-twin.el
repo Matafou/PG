@@ -202,7 +202,7 @@ See `coq-eglot-twin-set-opam-switch'."
         (coq-eglot-exit))
       ;; a server still connecting, started when the twin was visited:
       ;; killed, like Eglot does when the connection is canceled
-      (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
+      (coq-eglot-lsp-kill-connecting-servers)
       (setq-local coq-eglot-server-program command)
       (coq-eglot-lsp-ensure-server))
     (coq-eglot-twin--update-label)))

@@ -212,13 +212,16 @@ command starts it with the load path of %s."
 reads the project file of %s anyway." root)))))))
 
 (defun coq-eglot-lsp--root-load-path-args (root)
-  "Option -Q of ROOT, the root of the server, if it has no project file.
+  "Option -R of ROOT, the root of the server, if it has no project file.
 Like coqtop, which binds its current directory to the empty logical
 path, so that a file can require the files next to it: coq-lsp binds
-nothing without a project file.  The -Q of coq-lsp is recursive."
+nothing without a project file.  -R, not -Q: coq-lsp puts all the -R
+before all the -Q, and the last binding of a directory wins, so a -Q
+of ROOT would hide the -R of its subdirectories in the load path of
+the buffer."
   (unless (seq-some (lambda (name) (file-exists-p (expand-file-name name root)))
                     '("_CoqProject" "_RocqProject"))
-    (list "-Q" (concat (directory-file-name (expand-file-name root)) ","))))
+    (list "-R" (concat (directory-file-name (expand-file-name root)) ","))))
 
 (defun coq-eglot-lsp--contact (&optional _interactive project)
   "Eglot contact for Coq: our server class and its command line.
@@ -226,12 +229,13 @@ With the load path of the current buffer, see
 `coq-eglot-lsp-load-path-args': coq-lsp adds it to the one of the
 project file it finds in its root directory, if any.  Without a project
 file, the root directory of PROJECT is bound to the empty logical path,
-see `coq-eglot-lsp--root-load-path-args'."
+see `coq-eglot-lsp--root-load-path-args'.  The Eglot of Emacs 29 gives
+no PROJECT: the one of the current buffer, like Eglot."
   (let* ((command (coq-eglot-lsp-server-command))
-         (root (if project (project-root project) default-directory))
+         (root (project-root (or project (eglot--current-project))))
          (root-args (coq-eglot-lsp--root-load-path-args root)))
     (when root-args
-      (message "Coq: no project file found in %s, assuming -Q . \"\""
+      (message "Coq: no project file found in %s, assuming -R . \"\""
                (abbreviate-file-name root)))
     (cons 'coq-eglot-lsp-server
           (append command
@@ -320,6 +324,13 @@ then, `eglot-current-server' does not find it."
                  (delq nil (mapcar (lambda (process)
                                      (process-get process 'jsonrpc-connection))
                                    (process-list)))))))
+
+(defun coq-eglot-lsp-kill-connecting-servers ()
+  "Kill the servers of the current buffer still connecting.
+See `coq-eglot-lsp-connecting-servers'.  The Eglot of Emacs 29 reports
+their aborted initialization as an error: ignored."
+  (dolist (server (coq-eglot-lsp-connecting-servers))
+    (ignore-errors (jsonrpc-shutdown server))))
 
 (defun coq-eglot-lsp-shutdown ()
   "Stop the server of the current buffer, even if it is busy.

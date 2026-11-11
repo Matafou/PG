@@ -1532,7 +1532,7 @@ connected: no other one is started."
           (should (= (length (gethash (eglot--current-project)
                                       eglot--servers-by-project))
                      1)))
-      (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
+      (coq-eglot-lsp-kill-connecting-servers)
       (coq-eglot-lsp-shutdown))))
 
 (ert-deftest coq-eglot-request-not-sent ()
@@ -1559,10 +1559,10 @@ running: the buffer is not busy afterwards."
           ;; no process output read since: not connected yet
           (should-not (eglot-current-server))
           (let ((servers (coq-eglot-lsp-connecting-servers)))
-            (should (= (length servers) 1))
-            (jsonrpc-shutdown (car servers)))
+            (should (= (length servers) 1)))
+          (coq-eglot-lsp-kill-connecting-servers)
           (should-not (coq-eglot-lsp-connecting-servers)))
-      (mapc #'jsonrpc-shutdown (coq-eglot-lsp-connecting-servers))
+      (coq-eglot-lsp-kill-connecting-servers)
       (coq-eglot-lsp-shutdown))))
 
 (defmacro with-twin-texts (this-text twin-text &rest body)
@@ -2559,6 +2559,29 @@ like the compilation."
             (should (string-match-p "another load path" (nth 1 warned))))
           (coq-eglot-exit))
       (clean-load-path-library))))
+
+(ert-deftest coq-eglot-load-path-root ()
+  "Without project file, the root of the server is bound before the load
+path of the buffer, which wins for the subdirectories of the root.  The
+root is the one of the project of the buffer even if Eglot gives no
+project, like the one of Emacs 29."
+  (let ((enable-local-variables :all)
+        ;; not the directory of the buffer
+        (project-dir (file-name-directory
+                      (directory-file-name load-path-directory))))
+    (with-file (expand-file-name "eglot_load_path.v" load-path-directory)
+      (cl-letf (((symbol-function 'eglot--current-project)
+                 (lambda () (cons 'transient project-dir))))
+        (let* ((args (cdr (coq-eglot-lsp--contact nil)))
+               (root (member (directory-file-name project-dir)
+                             (mapcar (lambda (arg) (string-remove-suffix "," arg))
+                                     args)))
+               (lib (member (concat load-path-directory "lib,LoadPathLib")
+                            args)))
+          (should root)
+          (should lib)
+          (should (equal (nth (- (length args) (length root) 1) args) "-R"))
+          (should (> (length root) (length lib))))))))
 
 (ert-deftest coq-eglot-use-project-file-nil ()
   "Without `coq-use-project-file', the server of a file runs in its
