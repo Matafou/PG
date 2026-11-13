@@ -106,7 +106,7 @@ has no effect until Emacs is restarted."
                  (const :tag "None" nil)))
 
 (defconst coq-eglot-directory
-  (expand-file-name "../coq-eglot/"
+  (expand-file-name "eglot/"
                     (file-name-directory (or load-file-name buffer-file-name)))
   "Directory of the Eglot backend.")
 
