@@ -45,6 +45,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'pg-lcs)                        ; the alignment of sentences
 (require 'coq-indent)                   ; coq-script-parse-cmdend-forward
 (require 'diff-mode)                    ; the faces of the diffs
 (require 'coq-db)                       ; the faces of the diffs of Coq
@@ -454,82 +455,6 @@ See `coq-eglot-twin--sentence'.  Computed again if the buffer changed."
                           (vconcat (nreverse sentences))))))))
       (cdr coq-eglot-twin--sentences))))
 
-(defun coq-eglot-twin--common-subsequence (a b)
-  "Pairs (I . J) of a longest common subsequence of vectors A and B.
-In increasing order: A[I] and B[J] are `equal'.  The common beginning
-and end are paired first, the middle part with the algorithm of Myers.
-If the middle parts differ by more than
-`coq-eglot-twin-max-differences' elements, they are not paired."
-  (let* ((n (length a)) (m (length b))
-         (prefix 0) (suffix 0) (pairs nil))
-    (while (and (< prefix n) (< prefix m)
-                (equal (aref a prefix) (aref b prefix)))
-      (push (cons prefix prefix) pairs)
-      (setq prefix (1+ prefix)))
-    (while (and (< (+ prefix suffix) n) (< (+ prefix suffix) m)
-                (equal (aref a (- n suffix 1)) (aref b (- m suffix 1))))
-      (setq suffix (1+ suffix)))
-    (let ((middle (coq-eglot-twin--myers
-                   (substring a prefix (- n suffix))
-                   (substring b prefix (- m suffix)))))
-      (dolist (pair middle)
-        (push (cons (+ prefix (car pair)) (+ prefix (cdr pair))) pairs)))
-    (dotimes (i suffix)
-      (push (cons (- n suffix (- i)) (- m suffix (- i))) pairs))
-    (nreverse pairs)))
-
-(defun coq-eglot-twin--myers (a b)
-  "Pairs (I . J) of a longest common subsequence of vectors A and B.
-In increasing order.  The algorithm of Myers, in O((N+M)D) for D
-differences.  Nil if D exceeds `coq-eglot-twin-max-differences'."
-  (let* ((n (length a)) (m (length b))
-         (max-d (min (+ n m) coq-eglot-twin-max-differences))
-         (offset (1+ max-d))
-         (v (make-vector (+ 3 (* 2 max-d)) 0))
-         ;; the part -D-1..D+1 of V before each step D, for the way back
-         (trace nil)
-         (found nil))
-    (catch 'found
-      (dotimes (d (1+ max-d))
-        (push (substring v (- offset d 1) (+ offset d 2)) trace)
-        (let ((k (- d)))
-          (while (<= k d)
-            (let* ((x (if (or (= k (- d))
-                              (and (/= k d)
-                                   (< (aref v (+ offset k -1))
-                                      (aref v (+ offset k 1)))))
-                          (aref v (+ offset k 1))
-                        (1+ (aref v (+ offset k -1)))))
-                   (y (- x k)))
-              (while (and (< x n) (< y m) (equal (aref a x) (aref b y)))
-                (setq x (1+ x) y (1+ y)))
-              (aset v (+ offset k) x)
-              (when (and (>= x n) (>= y m))
-                (setq found d)
-                (throw 'found nil)))
-            (setq k (+ k 2))))))
-    (when found
-      (let ((x n) (y m) (pairs nil) (d found))
-        (dolist (before trace)
-          ;; BEFORE is V before step D, indexed from -D-1
-          (let* ((k (- x y))
-                 (get (lambda (k) (aref before (+ k d 1))))
-                 (prev-k (if (or (= k (- d))
-                                 (and (/= k d)
-                                      (< (funcall get (1- k))
-                                         (funcall get (1+ k)))))
-                             (1+ k)
-                           (1- k)))
-                 (prev-x (funcall get prev-k))
-                 (prev-y (- prev-x prev-k)))
-            (while (and (> x prev-x) (> y prev-y))
-              (setq x (1- x) y (1- y))
-              (push (cons x y) pairs))
-            (when (> d 0)
-              (setq x prev-x y prev-y))
-            (setq d (1- d))))
-        pairs))))
-
 (defun coq-eglot-twin--align (&optional buffer)
   "Vector of the pairs of sentences of BUFFER and its twin.
 The pairs (I . J) of the indices of the paired sentences, I in BUFFER,
@@ -547,11 +472,12 @@ from THIS, PAIRS-OTHER from OTHER."
          (alignment (coq-eglot-twin--twins-alignment twins)))
     (unless (equal ticks (take 2 alignment))
       (let ((pairs (vconcat
-                    (coq-eglot-twin--common-subsequence
+                    (pg-lcs-common-subsequence
                      (cl-map 'vector #'coq-eglot-twin--sentence-text
                              (coq-eglot-twin--sentences this))
                      (cl-map 'vector #'coq-eglot-twin--sentence-text
-                             (coq-eglot-twin--sentences other))))))
+                             (coq-eglot-twin--sentences other))
+                     coq-eglot-twin-max-differences))))
         (setq alignment
               (append ticks
                       (list pairs
@@ -623,31 +549,15 @@ the twin if none."
         (coq-eglot-twin--sentence-end (aref twin-sentences (cdr pair))))
        (t (with-current-buffer coq-eglot--twin (point-min)))))))
 
-(defun coq-eglot-twin--gaps (pairs n m)
-  "The runs of two sequences of lengths N and M between their PAIRS.
-PAIRS, a list or a vector, are the pairs (I . J) of the indices of
-their paired elements, in increasing order.  A list of (RUN-A . RUN-B),
-the indices of the elements of the run in each sequence, each (FIRST
-. END), END excluded, or nil if the run is empty on this side."
-  (let ((runs nil) (i 0) (j 0))
-    (seq-doseq (pair (vconcat pairs (vector (cons n m))))
-      (when (or (< i (car pair)) (< j (cdr pair)))
-        (push (cons (and (< i (car pair)) (cons i (car pair)))
-                    (and (< j (cdr pair)) (cons j (cdr pair))))
-              runs))
-      (setq i (1+ (car pair)) j (1+ (cdr pair))))
-    (nreverse runs)))
-
 (defun coq-eglot-twin--zones (&optional buffer)
   "The diverging zones of BUFFER and of its twin.
 A list of (THIS . TWIN), the indices of the sentences of the zone in
 BUFFER and in its twin, each (FIRST . END), END excluded, or nil if the
 zone is empty on this side.  BUFFER defaults to the current one."
   (with-current-buffer (or buffer (current-buffer))
-    (coq-eglot-twin--gaps (coq-eglot-twin--align)
-                          (length (coq-eglot-twin--sentences))
-                          (length (coq-eglot-twin--sentences
-                                   coq-eglot--twin)))))
+    (pg-lcs-gaps (coq-eglot-twin--align)
+                 (length (coq-eglot-twin--sentences))
+                 (length (coq-eglot-twin--sentences coq-eglot--twin)))))
 
 ;;; Highlighting of the diverging zones
 
@@ -741,9 +651,10 @@ Only in the zones with sentences on both sides, see
           (pcase-dolist (`(,run . ,twin-run)
                          (coq-eglot-twin--unmatched words twin-words))
             (when run
-              (coq-eglot-twin--mark this words run face 12 t))
+              (coq-eglot-twin--mark-refine this words run face 12))
             (when twin-run
-              (coq-eglot-twin--mark twin twin-words twin-run twin-face 12 t))))))))
+              (coq-eglot-twin--mark-refine twin twin-words twin-run
+                                          twin-face 12))))))))
 
 (defun coq-eglot-twin--highlight (&optional buffer)
   "Highlight the diverging sentences of BUFFER and of its twin.
@@ -1171,15 +1082,16 @@ Each one (START END . TEXT).  Not those in comments if NO-COMMENTS."
 A list of (RANGE-A . RANGE-B), each (FIRST . END), END excluded, or nil
 if the run is empty on this side.  A and B are vectors of pieces, see
 `coq-eglot-twin--pieces'."
-  (coq-eglot-twin--gaps (coq-eglot-twin--common-subsequence
-                         (cl-map 'vector #'cddr a) (cl-map 'vector #'cddr b))
-                        (length a) (length b)))
+  (pg-lcs-gaps (pg-lcs-common-subsequence
+                (cl-map 'vector #'cddr a) (cl-map 'vector #'cddr b)
+                coq-eglot-twin-max-differences)
+               (length a) (length b)))
 
-(defun coq-eglot-twin--mark (buffer pieces range face priority &optional script)
+(defun coq-eglot-twin--mark (buffer pieces range face priority property record)
   "Highlight the PIECES of BUFFER in RANGE with FACE, at PRIORITY.
-Line by line.  In a SCRIPT buffer if non-nil, the words of its
-diverging zones, see `coq-eglot-twin--refine-zones', otherwise an
-output buffer.  Return the bounds (START . END) of the range."
+Line by line.  Each overlay gets PROPERTY set to t, and is passed to
+the function RECORD, called in BUFFER.  Return the bounds (START . END)
+of the range."
   (with-current-buffer buffer
     (let ((i (car range)))
       (while (< i (cdr range))
@@ -1194,14 +1106,28 @@ output buffer.  Return the bounds (START . END) of the range."
           (let ((overlay (make-overlay start end nil nil nil)))
             (overlay-put overlay 'face face)
             (overlay-put overlay 'priority priority)
-            (if script
-                (progn (overlay-put overlay 'coq-eglot-twin-refine t)
-                       (push overlay coq-eglot-twin--overlays))
-              (overlay-put overlay 'coq-eglot-twin t)
-              (push overlay coq-eglot-twin--output-overlays)))
+            (overlay-put overlay property t)
+            (funcall record overlay))
           (setq i (1+ i))))))
   (cons (car (aref pieces (car range)))
         (cadr (aref pieces (1- (cdr range))))))
+
+(defun coq-eglot-twin--mark-refine (buffer pieces range face priority)
+  "Highlight the words PIECES of a script BUFFER in RANGE.
+With FACE, at PRIORITY, see `coq-eglot-twin--mark'.  The words of its
+diverging zones, see `coq-eglot-twin--refine-zones'."
+  (coq-eglot-twin--mark buffer pieces range face priority
+                        'coq-eglot-twin-refine
+                        (lambda (overlay)
+                          (push overlay coq-eglot-twin--overlays))))
+
+(defun coq-eglot-twin--mark-output (buffer pieces range face priority)
+  "Highlight the PIECES of an output BUFFER in RANGE.
+With FACE, at PRIORITY, see `coq-eglot-twin--mark'."
+  (coq-eglot-twin--mark buffer pieces range face priority
+                        'coq-eglot-twin
+                        (lambda (overlay)
+                          (push overlay coq-eglot-twin--output-overlays))))
 
 (defun coq-eglot-twin--compare-buffers (a b face-a words-a face-b words-b)
   "Highlight the lines of buffers A and B without match in the other one.
@@ -1212,10 +1138,10 @@ the words that differ, with WORDS-A and WORDS-B."
         (word coq-eglot-twin--word-regexp))
     (pcase-dolist (`(,range-a . ,range-b)
                    (coq-eglot-twin--unmatched lines-a lines-b))
-      (let ((bounds-a (and range-a (coq-eglot-twin--mark a lines-a range-a
-                                                         face-a 10)))
-            (bounds-b (and range-b (coq-eglot-twin--mark b lines-b range-b
-                                                         face-b 10))))
+      (let ((bounds-a (and range-a (coq-eglot-twin--mark-output
+                                    a lines-a range-a face-a 10)))
+            (bounds-b (and range-b (coq-eglot-twin--mark-output
+                                    b lines-b range-b face-b 10))))
         (when (and bounds-a bounds-b)
           (let ((pieces-a (coq-eglot-twin--pieces a word (car bounds-a)
                                                   (cdr bounds-a)))
@@ -1224,9 +1150,9 @@ the words that differ, with WORDS-A and WORDS-B."
             (pcase-dolist (`(,run-a . ,run-b)
                            (coq-eglot-twin--unmatched pieces-a pieces-b))
               (when run-a
-                (coq-eglot-twin--mark a pieces-a run-a words-a 11))
+                (coq-eglot-twin--mark-output a pieces-a run-a words-a 11))
               (when run-b
-                (coq-eglot-twin--mark b pieces-b run-b words-b 11)))))))))
+                (coq-eglot-twin--mark-output b pieces-b run-b words-b 11)))))))))
 
 ;;; The twin of reference
 

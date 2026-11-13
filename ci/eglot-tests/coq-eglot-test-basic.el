@@ -1620,18 +1620,17 @@ Definition s := \"a (* not a comment *) . string\"." ""
 
 (ert-deftest coq-eglot-twin-common-subsequence ()
   "The longest common subsequence of two vectors, as pairs of indices."
-  (should (equal (coq-eglot-twin--common-subsequence [] []) nil))
-  (should (equal (coq-eglot-twin--common-subsequence [a b c] [a b c])
+  (should (equal (pg-lcs-common-subsequence [] []) nil))
+  (should (equal (pg-lcs-common-subsequence [a b c] [a b c])
                  '((0 . 0) (1 . 1) (2 . 2))))
-  (should (equal (coq-eglot-twin--common-subsequence [a b c d] [a x c d y])
+  (should (equal (pg-lcs-common-subsequence [a b c d] [a x c d y])
                  '((0 . 0) (2 . 2) (3 . 3))))
-  (should (equal (coq-eglot-twin--common-subsequence [a b c] [x a y c])
+  (should (equal (pg-lcs-common-subsequence [a b c] [x a y c])
                  '((0 . 1) (2 . 3))))
   ;; too many differences in the middle: only the beginning and end
-  (let ((coq-eglot-twin-max-differences 2))
-    (should (equal (coq-eglot-twin--common-subsequence
-                    [s a b c e] [s x y z a e])
-                   '((0 . 0) (4 . 5))))))
+  (should (equal (pg-lcs-common-subsequence
+                  [s a b c e] [s x y z a e] 2)
+                 '((0 . 0) (4 . 5)))))
 
 (ert-deftest coq-eglot-twin-alignment ()
   "Sentences differing by comments and blanks only are paired, the
