@@ -24,6 +24,34 @@
 (require 'coq-system)                   ; coq-project-filename
 (require 'coq-project)                  ; coq-include-options
 
+;; Private symbols of Eglot and jsonrpc used in this file.  When Eglot
+;; changes (new Emacs, new Eglot from ELPA), check that each one still
+;; exists with the same meaning: run the test
+;; `coq-eglot-lsp-internals-exist', then read the new definitions of
+;; these symbols.  Each element is (KIND SYMBOL...) with KIND `function'
+;; or `variable': one of the SYMBOLs must exist, they are the
+;; alternatives of different versions.
+(defconst coq-eglot-lsp--internals
+  '((function jsonrpc--process)
+    (function jsonrpc--async-request-1)
+    ;; an alist since jsonrpc 1.0.24 (Emacs 30), a hash table before
+    (function jsonrpc--continuations jsonrpc--request-continuations)
+    (function eglot--project)
+    (function eglot--current-project)
+    (function eglot--guess-contact)
+    (function eglot--managed-buffers)
+    (function eglot--pos-to-lsp-position)
+    (function eglot--lsp-position-to-point)
+    (function eglot--signal-textDocument/didChange)
+    (function eglot--VersionedTextDocumentIdentifier)
+    (function eglot--TextDocumentIdentifier)
+    (function eglot-uri-to-path eglot--uri-to-path)
+    (variable eglot--servers-by-project)
+    (variable eglot--managed-mode)
+    (variable eglot--versioned-identifier))
+  "Internal functions and variables of Eglot and jsonrpc that we use.
+See the comment above for what to check when Eglot changes.")
+
 (defgroup coq-eglot nil
   "Coq backend using a language server through Eglot."
   :group 'coq-mode)
@@ -102,6 +130,42 @@ Ask the ocamlc installed next to it, like in an opam switch."
                           (ignore-errors (car (process-lines ocamlc "-version")))))
                    coq-eglot-lsp--ocaml-versions))))))
 
+;; the output of --version is the number alone, like "0.2.5": keep the
+;; first dotted number of the first line to be robust
+(defvar coq-eglot-lsp--server-versions (make-hash-table :test #'equal)
+  "Cache of the versions of the servers, by file name.")
+
+(defun coq-eglot-lsp--server-version (program)
+  "Version of the server PROGRAM, as a string, or nil if unknown.
+Run it once with --version, and keep the answer by file name."
+  (let ((exe (executable-find program)))
+    (when exe
+      (setq exe (file-truename exe))
+      (let ((cached (gethash exe coq-eglot-lsp--server-versions 'unknown)))
+        (if (not (eq cached 'unknown))
+            cached
+          (puthash exe
+                   (ignore-errors
+                     (let ((line (car (process-lines exe "--version"))))
+                       (and line
+                            (string-match "[0-9]+\\(?:\\.[0-9]+\\)+" line)
+                            (match-string 0 line))))
+                   coq-eglot-lsp--server-versions))))))
+
+(defconst coq-eglot-lsp-minimal-version "0.2.3"
+  "Oldest version of coq-lsp supported.
+It added the range of the sentence to the answer of proof/goals, and
+the request petanque/get_state_at_pos.")
+
+(defun coq-eglot-lsp--check-server-version (program)
+  "Signal a user error if the server PROGRAM is too old.
+Do nothing if its version is unknown: the server may still work."
+  (let ((version (coq-eglot-lsp--server-version program)))
+    (when (and version (version< version coq-eglot-lsp-minimal-version))
+      (user-error "coq-lsp %s is too old for the Eglot backend of Coq, \
+version %s or later is needed (%s)"
+                  version coq-eglot-lsp-minimal-version program))))
+
 (defun coq-eglot-lsp--memprof-p (version)
   "Non-nil if OCaml VERSION supports memprof-limits: 4.x or >= 5.3."
   (and version
@@ -148,6 +212,15 @@ reset the options given at initialization."
 ;; Must run after `eglot-signal-didChangeConfiguration'
 (add-hook 'eglot-connect-hook #'coq-eglot-lsp--send-options t)
 
+(defun coq-eglot-lsp--logical-binding (dir path)
+  "Argument DIR,PATH of -R and -Q.
+Signal a user error if DIR has a comma: coq-lsp splits the argument at
+the comma, and there is no way to escape it."
+  (when (string-search "," dir)
+    (user-error "Directory %s has a comma, which coq-lsp cannot bind \
+(-R DIR,LP): rename it" dir))
+  (concat (directory-file-name dir) "," path))
+
 (defun coq-eglot-lsp-load-path-args (&optional command)
   "Options -R and -Q of the server, from `coq-load-path'.
 The load path of the current buffer, like the compilation uses it, see
@@ -171,16 +244,24 @@ options."
                (push (list option (pop options)) args)
              (let* ((dir (pop options))
                     (path (pop options)))
-               (push (list option (concat (directory-file-name dir) "," path))
+               (push (list option (coq-eglot-lsp--logical-binding dir path))
                      args))))
           ((or "-I" "-package") (unless command (pop options))))))
     (apply #'append (nreverse args))))
 
 (defun coq-eglot-lsp--server-load-path-args (server)
-  "Options -R and -Q of the command line of SERVER."
+  "Options -R and -Q of the command line of SERVER.
+Without those of `coq-eglot-server-program', which come first: they are
+the same for all the files."
   (let ((process (jsonrpc--process server)))
     (and (processp process)
-         (coq-eglot-lsp-load-path-args (cdr (process-command process))))))
+         (let* ((args (coq-eglot-lsp-load-path-args
+                       (cdr (process-command process))))
+                (own (coq-eglot-lsp-load-path-args
+                      (cdr coq-eglot-server-program))))
+           (if (equal (seq-take args (length own)) own)
+               (nthcdr (length own) args)
+             args)))))
 
 (defun coq-eglot-lsp-check-load-path ()
   "Warn if the server of the current buffer has another load path.
@@ -221,7 +302,7 @@ of ROOT would hide the -R of its subdirectories in the load path of
 the buffer."
   (unless (seq-some (lambda (name) (file-exists-p (expand-file-name name root)))
                     '("_CoqProject" "_RocqProject"))
-    (list "-R" (concat (directory-file-name (expand-file-name root)) ","))))
+    (list "-R" (coq-eglot-lsp--logical-binding (expand-file-name root) ""))))
 
 (defun coq-eglot-lsp--contact (&optional _interactive project)
   "Eglot contact for Coq: our server class and its command line.
@@ -233,14 +314,21 @@ see `coq-eglot-lsp--root-load-path-args'.  The Eglot of Emacs 29 gives
 no PROJECT: the one of the current buffer, like Eglot."
   (let* ((command (coq-eglot-lsp-server-command))
          (root (project-root (or project (eglot--current-project))))
-         (root-args (coq-eglot-lsp--root-load-path-args root)))
+         (root-args (coq-eglot-lsp--root-load-path-args root))
+         (buffer-args
+          (condition-case err
+              (coq-eglot-lsp-load-path-args)
+            (user-error (signal (car err) (cdr err)))
+            (error (user-error "Invalid `coq-load-path': %s"
+                               (error-message-string err))))))
+    (coq-eglot-lsp--check-server-version (car command))
     (when root-args
       (message "Coq: no project file found in %s, assuming -R . \"\""
                (abbreviate-file-name root)))
     (cons 'coq-eglot-lsp-server
           (append command
                   root-args
-                  (coq-eglot-lsp-load-path-args)
+                  buffer-args
                   (when coq-eglot-server-idle-delay
                     (list (format "--idle-delay=%s"
                                   coq-eglot-server-idle-delay)))
@@ -316,7 +404,7 @@ then, `eglot-current-server' does not find it."
   (let* ((project (eglot--current-project))
          (connected (gethash project eglot--servers-by-project)))
     (seq-filter (lambda (server)
-                  (and (cl-typep server 'eglot-lsp-server)
+                  (and (cl-typep server 'coq-eglot-lsp-server)
                        (equal (eglot--project server) project)
                        (not (memq server connected))
                        (jsonrpc-running-p server)))
@@ -644,11 +732,6 @@ list of strings, or signal an error if COMMAND fails."
 (defun coq-eglot-lsp--buffer (uri)
   "The live buffer visiting URI, or nil."
   (find-buffer-visiting (coq-eglot-lsp--uri-to-path uri)))
-
-(defconst coq-eglot-lsp-minimal-version "0.2.3"
-  "Oldest version of coq-lsp supported.
-It added the range of the sentence to the answer of proof/goals, and
-the request petanque/get_state_at_pos.")
 
 (cl-defmethod eglot-handle-notification
   ((_server coq-eglot-lsp-server) (_method (eql $/coq/serverVersion))

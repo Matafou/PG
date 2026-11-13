@@ -182,12 +182,16 @@ With `setq', not saved by customize."
 (defun coq-eglot-compile-requires (start end on-done)
   "Compile the libraries required by the sentences between START and END.
 Return nil if there is nothing to compile: no Require sentence there,
-or `coq-compile-before-require' is nil.  Otherwise start the
-compilation in the background and return non-nil.  ON-DONE is called
-later in the current buffer with nil if all the compilations
-succeeded, otherwise with the start of the first Require sentence
-whose compilation failed.  The errors are displayed by the
-compilation."
+or `coq-compile-before-require' is nil.  Then ON-DONE is not called.
+Otherwise return non-nil, and ON-DONE is called exactly once in the
+current buffer, with nil if all the compilations succeeded, otherwise
+with the start of the first Require sentence whose compilation failed.
+It is called later, when the background compilation ends, except if
+the compilation could not start: then it is called with a failure
+before this function returns.  The return value is non-nil in that
+case too, so that the caller does not continue twice.  It is not
+called if the compilation is cancelled, see `coq-eglot-compile-cancel'.
+The errors are displayed by the compilation."
   (let ((requires (and coq-compile-before-require
                        (coq-eglot-compile--require-sentences start end))))
     ;; the processed Require sentences are after the proof position
@@ -320,15 +324,23 @@ Mark them and the mode line."
       (when coq-eglot-compile--loaded
         (coq-eglot-compile-check-outdated)))))
 
+(defun coq-eglot-compile--any-loaded-p ()
+  "Non-nil if some live buffer has compiled Require sentences."
+  (seq-some (lambda (buffer)
+              (buffer-local-value 'coq-eglot-compile--loaded buffer))
+            (buffer-list)))
+
 (defun coq-eglot-compile--file-changed ()
-  "A file buffer was saved or reverted: it may be a library."
-  (when buffer-file-name
+  "A file buffer was saved or reverted: it may be a library.
+Do nothing if no buffer has compiled Require sentences."
+  (when (and buffer-file-name (coq-eglot-compile--any-loaded-p))
     (coq-eglot-compile-check-all-outdated)))
 
 (defun coq-eglot-compile--file-modified ()
   "A file buffer is about to be modified: it may be a library.
-Check after the modification, when the buffer is marked as modified."
-  (when buffer-file-name
+Check after the modification, when the buffer is marked as modified.
+Do nothing if no buffer has compiled Require sentences."
+  (when (and buffer-file-name (coq-eglot-compile--any-loaded-p))
     (run-at-time 0 nil #'coq-eglot-compile-check-all-outdated)))
 
 (add-hook 'first-change-hook #'coq-eglot-compile--file-modified)

@@ -3454,6 +3454,116 @@ wide as the window."
     (should (equal (coq-eglot--format-hyp '(:names ["H"] :ty "a /\\ \nb"))
                    "  H :\n    a /\\\n    b"))))
 
+;;; Robustness of the connection
+
+(ert-deftest coq-eglot-lsp-internals-exist ()
+  "The internals of Eglot and jsonrpc we use exist, one of the
+alternatives of each.  Needs no server."
+  (dolist (entry coq-eglot-lsp--internals)
+    (should (seq-some (lambda (symbol)
+                        (if (eq (car entry) 'function)
+                            (fboundp symbol)
+                          (boundp symbol)))
+                      (cdr entry)))))
+
+(defmacro with-fake-server (output &rest body)
+  "Run BODY with the server `fake-server', printing OUTPUT with --version."
+  (declare (indent 1) (debug t))
+  `(let* ((fake-server (make-temp-file "fake-lsp" nil ".sh"))
+          (coq-eglot-lsp--server-versions (make-hash-table :test #'equal))
+          (coq-eglot-server-program (list fake-server)))
+     (unwind-protect
+         (progn
+           (with-temp-file fake-server
+             (insert "#!/bin/sh\n" ,output))
+           (set-file-modes fake-server #o755)
+           ,@body)
+       (delete-file fake-server))))
+
+(ert-deftest coq-eglot-server-version-check ()
+  "A server older than the minimal version is refused before starting,
+an unknown version is not."
+  (let ((enable-local-variables nil))
+    (with-fake-server "echo 0.1.9"
+      (should (equal (coq-eglot-lsp--server-version fake-server) "0.1.9"))
+      (let ((err (should-error (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))
+                               :type 'user-error)))
+        (should (string-match-p "too old" (cadr err)))))
+    (with-fake-server "echo 'coq-lsp 0.2.5+9.2'"
+      (should (equal (coq-eglot-lsp--server-version fake-server) "0.2.5"))
+      (should (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))))
+    (with-fake-server "echo unknown"
+      (should-not (coq-eglot-lsp--server-version fake-server))
+      (should (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))))
+    (with-fake-server "exit 1"
+      (should-not (coq-eglot-lsp--server-version fake-server))
+      (should (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))))))
+
+(ert-deftest coq-eglot-server-version-cached ()
+  "The server is run once with --version."
+  (with-fake-server "echo 0.2.5"
+    (let ((calls 0))
+      (cl-letf* ((orig (symbol-function 'process-lines))
+                 ((symbol-function 'process-lines)
+                  (lambda (&rest args) (cl-incf calls) (apply orig args))))
+        (coq-eglot-lsp--server-version fake-server)
+        (coq-eglot-lsp--server-version fake-server)
+        (should (= calls 1))))))
+
+(ert-deftest coq-eglot-load-path-server-program-args ()
+  "The -R and -Q of `coq-eglot-server-program' are not compared with
+the load path of the buffer."
+  (let ((process (make-process :name "fake-coq-lsp" :noquery t
+                               :command '("sleep" "30" "-R" "a,A"
+                                          "-Q" "b,B" "-R" "c,C")))
+        (coq-eglot-server-program '("sleep" "30" "-R" "a,A" "-Q" "b,B")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'jsonrpc--process) (lambda (_) process)))
+          (should (equal (coq-eglot-lsp--server-load-path-args nil)
+                         '("-R" "c,C")))
+          (let ((coq-eglot-server-program '("sleep" "30")))
+            (should (equal (coq-eglot-lsp--server-load-path-args nil)
+                           '("-R" "a,A" "-Q" "b,B" "-R" "c,C")))))
+      (delete-process process))))
+
+(ert-deftest coq-eglot-load-path-invalid ()
+  "An invalid `coq-load-path' is a user error naming it."
+  (let ((coq-eglot-server-program '("coq-lsp"))
+        (coq-load-path '(42)))
+    (with-programs '("coq-lsp")
+      (let ((err (should-error (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))
+                               :type 'user-error)))
+        (should (string-match-p "coq-load-path" (cadr err)))))))
+
+(ert-deftest coq-eglot-load-path-comma ()
+  "A comma in a directory is a user error: coq-lsp splits -R DIR,LP there."
+  (should-error (coq-eglot-lsp--root-load-path-args "/tmp/a,b/")
+                :type 'user-error)
+  (let ((coq-load-path '((rec "lib,x" "Lib"))))
+    (should-error (coq-eglot-lsp-load-path-args) :type 'user-error))
+  (should (equal (coq-eglot-lsp--logical-binding "/tmp/ab/" "Lib")
+                 "/tmp/ab,Lib")))
+
+(ert-deftest coq-eglot-compile-hooks-cheap ()
+  "The hooks of the outdated libraries schedule nothing if no buffer
+has compiled Require sentences."
+  (let (scheduled)
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest _) (setq scheduled t))))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/not-a-real-file.v")
+        (unwind-protect
+            (progn
+              (should-not (coq-eglot-compile--any-loaded-p))
+              (coq-eglot-compile--file-modified)
+              (should-not scheduled)
+              (setq coq-eglot-compile--loaded (list 'overlay))
+              (should (coq-eglot-compile--any-loaded-p))
+              (coq-eglot-compile--file-modified)
+              (should scheduled))
+          (setq coq-eglot-compile--loaded nil
+                buffer-file-name nil))))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here
