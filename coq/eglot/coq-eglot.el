@@ -278,7 +278,7 @@ current one."
       (coq-eglot--update-overlays)
       (coq-eglot--goals-at-position-async))))
 
-(defun coq-eglot--script-buffer ()
+(defun coq-eglot-script-buffer ()
   "Return the script buffer a command of the backend acts on.
 The current buffer in a script buffer, the active script buffer in the
 goals and response buffers, like in Proof General."
@@ -291,9 +291,9 @@ goals and response buffers, like in Proof General."
 
 (defmacro coq-eglot--with-script (&rest body)
   "Run BODY in the script buffer of the command, made active.
-See `coq-eglot--script-buffer'."
+See `coq-eglot-script-buffer'."
   (declare (indent 0) (debug t))
-  `(with-current-buffer (coq-eglot--script-buffer)
+  `(with-current-buffer (coq-eglot-script-buffer)
      (setq coq-eglot--command-buffer (current-buffer))
      (coq-eglot--activate)
      ,@body))
@@ -1977,7 +1977,7 @@ backend, see `coq-Show'."
   "Move point to the proof position.
 In the goals and response buffers, go to the script buffer first."
   (interactive)
-  (let ((buffer (coq-eglot--script-buffer)))
+  (let ((buffer (coq-eglot-script-buffer)))
     (unless (eq buffer (current-buffer))
       (pop-to-buffer buffer))
     (goto-char (coq-eglot-position))))
@@ -2165,6 +2165,106 @@ Run when Eglot starts or stops managing the buffer."
                 (cl-substitute #'coq-eglot--hover-eldoc-function
                                #'eglot-hover-eldoc-function
                                eldoc-documentation-functions))))
+
+;;; Interface of the extensions
+;;
+;; What the extensions of the backend, the two Rocq mode and the
+;; sandboxes (coq-eglot-twin.el, coq-eglot-sandbox.el), use of it, to
+;; keep them away from its internals: the check running, the proof
+;; position, the output of a script buffer, the buffer where the user
+;; works.
+
+(defun coq-eglot-checking-p ()
+  "Non-nil if the server checks a part of the current script buffer."
+  (and coq-eglot--running t))
+
+(defun coq-eglot-check-target ()
+  "End of the part of the current script buffer being checked, or nil."
+  (and coq-eglot--running
+       (marker-position (plist-get coq-eglot--running :target))))
+
+(defun coq-eglot-move-proof-position (target)
+  "Move the proof position of the current script buffer to TARGET.
+Forward or back, without making the buffer the one where the user
+works, see `coq-eglot-working-buffer'.  During a check, only further
+than the part being checked: return nil if TARGET is before its end,
+non-nil otherwise."
+  (cond
+   (coq-eglot--running
+    (let ((end (coq-eglot-check-target)))
+      (cond ((> target end) (coq-eglot--queue target) t)
+            ((= target end) t))))
+   ((< target (coq-eglot-position)) (coq-eglot--retract target) t)
+   ((> target (coq-eglot-position)) (coq-eglot--advance target) t)
+   (t t)))
+
+(defun coq-eglot-next-sentence-position (pos)
+  "Position after the blanks and comments following POS."
+  (coq-eglot--skip-forward pos))
+
+(defun coq-eglot-processed-overlays ()
+  "Overlays of the processed part and of the part being checked.
+Those that are displayed, not empty."
+  (seq-filter (lambda (overlay)
+                (and (overlayp overlay) (overlay-buffer overlay)
+                     (< (overlay-start overlay) (overlay-end overlay))))
+              (list coq-eglot--locked-overlay coq-eglot--queue-overlay)))
+
+(defun coq-eglot-working-buffer ()
+  "The script buffer where the user works, or nil.
+The one of the last command of the backend or of the last edition."
+  coq-eglot--command-buffer)
+
+(defun coq-eglot-set-working-buffer (buffer)
+  "Make BUFFER the script buffer where the user works."
+  (setq coq-eglot--command-buffer buffer))
+
+(defun coq-eglot-own-output-p ()
+  "Non-nil if the current script buffer has an output of its own.
+See `coq-eglot-give-own-output'."
+  (and coq-eglot--buffer-output t))
+
+(defun coq-eglot-give-own-output (suffix)
+  "Give the current script buffer an output of its own.
+Its goals and messages are displayed in buffers named with SUFFIX,
+like \"*goals*SUFFIX\", at the same time as the ones of the other
+script buffers.  See `coq-eglot-share-output'."
+  ;; it leaves the output it shared
+  (coq-eglot--forget-active)
+  (setq coq-eglot--buffer-output (coq-eglot--make-output suffix))
+  (coq-eglot--update-overlays))
+
+(defun coq-eglot-share-output ()
+  "Give the current script buffer the output of the other ones back.
+The buffers of its own output are killed, see
+`coq-eglot-give-own-output'."
+  (when coq-eglot--buffer-output
+    (dolist (name (list (coq-eglot--goals-name)
+                        (coq-eglot--conclusion-name)
+                        (coq-eglot--response-name)))
+      (let ((output (get-buffer name)))
+        (when output
+          (coq-eglot--delete-windows name)
+          (kill-buffer output))))
+    (setq coq-eglot--buffer-output nil)
+    (coq-eglot--update-overlays)))
+
+(defun coq-eglot-output-buffers ()
+  "The goals, conclusion and response buffers of the current script buffer.
+A list of three, each a buffer or nil: the conclusion only if
+`coq-eglot-split-goals'."
+  (mapcar (lambda (name) (and name (get-buffer name)))
+          (list (coq-eglot--goals-name)
+                (and coq-eglot-split-goals (coq-eglot--conclusion-name))
+                (coq-eglot--response-name))))
+
+(defun coq-eglot-display-script (buffer)
+  "Display the output of script BUFFER, in the selected window.
+BUFFER becomes the active script buffer of its output, its goals and
+messages windows are laid out."
+  (with-current-buffer buffer
+    (coq-eglot--activate)
+    (coq-eglot-layout-windows)))
 
 ;;; Mode
 

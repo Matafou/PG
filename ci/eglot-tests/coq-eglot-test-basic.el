@@ -1304,10 +1304,10 @@ the same time, in their own goals buffers, and both stay active."
             ;; the goals buffers know their output
             (with-current-buffer "*goals*<2>"
               (should (eq (coq-eglot--output) output))
-              (should (eq (coq-eglot--script-buffer) second)))
+              (should (eq (coq-eglot-script-buffer) second)))
             (with-current-buffer "*goals*"
               (should (eq (coq-eglot--output) coq-eglot--default-output))
-              (should (eq (coq-eglot--script-buffer) first)))))
+              (should (eq (coq-eglot-script-buffer) first)))))
       (when (buffer-live-p second)
         (with-current-buffer second (set-buffer-modified-p nil))
         (kill-buffer second))
@@ -1576,13 +1576,12 @@ server, only their sentences and their alignment."
          (progn
            (with-current-buffer twin
              (insert ,twin-text)
-             (coq-mode)
-             (setq coq-eglot--twin this)
-             (setq coq-eglot-twin--reference t))
+             (coq-mode))
            (with-current-buffer this
              (insert ,this-text)
-             (coq-mode)
-             (setq coq-eglot--twin twin)
+             (coq-mode))
+           (coq-eglot-twin--link this twin)
+           (with-current-buffer this
              ,@body))
        (kill-buffer this)
        (kill-buffer twin))))
@@ -1768,10 +1767,10 @@ ones together, and updated when idle after a change."
         (add-hook 'after-change-functions #'coq-eglot-twin--after-change nil t)
         (goto-char (point-max))
         (delete-region (search-position "Check 4.") (point-max)))
-      (should coq-eglot-twin--timer)
-      (cancel-timer coq-eglot-twin--timer)
-      (coq-eglot-twin--idle-update)
-      (should-not coq-eglot-twin--timer)
+      (should (coq-eglot-twin--twins-highlight-timer coq-eglot-twin--twins))
+      (cancel-timer (coq-eglot-twin--twins-highlight-timer coq-eglot-twin--twins))
+      (coq-eglot-twin--idle-update coq-eglot-twin--twins)
+      (should-not (coq-eglot-twin--twins-highlight-timer coq-eglot-twin--twins))
       (should (equal (highlighted twin) '("Check 20. Check 30.")))
       (coq-eglot-twin--stop-alignment twin)
       (should-not (highlighted twin)))))
@@ -1832,8 +1831,8 @@ blending theirs with the one of the processed part."
                      (overlays-in (point-min) (point-max))))
     (should (memq #'coq-eglot-twin--after-change after-change-functions))
     ;; the twin paired is the reference: removed there, added here
-    (should (buffer-local-value 'coq-eglot-twin--reference twin))
-    (should-not coq-eglot-twin--reference)
+    (should (coq-eglot-twin--reference-p twin))
+    (should-not (coq-eglot-twin--reference-p))
     (cl-flet ((faces (buffer)
                 (delete-dups (mapcar (lambda (overlay) (overlay-get overlay 'face))
                                      (seq-filter
@@ -1844,11 +1843,12 @@ blending theirs with the one of the processed part."
       (should (equal (faces (current-buffer)) '(coq-eglot-twin-added)))
       (should (equal (faces twin) '(coq-eglot-twin-removed)))
       (coq-eglot-twin-swap-reference)
-      (should coq-eglot-twin--reference)
+      (should (coq-eglot-twin--reference-p))
       (should (equal (faces (current-buffer)) '(coq-eglot-twin-removed)))
       (should (equal (faces twin) '(coq-eglot-twin-added))))
     (coq-eglot-twin-unpair)
-    (should-not coq-eglot-twin--reference)
+    (should-not (coq-eglot-twin--reference-p))
+    (should-not coq-eglot-twin--twins)
     (should-not (cl-some (lambda (overlay) (overlay-get overlay 'coq-eglot-twin))
                          (overlays-in (point-min) (point-max))))
     (should-not (memq #'coq-eglot-twin--after-change after-change-functions))
@@ -1932,7 +1932,9 @@ In two directories, so two servers.  The twin is bound to `twin'."
                         (or coq-eglot--running coq-eglot-twin--follow-timer
                             coq-eglot-twin--following
                             coq-eglot-twin--show-timer
-                            coq-eglot-twin--compare-timer)))
+                            (and coq-eglot-twin--twins
+                                 (coq-eglot-twin--twins-compare-timer
+                                  coq-eglot-twin--twins)))))
                     (list (current-buffer) coq-eglot--twin))
       (accept-process-output nil 0.02))))
 
