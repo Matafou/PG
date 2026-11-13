@@ -68,6 +68,16 @@
   (funcall command)
   (wait-for-coq))
 
+(defmacro as-user (buffer &rest body)
+  "Run BODY in BUFFER as a command of the user there.
+In the selected window, displaying BUFFER, with `this-command' set: an
+edition by the user, see `coq-eglot--user-edit-p'."
+  (declare (indent 1) (debug t))
+  `(save-window-excursion
+     (switch-to-buffer ,buffer)
+     (let ((this-command 'test-command))
+       ,@body)))
+
 (defun end-of-command ()
   "Run what Emacs runs at the end of a command, wait for its requests.
 After an edition, the goals and the proof position are updated
@@ -1981,12 +1991,27 @@ diverging zone.  The leader is the last one with a command."
                  (coq-eglot--skip-backward (point-max)))))
     (should (position-at-marker-p "l3"))
     ;; an edition of the leader moves the follower back
-    (with-current-buffer twin
+    (as-user twin
       (goto-char (search-position "  idtac." twin))
       (insert " idtac.")
       (run-hooks 'post-command-hook))
     (wait-for-twins)
-    (should (position-at-marker-p "l2 proof"))))
+    (should (position-at-marker-p "l2 proof"))
+    ;; an edition by a program of the follower: still the follower
+    (with-current-buffer (current-buffer)
+      (let ((follower (current-buffer)))
+        (should (coq-eglot-twin--leader-p twin))
+        (goto-char (search-position "l2 proof"))
+        (forward-line -1)
+        (insert "(* by a program *) ")
+        (should (coq-eglot-twin--leader-p twin))
+        (should-not (coq-eglot-twin--leader-p follower))
+        ;; its edition is handled without a command
+        (should coq-eglot--after-edit-timer)
+        (wait-for-twins)
+        (accept-process-output nil 0.1)
+        (should-not coq-eglot--after-edit-timer)
+        (should-not coq-eglot--edited)))))
 
 (defun twin-differences (buffer)
   "The texts highlighted as differences in BUFFER, with their faces."
@@ -2269,7 +2294,7 @@ General: the rest is checked after, unless the check fails."
     (should coq-eglot--running)
     (coq-eglot-assert-next-command)
     ;; the part being checked grows at once
-    (should (>= (plist-get coq-eglot--running :target)
+    (should (>= (coq-eglot--checking-target coq-eglot--running)
                 (save-excursion (goto-marker "statement") (point))))
     (wait-for-coq)
     (should (position-at-marker-p "statement"))
@@ -2363,6 +2388,64 @@ The next command starts a new server."
     (run #'coq-eglot-assert-next-command)
     (should (coq-eglot-lsp-current-server))
     (should (position-at-marker-p "definition"))))
+
+(ert-deftest coq-eglot-exit-other-buffer-checking ()
+  "Stopping or restarting the server from a buffer stops the check of
+another buffer of the server: no answer will come, it is not busy."
+  (dolist (command '(coq-eglot-restart-server coq-eglot-exit))
+    (with-file "eglot_slow.v"
+      (force-new-check)
+      (let ((slow (current-buffer)))
+        (coq-eglot-process-buffer)
+        (should coq-eglot--running)
+        (with-test-file
+          (funcall command))
+        (with-current-buffer slow
+          (should-not coq-eglot--running)
+          (should-not coq-eglot--interrupting)
+          (should-not (overlay-buffer coq-eglot--queue-overlay))
+          ;; not busy: a new command runs
+          (goto-char (point-min))
+          (re-search-forward "Fixpoint.*$")
+          (run #'coq-eglot-goto-point)
+          (should (> (coq-eglot-position) (point-min))))))))
+
+(ert-deftest coq-eglot-kill-buffer-checking ()
+  "Killing a buffer during its check forgets it: its markers are freed,
+it is no longer the buffer where the user works."
+  (with-file "eglot_slow.v"
+    (force-new-check)
+    (coq-eglot-process-buffer)
+    (should coq-eglot--running)
+    (let ((target (coq-eglot--checking-target coq-eglot--running)))
+      (coq-eglot-set-working-buffer (current-buffer))
+      (run-hooks 'kill-buffer-hook)
+      (should-not coq-eglot--running)
+      (should-not (marker-buffer target))
+      (should-not (coq-eglot-working-buffer)))))
+
+(ert-deftest coq-eglot-inactive-keeps-output ()
+  "A script buffer that is not active leaves the output alone: its goals,
+its messages and the output hook are those of the active one."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (let* ((output (coq-eglot--output))
+           (goals (coq-eglot--output-goals output))
+           (other (find-file-noselect "eglot_other.v"))
+           (ran nil))
+      (unwind-protect
+          (with-current-buffer other
+            (should-not (coq-eglot--active-p))
+            (add-hook 'coq-eglot-output-hook (lambda () (setq ran t)) nil t)
+            (coq-eglot--show-goals '(:goals (:goals [] :stack [] :shelf []
+                                                    :given_up [])))
+            (coq-eglot--show-response "other")
+            (should (equal (coq-eglot--output-goals output) goals))
+            (should-not ran)
+            (should-not (string-match-p "other"
+                                        (buffer-text "*response*"))))
+        (kill-buffer other)))))
 
 (ert-deftest coq-eglot-memprof-versions ()
   "memprof-limits is supported by OCaml 4.x and >= 5.3."

@@ -118,10 +118,21 @@ buffer.")
 (defvar-local coq-eglot--queue-overlay nil
   "Overlay displaying the part of the script being checked.")
 
+(cl-defstruct (coq-eglot--checking
+               (:constructor coq-eglot--make-checking (target)))
+  "A check running in a script buffer.
+TARGET is a marker at the end of the part being checked.  THEN is nil,
+or a marker where the user asked to go meanwhile, further than TARGET:
+the check of the rest starts when this one is finished, see
+`coq-eglot--queue'.  The object itself identifies the check: the
+answers of the server for another one are ignored, see
+`coq-eglot--send'.  Its markers are freed when it stops, see
+`coq-eglot--stop'."
+  target then)
+
 (defvar-local coq-eglot--running nil
-  "The check running, or nil.
-A plist with :id, the id of the request, and :target, a marker at the
-end of the part to check.")
+  "The check running in the current script buffer, or nil.
+A `coq-eglot--checking'.")
 
 (defun coq-eglot-position ()
   "Return the proof position of the current buffer."
@@ -310,8 +321,19 @@ Or the part being checked: run when their overlays are updated, see
 
 (defvar coq-eglot--command-buffer nil
   "Script buffer of the last command of the backend, or of the last edition.
-Not of the cursor moves: the buffer where the user works, see
+By the user, not by a program, nor the cursor moves: the buffer where
+the user works, see
 `coq-eglot--with-script' and `coq-eglot--after-change'.")
+
+(defun coq-eglot--on-kill ()
+  "Forget the current script buffer, being killed.
+Stop its check and its compilation, it is no longer the active one, nor
+the one where the user works."
+  (coq-eglot-compile-cancel)
+  (coq-eglot--stop)
+  (when (eq coq-eglot--command-buffer (current-buffer))
+    (setq coq-eglot--command-buffer nil))
+  (coq-eglot--forget-active))
 
 (defun coq-eglot--update-overlays ()
   "Update the overlays of the processed part and of the checked part.
@@ -332,7 +354,7 @@ Run `coq-eglot-position-hook'."
       (overlay-put coq-eglot--queue-overlay 'face 'proof-queue-face))
     (move-overlay coq-eglot--queue-overlay (coq-eglot-position)
                   (max (coq-eglot-position)
-                       (plist-get coq-eglot--running :target))))
+                       (coq-eglot--checking-target coq-eglot--running))))
   (run-hooks 'coq-eglot-position-hook))
 
 (defun coq-eglot--pop-ends (pos)
@@ -747,12 +769,18 @@ is not displayed yet."
                        (with-current-buffer buffer
                          (coq-eglot-layout-windows))))))))
 
+(defun coq-eglot--displays-p ()
+  "Non-nil if the current buffer displays its state in its output.
+A script buffer that is active, or a goals or response buffer: only
+the active script buffer displays its state."
+  (or (not coq-eglot-mode) (coq-eglot--active-p)))
+
 (defun coq-eglot--set-buffer-text (name mode text)
   "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
 Then adjust the heights of the windows, see
 `coq-optimise-resp-windows-enable'.  Do nothing if called from a script
-buffer that is not active: only the active one displays its state."
-  (when (or (not coq-eglot-mode) (coq-eglot--active-p))
+buffer that is not active, see `coq-eglot--displays-p'."
+  (when (coq-eglot--displays-p)
     (coq-eglot--set-buffer-text-1 name mode text)))
 
 (defun coq-eglot--set-buffer-text-1 (name mode text)
@@ -1312,7 +1340,14 @@ See `coq-eglot--show-goals' and `coq-eglot--show-response'.")
 
 (defun coq-eglot--show-goals (answer)
   "Display the goals of ANSWER of the server.
-See `coq-eglot-split-goals'.  Run `coq-eglot-output-hook'."
+See `coq-eglot-split-goals'.  Run `coq-eglot-output-hook'.  Do nothing
+in a script buffer that is not active, see `coq-eglot--displays-p': the
+output keeps the state of the buffer it displays."
+  (when (coq-eglot--displays-p)
+    (coq-eglot--show-goals-1 answer)))
+
+(defun coq-eglot--show-goals-1 (answer)
+  "Display the goals of ANSWER of the server, see `coq-eglot--show-goals'."
   (let* ((output (coq-eglot--output))
          (goals (plist-get answer :goals))
          (new (not (equal goals (coq-eglot--output-goals output)))))
@@ -1421,10 +1456,12 @@ See `coq-eglot-split-goals'."
 
 (defun coq-eglot--show-response (text)
   "Display TEXT in the response buffer.
-Run `coq-eglot-output-hook'."
-  (coq-eglot--set-buffer-text (coq-eglot--response-name)
-                              #'coq-eglot-response-mode text)
-  (run-hooks 'coq-eglot-output-hook))
+Run `coq-eglot-output-hook'.  Do nothing in a script buffer that is not
+active, see `coq-eglot--displays-p'."
+  (when (coq-eglot--displays-p)
+    (coq-eglot--set-buffer-text (coq-eglot--response-name)
+                                #'coq-eglot-response-mode text)
+    (run-hooks 'coq-eglot-output-hook)))
 
 (defun coq-eglot--show-answer (answer)
   "Display the goals and the messages of ANSWER of the server."
@@ -1482,7 +1519,7 @@ server may still be finishing an interrupted sentence."
 
 (defun coq-eglot--start (target)
   "Mark the part from the proof position to TARGET as being checked."
-  (setq coq-eglot--running (list :target (copy-marker target)))
+  (setq coq-eglot--running (coq-eglot--make-checking (copy-marker target)))
   (coq-eglot--clear-error)
   (coq-eglot--update-overlays))
 
@@ -1493,14 +1530,13 @@ check was interrupted meanwhile: an answer or an error may still come
 for a cancelled request."
   (let ((running coq-eglot--running))
     (condition-case err
-        (plist-put running :id
-                   (funcall request-fn pos
-                            (lambda (answer)
-                              (when (eq coq-eglot--running running)
-                                (funcall on-success answer)))
-                            (lambda (err)
-                              (when (eq coq-eglot--running running)
-                                (coq-eglot--failed-request err)))))
+        (funcall request-fn pos
+                 (lambda (answer)
+                   (when (eq coq-eglot--running running)
+                     (funcall on-success answer)))
+                 (lambda (err)
+                   (when (eq coq-eglot--running running)
+                     (coq-eglot--failed-request err))))
       ;; not sent, like without server: the check is not running
       (error (when (eq coq-eglot--running running)
                (coq-eglot--stop))
@@ -1512,8 +1548,8 @@ Return the position the user asked to go to meanwhile, if any, see
 `coq-eglot--queue'."
   (let ((then nil))
     (when coq-eglot--running
-      (set-marker (plist-get coq-eglot--running :target) nil)
-      (let ((marker (plist-get coq-eglot--running :then)))
+      (set-marker (coq-eglot--checking-target coq-eglot--running) nil)
+      (let ((marker (coq-eglot--checking-then coq-eglot--running)))
         (when marker
           (setq then (marker-position marker))
           (set-marker marker nil)))
@@ -1528,16 +1564,17 @@ the check of the rest starts when the running one is finished, unless
 it fails.  The running request is not replaced: cancelling it could
 interrupt Coq.  Signal an error if TARGET is not after the part being
 checked: moving back while checking is not possible."
-  (let ((end (plist-get coq-eglot--running :target)))
+  (let ((end (coq-eglot--checking-target coq-eglot--running)))
     (when (<= target end)
       (coq-eglot--check-busy))
     (set-marker end (max target
                          (coq-eglot--guess-end
                           (1- (coq-eglot--skip-backward target)))))
-    (let ((then (plist-get coq-eglot--running :then)))
+    (let ((then (coq-eglot--checking-then coq-eglot--running)))
       (if then
           (set-marker then target)
-        (plist-put coq-eglot--running :then (copy-marker target))))
+        (setf (coq-eglot--checking-then coq-eglot--running)
+              (copy-marker target))))
     (coq-eglot--update-overlays)))
 
 (defun coq-eglot--continue (then)
@@ -1568,7 +1605,7 @@ sentence before, if known."
 Do not go past the target, nor past an error."
   (when (and coq-eglot--running
              (> pos (coq-eglot-position))
-             (<= pos (plist-get coq-eglot--running :target))
+             (<= pos (coq-eglot--checking-target coq-eglot--running))
              (not (coq-eglot-lsp-error-range (coq-eglot-position) pos)))
     (coq-eglot--set-position pos nil)))
 
@@ -1843,7 +1880,7 @@ During a check, the sentence after the part being checked, see
         (coq-eglot--next)
       ;; the sentence after the part being checked
       (let ((start (coq-eglot--skip-forward
-                    (plist-get coq-eglot--running :target))))
+                    (coq-eglot--checking-target coq-eglot--running))))
         (when (< start (point-max))
           (coq-eglot--queue (coq-eglot--guess-end start)))))))
 
@@ -1922,15 +1959,28 @@ computation that cannot be interrupted, restart it: see
      (coq-eglot--interrupting (coq-eglot-restart-server))
      (t (message "Coq: nothing to interrupt")))))
 
+(defun coq-eglot--forget-checks (buffers)
+  "Forget the checks of BUFFERS, whose server stopped.
+Their running checks, compilations and interruptions: no answer will
+come.  Their proof positions stay."
+  (dolist (buffer buffers)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when coq-eglot-mode
+          (coq-eglot-compile-cancel)
+          (coq-eglot--stop)
+          (setq coq-eglot--interrupting nil))))))
+
 (defun coq-eglot-restart-server ()
   "Restart the server, even if it is busy.
 The proof position and the kept goals stay: the text did not change.
-The new server checks again the processed part when needed."
+The new server checks again the processed part when needed.  The
+checks of all the buffers of the server stop."
   (interactive)
   (coq-eglot--with-script
     (coq-eglot--cancel)
-    (setq coq-eglot--interrupting nil)
-    (coq-eglot-lsp-restart)
+    (coq-eglot--forget-checks (cons (current-buffer) (coq-eglot-lsp-shutdown)))
+    (coq-eglot-lsp-ensure-server)
     (coq-eglot--goals-at-position-async)
     (message "Coq: server restarted")))
 
@@ -1941,13 +1991,14 @@ server managed.  The next command starts a new server."
   (interactive)
   (coq-eglot--with-script
     (coq-eglot--cancel)
-    (dolist (buffer (or (coq-eglot-lsp-shutdown) (list (current-buffer))))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (when coq-eglot-mode
-            (setq coq-eglot--interrupting nil)
-            (coq-eglot--set-position nil nil)
-            (coq-eglot--clear-error)))))
+    (let ((buffers (cons (current-buffer) (coq-eglot-lsp-shutdown))))
+      (coq-eglot--forget-checks buffers)
+      (dolist (buffer buffers)
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when coq-eglot-mode
+              (coq-eglot--set-position nil nil)
+              (coq-eglot--clear-error))))))
     (setq coq-eglot--printing-flags nil)
     (coq-eglot--show-goals nil)
     (coq-eglot--show-response "")
@@ -1992,15 +2043,31 @@ The proof position is moved back at the end of the current command.")
   "Non-nil if an edition interrupted the running check.
 The goals are displayed at the end of the current command.")
 
+(defvar-local coq-eglot--after-edit-timer nil
+  "Timer finishing the handling of an edition, or nil.
+See `coq-eglot--after-edit-later'.")
+
+(defun coq-eglot--user-edit-p ()
+  "Non-nil if the user is editing the current buffer.
+In a command, in the buffer of the selected window: not an edition by
+a program from a timer or a process, like the revert of a buffer whose
+file an agent wrote, nor by a command in another buffer."
+  (and this-command
+       (eq (current-buffer) (window-buffer (selected-window)))))
+
 (defun coq-eglot--after-change (beg _end _len)
   "Move the proof position before the sentence edited at BEG.
 Typing right at the proof position does not move it.  Editing the
 processed part, or the part being checked, interrupts the server: all
 pending requests are cancelled, and the edition is sent to the server
-at the end of the command (not here, see `coq-eglot-lsp-send-changes')."
-  (setq coq-eglot--command-buffer (current-buffer))
+at the end of the command (not here, see `coq-eglot-lsp-send-changes'),
+or right after it for an edition by a program, see
+`coq-eglot--after-edit-later'.  The buffer becomes the one where the
+user works if the user edits it, see `coq-eglot--user-edit-p'."
+  (when (coq-eglot--user-edit-p)
+    (setq coq-eglot--command-buffer (current-buffer)))
   (when (< beg (if coq-eglot--running
-                   (plist-get coq-eglot--running :target)
+                   (coq-eglot--checking-target coq-eglot--running)
                  (coq-eglot-position)))
     (coq-eglot--cancel)
     (setq coq-eglot--interrupted t))
@@ -2009,7 +2076,13 @@ at the end of the command (not here, see `coq-eglot-lsp-send-changes')."
     (coq-eglot--pop-ends (1- beg))
     (coq-eglot--update-overlays)
     (coq-eglot--clear-error)
-    (setq coq-eglot--edited (min beg (or coq-eglot--edited beg)))))
+    (setq coq-eglot--edited (min beg (or coq-eglot--edited beg))))
+  (when (and (or coq-eglot--edited coq-eglot--interrupted)
+             (not coq-eglot--after-edit-timer))
+    ;; for the editions that no command of this buffer ends
+    (setq coq-eglot--after-edit-timer
+          (run-at-time 0 nil #'coq-eglot--after-edit-later
+                       (current-buffer)))))
 
 (defun coq-eglot--sentence-before-async (pos on-found)
   "Like `coq-eglot--sentence-before' for POS, but without waiting.
@@ -2034,15 +2107,30 @@ no such sentence or a request fails."
        #'ignore)))))
 
 (defun coq-eglot--post-command ()
+  "Finish the handling of an edition of the current buffer by the user.
+At the end of the command, see `coq-eglot--after-edit'."
+  (coq-eglot--after-edit t))
+
+(defun coq-eglot--after-edit-later (buffer)
+  "Finish the handling of an edition of BUFFER no command of it ended.
+An edition by a program, or by a command in another buffer: BUFFER is
+not made active, see `coq-eglot--after-edit'."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq coq-eglot--after-edit-timer nil)
+      (when coq-eglot-mode
+        (coq-eglot--after-edit nil)))))
+
+(defun coq-eglot--after-edit (activate)
   "Display the goals after an edition moved back or interrupted.
-Never wait for the server here: it may still be finishing an
-interrupted sentence.  The proof position is first the end of the last
-known sentence before the edition (see `coq-eglot--after-change').  The
-server is then asked asynchronously for the last sentence before the
-edition, the proof position moves there if the buffer did not change
-meanwhile."
+Make the buffer the active one if ACTIVATE.  Never wait for the server
+here: it may still be finishing an interrupted sentence.  The proof
+position is first the end of the last known sentence before the
+edition (see `coq-eglot--after-change').  The server is then asked
+asynchronously for the last sentence before the edition, the proof
+position moves there if the buffer did not change meanwhile."
   (when (or coq-eglot--edited coq-eglot--interrupted)
-    (coq-eglot--activate)
+    (when activate (coq-eglot--activate))
     (let ((beg coq-eglot--edited)
           (tick (buffer-chars-modified-tick)))
       (setq coq-eglot--edited nil coq-eglot--interrupted nil)
@@ -2181,7 +2269,7 @@ Run when Eglot starts or stops managing the buffer."
 (defun coq-eglot-check-target ()
   "End of the part of the current script buffer being checked, or nil."
   (and coq-eglot--running
-       (marker-position (plist-get coq-eglot--running :target))))
+       (marker-position (coq-eglot--checking-target coq-eglot--running))))
 
 (defun coq-eglot-move-proof-position (target)
   "Move the proof position of the current script buffer to TARGET.
@@ -2212,8 +2300,9 @@ Those that are displayed, not empty."
 
 (defun coq-eglot-working-buffer ()
   "The script buffer where the user works, or nil.
-The one of the last command of the backend or of the last edition."
-  coq-eglot--command-buffer)
+The one of the last command of the backend or of the last edition by
+the user, if still live."
+  (and (buffer-live-p coq-eglot--command-buffer) coq-eglot--command-buffer))
 
 (defun coq-eglot-set-working-buffer (buffer)
   "Make BUFFER the script buffer where the user works."
@@ -2547,7 +2636,7 @@ Warn if processed Require sentences load outdated libraries."
         (add-hook 'eglot-managed-mode-hook #'coq-eglot-lsp-check-load-path nil t)
         (add-hook 'after-change-functions #'coq-eglot--after-change nil t)
         (add-hook 'post-command-hook #'coq-eglot--post-command nil t)
-        (add-hook 'kill-buffer-hook #'coq-eglot--forget-active nil t)
+        (add-hook 'kill-buffer-hook #'coq-eglot--on-kill nil t)
         (coq-eglot--update-overlays)
         (coq-eglot--layout-on-visit))
     (setq coq-eglot-lsp-progress-function nil)
@@ -2564,7 +2653,7 @@ Warn if processed Require sentences load outdated libraries."
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot-lsp-check-load-path t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)
     (remove-hook 'post-command-hook #'coq-eglot--post-command t)
-    (remove-hook 'kill-buffer-hook #'coq-eglot--forget-active t)
+    (remove-hook 'kill-buffer-hook #'coq-eglot--on-kill t)
     (coq-eglot--forget-active)
     (coq-eglot--cancel)
     (coq-eglot--set-position nil nil)
