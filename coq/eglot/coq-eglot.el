@@ -253,6 +253,26 @@ For timers and callbacks, which may run in any buffer."
 See `coq-eglot-twin-pair'.")
 (put 'coq-eglot--twin 'permanent-local t)
 
+(defvar-local coq-eglot--sandbox nil
+  "The sandbox of the current script buffer, if it is in one.
+See `coq-eglot-sandbox-create'.")
+(put 'coq-eglot--sandbox 'permanent-local t)
+
+(defconst coq-eglot-sandbox-meta ".rocq-sandbox"
+  "Directory of the description of a sandbox, at its root.")
+
+(defun coq-eglot-sandbox-project (dir)
+  "The project of DIR if it is in a sandbox, for `project-find-functions'.
+Its root, where its description is, like the root of the project it is
+a copy of: when the latter is the root of a git repository, a copy has
+no repository, its server would not have the same root."
+  (when-let* ((root (locate-dominating-file dir coq-eglot-sandbox-meta)))
+    (cons 'transient (file-name-as-directory (expand-file-name root)))))
+
+;; After the project files of Coq and git: a sandbox in a worktree, or
+;; whose project has a project file, has the same root as its project.
+(add-hook 'project-find-functions #'coq-eglot-sandbox-project 90)
+
 (defvar-local coq-eglot--twin-label nil
   "Label of the server of a twin in the mode line, like an opam switch.
 See `coq-eglot-twin-pair'.")
@@ -2465,7 +2485,15 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
       :active coq-eglot--twin
       :help "The server of the twin from another opam switch"]
      ["Unpair" coq-eglot-twin-unpair
-      :active coq-eglot--twin]))
+      :active coq-eglot--twin]
+     "---"
+     ["New Sandbox..." coq-eglot-sandbox-create
+      :active (and (not coq-eglot--twin) (not coq-eglot--sandbox))
+      :help "A copy of the project where an agent works, the twin of this buffer"]
+     ["Pair With Sandbox..." coq-eglot-sandbox-pair
+      :active (and (not coq-eglot--twin) (not coq-eglot--sandbox))
+      :help "Its copy in a sandbox of the project is the twin of this buffer"]
+     ["Delete Sandbox..." coq-eglot-sandbox-delete]))
   "Menu of the Eglot backend of Coq, see `easy-menu-define'.")
 
 (easy-menu-define coq-eglot-menu coq-eglot-mode-map
@@ -2519,7 +2547,12 @@ Warn if processed Require sentences load outdated libraries."
      " Coq-LSP")
    ;; which server, for twins
    (and coq-eglot--twin coq-eglot--twin-label
-        (format "[%s]" coq-eglot--twin-label))))
+        (format "[%s]" coq-eglot--twin-label))
+   ;; not the real development
+   (and coq-eglot--sandbox
+        (propertize " Sandbox" 'face 'warning
+                    'help-echo (format "In the sandbox %s, read only"
+                                       coq-eglot--sandbox)))))
 
 (define-minor-mode coq-eglot-mode
   "Interaction with Coq through a language server, like Proof General.
@@ -2582,6 +2615,9 @@ Warn if processed Require sentences load outdated libraries."
 (autoload 'coq-eglot-twin-goto-twin-position "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-toggle-synchronize "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-swap-reference "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-sandbox-create "coq-eglot-sandbox" nil t)
+(autoload 'coq-eglot-sandbox-pair "coq-eglot-sandbox" nil t)
+(autoload 'coq-eglot-sandbox-delete "coq-eglot-sandbox" nil t)
 
 (provide 'coq-eglot)
 
