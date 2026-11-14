@@ -68,6 +68,16 @@
   (funcall command)
   (wait-for-coq))
 
+(defmacro as-user (buffer &rest body)
+  "Run BODY in BUFFER as a command of the user there.
+In the selected window, displaying BUFFER, with `this-command' set: an
+edition by the user, see `coq-eglot--user-edit-p'."
+  (declare (indent 1) (debug t))
+  `(save-window-excursion
+     (switch-to-buffer ,buffer)
+     (let ((this-command 'test-command))
+       ,@body)))
+
 (defun end-of-command ()
   "Run what Emacs runs at the end of a command, wait for its requests.
 After an edition, the goals and the proof position are updated
@@ -1981,12 +1991,27 @@ diverging zone.  The leader is the last one with a command."
                  (coq-eglot--skip-backward (point-max)))))
     (should (position-at-marker-p "l3"))
     ;; an edition of the leader moves the follower back
-    (with-current-buffer twin
+    (as-user twin
       (goto-char (search-position "  idtac." twin))
       (insert " idtac.")
       (run-hooks 'post-command-hook))
     (wait-for-twins)
-    (should (position-at-marker-p "l2 proof"))))
+    (should (position-at-marker-p "l2 proof"))
+    ;; an edition by a program of the follower: still the follower
+    (with-current-buffer (current-buffer)
+      (let ((follower (current-buffer)))
+        (should (coq-eglot-twin--leader-p twin))
+        (goto-char (search-position "l2 proof"))
+        (forward-line -1)
+        (insert "(* by a program *) ")
+        (should (coq-eglot-twin--leader-p twin))
+        (should-not (coq-eglot-twin--leader-p follower))
+        ;; its edition is handled without a command
+        (should coq-eglot--after-edit-timer)
+        (wait-for-twins)
+        (accept-process-output nil 0.1)
+        (should-not coq-eglot--after-edit-timer)
+        (should-not coq-eglot--edited)))))
 
 (defun twin-differences (buffer)
   "The texts highlighted as differences in BUFFER, with their faces."
@@ -2269,7 +2294,7 @@ General: the rest is checked after, unless the check fails."
     (should coq-eglot--running)
     (coq-eglot-assert-next-command)
     ;; the part being checked grows at once
-    (should (>= (plist-get coq-eglot--running :target)
+    (should (>= (coq-eglot--checking-target coq-eglot--running)
                 (save-excursion (goto-marker "statement") (point))))
     (wait-for-coq)
     (should (position-at-marker-p "statement"))
@@ -2363,6 +2388,120 @@ The next command starts a new server."
     (run #'coq-eglot-assert-next-command)
     (should (coq-eglot-lsp-current-server))
     (should (position-at-marker-p "definition"))))
+
+(ert-deftest coq-eglot-exit-other-buffer-checking ()
+  "Stopping or restarting the server from a buffer stops the check of
+another buffer of the server: no answer will come, it is not busy."
+  (dolist (command '(coq-eglot-restart-server coq-eglot-exit))
+    (with-file "eglot_slow.v"
+      (force-new-check)
+      (let ((slow (current-buffer)))
+        (coq-eglot-process-buffer)
+        (should coq-eglot--running)
+        (with-test-file
+          (funcall command))
+        (with-current-buffer slow
+          (should-not coq-eglot--running)
+          (should-not coq-eglot--interrupting)
+          (should-not (overlay-buffer coq-eglot--queue-overlay))
+          ;; not busy: a new command runs
+          (goto-char (point-min))
+          (re-search-forward "Fixpoint.*$")
+          (run #'coq-eglot-goto-point)
+          (should (> (coq-eglot-position) (point-min))))))))
+
+(ert-deftest coq-eglot-kill-buffer-checking ()
+  "Killing a buffer during its check forgets it: its markers are freed,
+it is no longer the buffer where the user works."
+  (with-file "eglot_slow.v"
+    (force-new-check)
+    (coq-eglot-process-buffer)
+    (should coq-eglot--running)
+    (let ((target (coq-eglot--checking-target coq-eglot--running)))
+      (coq-eglot-set-working-buffer (current-buffer))
+      (run-hooks 'kill-buffer-hook)
+      (should-not coq-eglot--running)
+      (should-not (marker-buffer target))
+      (should-not (coq-eglot-working-buffer)))))
+
+(ert-deftest coq-eglot-inactive-keeps-output ()
+  "A script buffer that is not active leaves the output alone: its goals,
+its messages and the output hook are those of the active one."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (let* ((output (coq-eglot--output))
+           (goals (coq-eglot--output-goals output))
+           (other (find-file-noselect "eglot_other.v"))
+           (ran nil))
+      (unwind-protect
+          (with-current-buffer other
+            (should-not (coq-eglot--active-p))
+            (add-hook 'coq-eglot-output-hook (lambda () (setq ran t)) nil t)
+            (coq-eglot--show-goals '(:goals (:goals [] :stack [] :shelf []
+                                                    :given_up [])))
+            (coq-eglot--show-response "other")
+            (should (equal (coq-eglot--output-goals output) goals))
+            (should-not ran)
+            (should-not (string-match-p "other"
+                                        (buffer-text "*response*"))))
+        (kill-buffer other)))))
+
+(ert-deftest coq-eglot-error-after-point-in-sentence ()
+  "Going to a point inside a sentence whose error is located after point
+reports the error and stops before the sentence."
+  (with-test-file
+    (goto-marker "error")
+    (search-backward "unknown_lemma")
+    ;; inside the sentence, before the term Coq complains about
+    (run #'coq-eglot-goto-point)
+    (should (position-at-marker-p "before error"))
+    (should (string-match-p "unknown_lemma" (buffer-text "*response*")))))
+
+(ert-deftest coq-eglot-query-cancelled-silent ()
+  "A query cancelled by an edition or a new check displays no error."
+  (with-file "eglot_slow.v"
+    (force-new-check)
+    (goto-char (point-min))
+    (re-search-forward "^Fixpoint.*$")
+    (run #'coq-eglot-goto-point)
+    (coq-eglot--show-response "before")
+    (let ((done nil))
+      (cl-letf* ((show-error (symbol-function 'coq-eglot--show-error))
+                 ((symbol-function 'coq-eglot--show-error)
+                  (lambda (text) (setq done t) (funcall show-error text))))
+        (coq-eglot-run-query "Eval vm_compute in Nat.eqb (fact 11) 0"
+                             nil (lambda () (setq done t)))
+        (accept-process-output nil 0.05)
+        (coq-eglot-lsp-cancel-all)
+        (wait-until (lambda () done) 2)))
+    (should (equal (buffer-text "*response*") "before"))))
+
+(ert-deftest coq-eglot-compile-error-not-busy ()
+  "An error when the compilation starts stops the check: not busy."
+  (with-test-file
+    (cl-letf (((symbol-function 'coq-eglot-compile-requires)
+               (lambda (&rest _) (error "No coqdep"))))
+      (goto-marker "split")
+      (should-error (coq-eglot-goto-point))
+      (should-not coq-eglot--running))))
+
+(ert-deftest coq-eglot-fail-unknown-sentence-before ()
+  "A failure whose sentence before is unknown keeps the known proof
+position before it, instead of going back to the beginning."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (let ((position (coq-eglot-position))
+          (start (save-excursion (goto-marker "error")
+                                 (search-backward "rewrite"))))
+      ;; the answer kept for the position is forgotten, the server
+      ;; answers without the range of the sentence
+      (setcdr (car coq-eglot--ends) nil)
+      (cl-letf (((symbol-function 'coq-eglot-lsp-goals)
+                 (lambda (&rest _) '(:goals nil))))
+        (coq-eglot--fail start (point-max) "Error." nil))
+      (should (= (coq-eglot-position) position)))))
 
 (ert-deftest coq-eglot-memprof-versions ()
   "memprof-limits is supported by OCaml 4.x and >= 5.3."
@@ -3314,6 +3453,116 @@ wide as the window."
   (cl-letf (((coq-eglot--output-width coq-eglot--default-output) 21))
     (should (equal (coq-eglot--format-hyp '(:names ["H"] :ty "a /\\ \nb"))
                    "  H :\n    a /\\\n    b"))))
+
+;;; Robustness of the connection
+
+(ert-deftest coq-eglot-lsp-internals-exist ()
+  "The internals of Eglot and jsonrpc we use exist, one of the
+alternatives of each.  Needs no server."
+  (dolist (entry coq-eglot-lsp--internals)
+    (should (seq-some (lambda (symbol)
+                        (if (eq (car entry) 'function)
+                            (fboundp symbol)
+                          (boundp symbol)))
+                      (cdr entry)))))
+
+(defmacro with-fake-server (output &rest body)
+  "Run BODY with the server `fake-server', printing OUTPUT with --version."
+  (declare (indent 1) (debug t))
+  `(let* ((fake-server (make-temp-file "fake-lsp" nil ".sh"))
+          (coq-eglot-lsp--server-versions (make-hash-table :test #'equal))
+          (coq-eglot-server-program (list fake-server)))
+     (unwind-protect
+         (progn
+           (with-temp-file fake-server
+             (insert "#!/bin/sh\n" ,output))
+           (set-file-modes fake-server #o755)
+           ,@body)
+       (delete-file fake-server))))
+
+(ert-deftest coq-eglot-server-version-check ()
+  "A server older than the minimal version is refused before starting,
+an unknown version is not."
+  (let ((enable-local-variables nil))
+    (with-fake-server "echo 0.1.9"
+      (should (equal (coq-eglot-lsp--server-version fake-server) "0.1.9"))
+      (let ((err (should-error (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))
+                               :type 'user-error)))
+        (should (string-match-p "too old" (cadr err)))))
+    (with-fake-server "echo 'coq-lsp 0.2.5+9.2'"
+      (should (equal (coq-eglot-lsp--server-version fake-server) "0.2.5"))
+      (should (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))))
+    (with-fake-server "echo unknown"
+      (should-not (coq-eglot-lsp--server-version fake-server))
+      (should (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))))
+    (with-fake-server "exit 1"
+      (should-not (coq-eglot-lsp--server-version fake-server))
+      (should (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))))))
+
+(ert-deftest coq-eglot-server-version-cached ()
+  "The server is run once with --version."
+  (with-fake-server "echo 0.2.5"
+    (let ((calls 0))
+      (cl-letf* ((orig (symbol-function 'process-lines))
+                 ((symbol-function 'process-lines)
+                  (lambda (&rest args) (cl-incf calls) (apply orig args))))
+        (coq-eglot-lsp--server-version fake-server)
+        (coq-eglot-lsp--server-version fake-server)
+        (should (= calls 1))))))
+
+(ert-deftest coq-eglot-load-path-server-program-args ()
+  "The -R and -Q of `coq-eglot-server-program' are not compared with
+the load path of the buffer."
+  (let ((process (make-process :name "fake-coq-lsp" :noquery t
+                               :command '("sleep" "30" "-R" "a,A"
+                                          "-Q" "b,B" "-R" "c,C")))
+        (coq-eglot-server-program '("sleep" "30" "-R" "a,A" "-Q" "b,B")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'jsonrpc--process) (lambda (_) process)))
+          (should (equal (coq-eglot-lsp--server-load-path-args nil)
+                         '("-R" "c,C")))
+          (let ((coq-eglot-server-program '("sleep" "30")))
+            (should (equal (coq-eglot-lsp--server-load-path-args nil)
+                           '("-R" "a,A" "-Q" "b,B" "-R" "c,C")))))
+      (delete-process process))))
+
+(ert-deftest coq-eglot-load-path-invalid ()
+  "An invalid `coq-load-path' is a user error naming it."
+  (let ((coq-eglot-server-program '("coq-lsp"))
+        (coq-load-path '(42)))
+    (with-programs '("coq-lsp")
+      (let ((err (should-error (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))
+                               :type 'user-error)))
+        (should (string-match-p "coq-load-path" (cadr err)))))))
+
+(ert-deftest coq-eglot-load-path-comma ()
+  "A comma in a directory is a user error: coq-lsp splits -R DIR,LP there."
+  (should-error (coq-eglot-lsp--root-load-path-args "/tmp/a,b/")
+                :type 'user-error)
+  (let ((coq-load-path '((rec "lib,x" "Lib"))))
+    (should-error (coq-eglot-lsp-load-path-args) :type 'user-error))
+  (should (equal (coq-eglot-lsp--logical-binding "/tmp/ab/" "Lib")
+                 "/tmp/ab,Lib")))
+
+(ert-deftest coq-eglot-compile-hooks-cheap ()
+  "The hooks of the outdated libraries schedule nothing if no buffer
+has compiled Require sentences."
+  (let (scheduled)
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest _) (setq scheduled t))))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/not-a-real-file.v")
+        (unwind-protect
+            (progn
+              (should-not (coq-eglot-compile--any-loaded-p))
+              (coq-eglot-compile--file-modified)
+              (should-not scheduled)
+              (setq coq-eglot-compile--loaded (list 'overlay))
+              (should (coq-eglot-compile--any-loaded-p))
+              (coq-eglot-compile--file-modified)
+              (should scheduled))
+          (setq coq-eglot-compile--loaded nil
+                buffer-file-name nil))))))
 
 (provide 'coq-eglot-test-basic)
 
