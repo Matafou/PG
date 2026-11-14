@@ -1590,7 +1590,12 @@ sentence before, if known."
   (coq-eglot--trace-error start end text)
   (let ((before (if answer (cons (coq-eglot-position) answer)
                   (coq-eglot--sentence-before start))))
-    (coq-eglot--set-position (car before) (cdr before))
+    (if before
+        (coq-eglot--set-position (car before) (cdr before))
+      ;; no sentence before, or the server did not say which: the known
+      ;; sentences before START stay processed
+      (coq-eglot--pop-ends start)
+      (coq-eglot--update-overlays))
     (coq-eglot--goals-at-position)
     (coq-eglot--show-error text)
     (coq-eglot--highlight-error start end)))
@@ -1627,13 +1632,19 @@ Only used to display the part being checked."
 CONTINUE is called with nil, or with the start of the first Require
 sentence whose compilation failed.  It is called right away if there
 is nothing to compile, never if the running check is cancelled
-meanwhile.  See `coq-eglot-compile-requires'."
+meanwhile.  See `coq-eglot-compile-requires'.  If the compilation
+signals an error, like a missing program, the running check stops: it
+is not left running without anything to wait for."
   (let ((running coq-eglot--running))
-    (unless (coq-eglot-compile-requires
-             start end
-             (lambda (failed)
-               (when (eq coq-eglot--running running)
-                 (funcall continue failed))))
+    (unless (condition-case err
+                (coq-eglot-compile-requires
+                 start end
+                 (lambda (failed)
+                   (when (eq coq-eglot--running running)
+                     (funcall continue failed))))
+              (error (when (eq coq-eglot--running running)
+                       (coq-eglot--stop))
+                     (signal (car err) (cdr err))))
       (funcall continue nil))))
 
 (defun coq-eglot--compilation-failed (start)
@@ -1711,27 +1722,38 @@ failed, or nil.  It is reported after the check."
 Stop at the first error, or ask the goals after the last sentence.
 FAILED is the start of a Require sentence after LAST whose compilation
 failed, reported if there was no error before."
-  (let ((then (coq-eglot--stop))
-        (error (coq-eglot-lsp-error-range start (1+ last))))
-    (if error
-        ;; the sentence that failed and its error message, not its goals
-        (let* ((answer (coq-eglot-lsp-goals (car error) t))
-               (range (plist-get answer :range))
-               (bounds (if range (coq-eglot-lsp-range range) error)))
-          (when (< start (car bounds))
-            (coq-eglot--trace-check start (car bounds) nil))
-          (coq-eglot--fail (car bounds) (cdr bounds)
-                           (or (plist-get answer :error) "Error.") nil))
-      (let* ((answer (coq-eglot-lsp-goals last))
-             (range (plist-get answer :range)))
-        (when range
-          (coq-eglot--trace-check start (cdr (coq-eglot-lsp-range range))
-                                  answer)
-          (coq-eglot--set-position (cdr (coq-eglot-lsp-range range)) answer)
-          (coq-eglot--show-answer answer))
-        (if failed
-            (coq-eglot--compilation-failed failed)
-          (coq-eglot--continue then))))))
+  (let* ((then (coq-eglot--stop))
+         ;; the last sentence checked, containing LAST
+         (answer (coq-eglot-lsp-goals last))
+         (range (plist-get answer :range))
+         (bounds (and range (coq-eglot-lsp-range range)))
+         ;; an error may be located after LAST in this sentence
+         (error (coq-eglot-lsp-error-range
+                 start (max (1+ last) (if bounds (cdr bounds) 0)))))
+    (cond
+     (error
+      ;; the sentence that failed and its error message, not its goals
+      (let* ((answer (coq-eglot-lsp-goals (car error) t))
+             (range (plist-get answer :range))
+             (bounds (if range (coq-eglot-lsp-range range) error)))
+        (when (< start (car bounds))
+          (coq-eglot--trace-check start (car bounds) nil))
+        (coq-eglot--fail (car bounds) (cdr bounds)
+                         (or (plist-get answer :error) "Error.") nil)))
+     ;; an error the diagnostics did not report
+     ((and bounds (plist-get answer :error))
+      (when (< start (car bounds))
+        (coq-eglot--trace-check start (car bounds) nil))
+      (coq-eglot--fail (car bounds) (cdr bounds) (plist-get answer :error)
+                       nil))
+     (t
+      (when bounds
+        (coq-eglot--trace-check start (cdr bounds) answer)
+        (coq-eglot--set-position (cdr bounds) answer)
+        (coq-eglot--show-answer answer))
+      (if failed
+          (coq-eglot--compilation-failed failed)
+        (coq-eglot--continue then))))))
 
 ;;; Trace
 
@@ -2173,8 +2195,10 @@ This is `coq-query-function' for the Eglot backend."
 Wait for it, display nothing.  Return nil if Coq answers an error, or
 outside of the processed part.  This is `coq-query-result-function'
 for the Eglot backend, used by the insertions built from a query, like
-`coq-insert-intros'."
+`coq-insert-intros'.  Signal an error during a check: the server would
+answer only after it."
   (coq-eglot--with-script
+    (coq-eglot--check-busy)
     (when (> (coq-eglot-position) (point-min))
       (condition-case nil
           (string-join (coq-eglot-lsp-query
@@ -2225,7 +2249,10 @@ THEN is called with the messages."
        (unless messages (message "Coq: no output"))
        (when then (funcall then messages)))
      (lambda (err)
-       (coq-eglot--show-error (or (plist-get err :message) (format "%S" err)))))))
+       ;; cancelled by an edition or a new check: nothing to tell
+       (unless (coq-eglot-lsp-cancelled-p err)
+         (coq-eglot--show-error
+          (or (plist-get err :message) (format "%S" err))))))))
 
 ;;; Double hit
 

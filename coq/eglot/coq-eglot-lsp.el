@@ -404,6 +404,12 @@ comes, `jsonrpc-request' would leave theirs, and them, unfinished."
    ((fboundp 'jsonrpc--request-continuations)
     (hash-table-keys (jsonrpc--request-continuations server)))))
 
+(defun coq-eglot-lsp-cancelled-p (err)
+  "Non-nil if ERR, the error of a request, says it was cancelled.
+After `$/cancelRequest': the error RequestCancelled of LSP for a request
+not started, the error Interrupted of coq-lsp for a running one."
+  (memql (plist-get err :code) '(-32800 -32001)))
+
 (defun coq-eglot-lsp-cancel-all ()
   "Ask the server of the current buffer to cancel all pending requests.
 Including those sent by Eglot on its own, like hover.  Their answers,
@@ -697,11 +703,14 @@ done."
 (cl-defmethod eglot-handle-notification :after
   ((_server coq-eglot-lsp-server)
    (_method (eql textDocument/publishDiagnostics))
-   &key uri diagnostics &allow-other-keys)
+   &key uri diagnostics version &allow-other-keys)
+  "Keep the DIAGNOSTICS of the buffer of URI, see `coq-eglot-lsp-error-range'.
+Not those of an older VERSION of the buffer, if given."
   (let ((buffer (coq-eglot-lsp--buffer uri)))
     (when buffer
       (with-current-buffer buffer
-        (setq coq-eglot-lsp--diagnostics diagnostics)))))
+        (unless (and version (not (eql version eglot--versioned-identifier)))
+          (setq coq-eglot-lsp--diagnostics diagnostics))))))
 
 (defun coq-eglot-lsp-error-range (start end)
   "Buffer range (BEG . END) of the first error located between START and END.

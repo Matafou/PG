@@ -2447,6 +2447,62 @@ its messages and the output hook are those of the active one."
                                         (buffer-text "*response*"))))
         (kill-buffer other)))))
 
+(ert-deftest coq-eglot-error-after-point-in-sentence ()
+  "Going to a point inside a sentence whose error is located after point
+reports the error and stops before the sentence."
+  (with-test-file
+    (goto-marker "error")
+    (search-backward "unknown_lemma")
+    ;; inside the sentence, before the term Coq complains about
+    (run #'coq-eglot-goto-point)
+    (should (position-at-marker-p "before error"))
+    (should (string-match-p "unknown_lemma" (buffer-text "*response*")))))
+
+(ert-deftest coq-eglot-query-cancelled-silent ()
+  "A query cancelled by an edition or a new check displays no error."
+  (with-file "eglot_slow.v"
+    (force-new-check)
+    (goto-char (point-min))
+    (re-search-forward "^Fixpoint.*$")
+    (run #'coq-eglot-goto-point)
+    (coq-eglot--show-response "before")
+    (let ((done nil))
+      (cl-letf* ((show-error (symbol-function 'coq-eglot--show-error))
+                 ((symbol-function 'coq-eglot--show-error)
+                  (lambda (text) (setq done t) (funcall show-error text))))
+        (coq-eglot-run-query "Eval vm_compute in Nat.eqb (fact 11) 0"
+                             nil (lambda () (setq done t)))
+        (accept-process-output nil 0.05)
+        (coq-eglot-lsp-cancel-all)
+        (wait-until (lambda () done) 2)))
+    (should (equal (buffer-text "*response*") "before"))))
+
+(ert-deftest coq-eglot-compile-error-not-busy ()
+  "An error when the compilation starts stops the check: not busy."
+  (with-test-file
+    (cl-letf (((symbol-function 'coq-eglot-compile-requires)
+               (lambda (&rest _) (error "No coqdep"))))
+      (goto-marker "split")
+      (should-error (coq-eglot-goto-point))
+      (should-not coq-eglot--running))))
+
+(ert-deftest coq-eglot-fail-unknown-sentence-before ()
+  "A failure whose sentence before is unknown keeps the known proof
+position before it, instead of going back to the beginning."
+  (with-test-file
+    (goto-marker "before error")
+    (run #'coq-eglot-goto-point)
+    (let ((position (coq-eglot-position))
+          (start (save-excursion (goto-marker "error")
+                                 (search-backward "rewrite"))))
+      ;; the answer kept for the position is forgotten, the server
+      ;; answers without the range of the sentence
+      (setcdr (car coq-eglot--ends) nil)
+      (cl-letf (((symbol-function 'coq-eglot-lsp-goals)
+                 (lambda (&rest _) '(:goals nil))))
+        (coq-eglot--fail start (point-max) "Error." nil))
+      (should (= (coq-eglot-position) position)))))
+
 (ert-deftest coq-eglot-memprof-versions ()
   "memprof-limits is supported by OCaml 4.x and >= 5.3."
   (should (coq-eglot-lsp--memprof-p "4.14.2"))
