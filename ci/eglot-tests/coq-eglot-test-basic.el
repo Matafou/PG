@@ -2235,7 +2235,7 @@ An edition deletes those it touches, the others stay."
     (dotimes (_ 3) (run #'coq-eglot-assert-next-command))
     (let ((overlays (sentence-overlays)))
       (should (= (length overlays) 3))
-      (should (equal (reverse coq-eglot--sentences) overlays))
+      (should (equal (reverse (coq-eglot-session-sentences)) overlays))
       (should (equal (mapcar (lambda (overlay)
                                (buffer-substring (overlay-start overlay)
                                                  (overlay-end overlay)))
@@ -2244,11 +2244,11 @@ An edition deletes those it touches, the others stay."
                        "Proof.")))
       (should (= (overlay-end (car (last overlays))) (coq-eglot-position))))
     ;; an edition in the second sentence
-    (goto-char (overlay-start (cadr coq-eglot--sentences)))
+    (goto-char (overlay-start (cadr (coq-eglot-session-sentences))))
     (insert " ")
     (end-of-command)
     (should (= (length (sentence-overlays)) 1))
-    (should (equal (sentence-overlays) coq-eglot--sentences))))
+    (should (equal (sentence-overlays) (coq-eglot-session-sentences)))))
 
 (ert-deftest coq-eglot-sentences-removed-by-others ()
   "Overlays of the sentences deleted by another package are forgotten."
@@ -2256,7 +2256,7 @@ An edition deletes those it touches, the others stay."
     (dotimes (_ 2) (run #'coq-eglot-assert-next-command))
     (remove-overlays)
     (should (= (coq-eglot-position) (point-min)))
-    (should-not coq-eglot--sentences)
+    (should-not (coq-eglot-session-sentences))
     (run #'coq-eglot-assert-next-command)
     (should (= (length (sentence-overlays)) 1))))
 
@@ -2538,7 +2538,7 @@ position before it, instead of going back to the beginning."
                                  (search-backward "rewrite"))))
       ;; the answer kept for the position is forgotten, the server
       ;; answers without the range of the sentence
-      (coq-eglot--set-sentence-answer (coq-eglot--last-sentence) nil)
+      (coq-eglot-session-set-sentence-answer (coq-eglot-session-last-sentence) nil)
       (cl-letf (((symbol-function 'coq-eglot-lsp-goals)
                  (lambda (&rest _) (coq-eglot-lsp-make-answer))))
         (coq-eglot--fail start (point-max) "Error." nil))
@@ -3681,25 +3681,125 @@ With buffer positions for the sentence and messages with severities."
                   (list :range (lsp-range 0 0 0 5) :severity 2
                         :message "Warning."))))))
 
-(ert-deftest coq-eglot-error-range-from-diagnostics ()
-  "The first error between two positions, among the kept diagnostics.
-Warnings do not count, nor diagnostics of another version."
-  (with-lsp-text "Lemma a : True.\nProof. exact foo. exact bar.\n"
-    (cl-letf (((symbol-function 'coq-eglot-lsp-version) (lambda () 3)))
-      (coq-eglot--receive-diagnostics
-       (coq-eglot-lsp--make-diagnostics
-        3 (list (coq-eglot-lsp--make-diagnostic 41 44 'error "bar" nil)
-                (coq-eglot-lsp--make-diagnostic 30 33 'error "foo" nil)
-                (coq-eglot-lsp--make-diagnostic 1 6 'warning "w" nil))))
-      (should (equal (coq-eglot--error-range 1 100) '(30 . 33)))
-      (should (equal (coq-eglot--error-range 31 100) '(41 . 44)))
-      (should-not (coq-eglot--error-range 1 30))
-      ;; an older version is ignored
-      (coq-eglot--receive-diagnostics (coq-eglot-lsp--make-diagnostics 2 nil))
-      (should (equal (coq-eglot--error-range 1 100) '(30 . 33)))
-      ;; a snapshot replaces the previous one, even empty
-      (coq-eglot--receive-diagnostics (coq-eglot-lsp--make-diagnostics 3 nil))
-      (should-not (coq-eglot--error-range 1 100)))))
+;; The session, with the server
+
+(ert-deftest coq-eglot-session-error-sentence ()
+  "The diagnostic of an error gives the range of its sentence."
+  (with-test-file
+    (goto-marker "error")
+    (run #'coq-eglot-goto-point)
+    (let ((diag (seq-find (lambda (diag)
+                            (eq (coq-eglot-lsp-diagnostic-severity diag) 'error))
+                          coq-eglot-session--diagnostics)))
+      (should diag)
+      (let ((sentence (coq-eglot-lsp-diagnostic-sentence diag)))
+        (should sentence)
+        (should (equal (buffer-substring (car sentence) (cdr sentence))
+                       "rewrite unknown_lemma."))))))
+
+;; The session, without server
+
+(defvar test-version 0
+  "The version of the document the fake server knows, see `with-session'.")
+
+(defmacro with-session (text &rest body)
+  "Run BODY in a temporary buffer containing TEXT, with a session.
+The version the server knows is `test-version', starting at 1: BODY
+increments it to send the changes."
+  (declare (indent 1) (debug t))
+  `(with-temp-buffer
+     (insert ,text)
+     (let ((test-version 1))
+       (coq-eglot-session-start (lambda () test-version))
+       ,@body)))
+
+(defun edit-at (pos)
+  "Insert a space at POS."
+  (save-excursion (goto-char pos) (insert " ")))
+
+(ert-deftest coq-eglot-session-validity ()
+  "What the server said about a version is valid before the first
+position edited since, the smallest one if several editions."
+  (with-session (make-string 100 ?a)
+    ;; not edited since version 1
+    (should (coq-eglot-session-valid-p 1 90))
+    (edit-at 30)
+    (should (coq-eglot-session-valid-p 1 29))
+    (should-not (coq-eglot-session-valid-p 1 30))
+    ;; the changes are sent: version 2
+    (setq test-version 2)
+    (should (coq-eglot-session-valid-p 2 90))
+    ;; an edition after, then one before: the smallest counts
+    (edit-at 50)
+    (edit-at 10)
+    (should (coq-eglot-session-valid-p 2 9))
+    (should-not (coq-eglot-session-valid-p 2 20))
+    (should-not (coq-eglot-session-valid-p 1 20))
+    (should (coq-eglot-session-valid-p 1 9))
+    ;; a version never edited, between two recorded ones, has the text
+    ;; of the next one: it counts its editions
+    (setq test-version 4)
+    (edit-at 60)
+    (should (coq-eglot-session-valid-p 3 20))
+    (should-not (coq-eglot-session-valid-p 3 60))
+    (should (coq-eglot-session-valid-p 4 59))
+    (should-not (coq-eglot-session-valid-p 4 60))
+    ;; no version: nothing valid
+    (should-not (coq-eglot-session-valid-p nil 1))))
+
+(ert-deftest coq-eglot-session-forgotten-versions ()
+  "An edition at the beginning makes the versions before useless: they are
+forgotten, nothing about them is valid, even later."
+  (with-session (make-string 100 ?a)
+    (edit-at 30)
+    (setq test-version 2)
+    (edit-at (point-min))
+    (setq test-version 3)
+    (edit-at 50)
+    (should-not (coq-eglot-session-valid-p 1 1))
+    (should-not (coq-eglot-session-valid-p 2 1))
+    (should (coq-eglot-session-valid-p 3 49))
+    (should (= (length coq-eglot-session--journal) 1))
+    ;; the server opens the document again: versions from 0
+    (coq-eglot-session-reset)
+    (setq test-version 0)
+    (should (coq-eglot-session-valid-p 0 90))))
+
+(defun diagnostic (start end &optional severity)
+  "A diagnostic from START to END, an error by default."
+  (coq-eglot-lsp--make-diagnostic start end (or severity 'error) "msg" nil))
+
+(ert-deftest coq-eglot-session-diagnostics ()
+  "The diagnostics are a snapshot, kept where still valid.
+The first error between two positions, warnings do not count."
+  (with-session (make-string 100 ?a)
+    (should (coq-eglot-session-receive-diagnostics
+             (coq-eglot-lsp--make-diagnostics
+              1 (list (diagnostic 41 44) (diagnostic 30 33)
+                      (diagnostic 1 6 'warning)))))
+    (should (equal (coq-eglot-session-error-range 1 100) '(30 . 33)))
+    (should (equal (coq-eglot-session-error-range 31 100) '(41 . 44)))
+    (should-not (coq-eglot-session-error-range 1 30))
+    ;; an edition forgets those after it
+    (edit-at 40)
+    (should-not (coq-eglot-session-error-range 31 100))
+    (should (equal (coq-eglot-session-error-range 1 100) '(30 . 33)))
+    ;; a late snapshot of version 1 is kept only before the edition
+    (should (coq-eglot-session-receive-diagnostics
+             (coq-eglot-lsp--make-diagnostics
+              1 (list (diagnostic 20 22) (diagnostic 60 62)))))
+    (should (equal (coq-eglot-session-error-range 1 100) '(20 . 22)))
+    (should-not (coq-eglot-session-error-range 21 100))
+    ;; a snapshot of version 2 replaces it, even empty
+    (setq test-version 2)
+    (should (coq-eglot-session-receive-diagnostics
+             (coq-eglot-lsp--make-diagnostics 2 nil)))
+    (should-not (coq-eglot-session-error-range 1 100))
+    ;; an older one is ignored
+    (should-not (coq-eglot-session-receive-diagnostics
+                 (coq-eglot-lsp--make-diagnostics
+                  1 (list (diagnostic 20 22)))))
+    (should-not (coq-eglot-session-error-range 1 100))))
 
 (provide 'coq-eglot-test-basic)
 

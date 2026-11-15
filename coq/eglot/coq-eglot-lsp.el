@@ -196,7 +196,9 @@ See `coq-eglot-strong-interrupt'."
    ;; Diagnostics after each sentence, to stop at the first error
    :eager_diagnostics t
    ;; Pretty print as strings
-   :pp_type 0))
+   :pp_type 0
+   ;; The range of the sentence of an error, in its diagnostic
+   :send_diags_extra_data t))
 
 (cl-defmethod eglot-initialization-options ((_server coq-eglot-lsp-server))
   (coq-eglot-lsp--options))

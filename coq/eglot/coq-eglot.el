@@ -51,6 +51,7 @@
 (require 'color)
 (require 'cl-lib)
 (require 'coq-eglot-lsp)
+(require 'coq-eglot-session)
 (require 'coq-eglot-compile)
 (require 'pg-terminator)                ; the double hit
 (require 'coq-goals)                    ; folding, number of goals, hypotheses
@@ -103,15 +104,6 @@ window of its own: both scroll independently.  See also
 
 ;;; Proof position
 
-(defvar-local coq-eglot--sentences nil
-  "The known processed sentences, the last one first.
-Each one is an overlay with a non-nil `coq-eglot-sentence' property,
-see `coq-eglot--add-sentence'.  The text before its end did not change
-since the server checked it, so what it records is still valid: an
-edition forgets the sentences it touches, see `coq-eglot--pop-ends'.
-Not every processed sentence has an overlay.  The proof position is
-the end of the first one, or the beginning of the buffer.")
-
 (defvar-local coq-eglot--locked-overlay nil
   "Overlay displaying the processed part of the script.")
 
@@ -134,56 +126,10 @@ answers of the server for another one are ignored, see
   "The check running in the current script buffer, or nil.
 A `coq-eglot--checking'.")
 
-(defun coq-eglot--last-sentence ()
-  "The overlay of the last known processed sentence, or nil.
-Forget the overlays deleted by others, for instance by
-`remove-overlays' without properties."
-  (while (and coq-eglot--sentences
-              (null (overlay-buffer (car coq-eglot--sentences))))
-    (pop coq-eglot--sentences))
-  (car coq-eglot--sentences))
-
-(defun coq-eglot--add-sentence (end answer)
-  "Record a processed sentence ending at END, with ANSWER, and return it.
-ANSWER is the answer of the server with the goals after the sentence,
-or nil, see `coq-eglot--set-sentence-answer'."
-  (let ((sentence (make-overlay end end nil nil nil)))
-    (overlay-put sentence 'coq-eglot-sentence t)
-    (coq-eglot--set-sentence-answer sentence answer)
-    (push sentence coq-eglot--sentences)
-    sentence))
-
-(defun coq-eglot--sentence-start (sentence)
-  "The start of SENTENCE, an overlay of `coq-eglot--sentences', or nil."
-  (and (< (overlay-start sentence) (overlay-end sentence))
-       (overlay-start sentence)))
-
-(defun coq-eglot--sentence-answer (sentence)
-  "The answer of the server with the goals after SENTENCE, or nil.
-SENTENCE is an overlay of `coq-eglot--sentences'."
-  (overlay-get sentence 'coq-eglot-answer))
-
-(defun coq-eglot--set-sentence-answer (sentence answer)
-  "Record ANSWER as the answer of the server after SENTENCE.
-SENTENCE is an overlay of `coq-eglot--sentences'.  The range of ANSWER,
-if it is the one of the sentence, gives the start of the overlay: it is
-empty, at the end of the sentence, while the start is unknown."
-  (let ((end (overlay-end sentence))
-        (bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
-    (when (and bounds (= (cdr bounds) end) (< (car bounds) end))
-      (move-overlay sentence (car bounds) end)))
-  (overlay-put sentence 'coq-eglot-answer answer))
-
-(defun coq-eglot--sentence-ending-at (end)
-  "The overlay of the known processed sentence ending at END, or nil."
-  (seq-find (lambda (sentence)
-              (and (overlay-buffer sentence) (= (overlay-end sentence) end)))
-            coq-eglot--sentences))
-
 (defun coq-eglot-position ()
-  "Return the proof position of the current buffer."
-  (let ((last (coq-eglot--last-sentence)))
-    (if last (overlay-end last) (point-min))))
+  "Return the proof position of the current buffer.
+See `coq-eglot-session-position'."
+  (coq-eglot-session-position))
 
 (defface coq-eglot-inactive-locked-face '((t :extend t))
   "Face of the processed part of the script buffers that are not active.
@@ -402,22 +348,17 @@ Run `coq-eglot-position-hook'."
                        (coq-eglot--checking-target coq-eglot--running))))
   (run-hooks 'coq-eglot-position-hook))
 
-(defun coq-eglot--pop-ends (pos)
-  "Forget the processed sentences ending after POS."
-  (while (and (coq-eglot--last-sentence)
-              (> (overlay-end (car coq-eglot--sentences)) pos))
-    (delete-overlay (pop coq-eglot--sentences))))
-
 (defun coq-eglot--set-position (end answer)
   "Move the proof position to END, with the ANSWER of the server for it.
 END is the end of a sentence, or nil for the beginning of the buffer.
 ANSWER may be nil."
-  (coq-eglot--pop-ends (or end (point-min)))
+  (coq-eglot-session-forget-sentences (or end (point-min)))
   (when end
     (if (= (coq-eglot-position) end)
         (when answer
-          (coq-eglot--set-sentence-answer (coq-eglot--last-sentence) answer))
-      (coq-eglot--add-sentence end answer)))
+          (coq-eglot-session-set-sentence-answer
+           (coq-eglot-session-last-sentence) answer))
+      (coq-eglot-session-add-sentence end answer)))
   (coq-eglot--update-overlays))
 
 (defun coq-eglot--skip-backward (pos)
@@ -438,8 +379,8 @@ already."
   (let ((end (coq-eglot--skip-backward pos)))
     (if (<= end (point-min))
         nil
-      (let* ((kept (coq-eglot--sentence-ending-at end))
-             (answer (and kept (coq-eglot--sentence-answer kept))))
+      (let* ((kept (coq-eglot-session-sentence-ending-at end))
+             (answer (and kept (coq-eglot-session-sentence-answer kept))))
         (if answer
             (cons end answer)
           ;; the sentence containing the last character before POS
@@ -452,30 +393,6 @@ already."
              (t (coq-eglot--sentence-before (car bounds))))))))))
 
 ;;; Errors
-
-(defvar-local coq-eglot--diagnostics nil
-  "Last diagnostics published by the server for the current buffer.
-A list of `coq-eglot-lsp-diagnostic'.")
-
-(defun coq-eglot--receive-diagnostics (diagnostics)
-  "Keep DIAGNOSTICS, a `coq-eglot-lsp-diagnostics', if about this version.
-See `coq-eglot--error-range'."
-  (when (eql (coq-eglot-lsp-diagnostics-version diagnostics)
-             (coq-eglot-lsp-version))
-    (setq coq-eglot--diagnostics
-          (coq-eglot-lsp-diagnostics-diagnostics diagnostics))))
-
-(defun coq-eglot--error-range (start end)
-  "Buffer range (BEG . END) of the first error located between START and END.
-Look for it in the last published diagnostics, return nil if none."
-  (let (first)
-    (dolist (diag coq-eglot--diagnostics)
-      (let ((beg (coq-eglot-lsp-diagnostic-start diag)))
-        (when (and (eq (coq-eglot-lsp-diagnostic-severity diag) 'error)
-                   (<= start beg) (< beg end)
-                   (or (null first) (< beg (car first))))
-          (setq first (cons beg (coq-eglot-lsp-diagnostic-end diag))))))
-    first))
 
 (defvar-local coq-eglot--error-overlays nil
   "Overlays on the sentence that failed and on the error location.")
@@ -516,7 +433,7 @@ of the error, if known, with `proof-warning-face'.  Move point to the
 error.  Run `coq-eglot-error-hook'."
   (coq-eglot--clear-error)
   (coq-eglot--error-overlay start end 'proof-boring-face 0)
-  (let ((range (coq-eglot--error-range start end)))
+  (let ((range (coq-eglot-session-error-range start end)))
     (when range
       (coq-eglot--error-overlay (car range) (cdr range) 'proof-warning-face 1))
     (goto-char (if range (car range) start)))
@@ -1172,14 +1089,14 @@ at the current width.  For OUTPUT, the current one by default."
                                (coq-eglot--output-flags output))))
                (buffer-live-p script))
       (with-current-buffer script
-        (let ((last (coq-eglot--last-sentence)))
+        (let ((last (coq-eglot-session-last-sentence)))
           (when (and last (not coq-eglot--running))
             (coq-eglot-lsp-goals-async
              (1- (overlay-end last))
              (lambda (answer)
-               (when (and (eq (coq-eglot--last-sentence) last)
+               (when (and (eq (coq-eglot-session-last-sentence) last)
                           (coq-eglot--active-p))
-                 (coq-eglot--set-sentence-answer last answer)
+                 (coq-eglot-session-set-sentence-answer last answer)
                  (coq-eglot--show-goals answer)))
              #'ignore)))))))
 
@@ -1554,14 +1471,14 @@ active, see `coq-eglot--displays-p'."
 Use the answer kept for the last processed sentence if any, ask the
 server otherwise, or if ASK is non-nil."
   (coq-eglot--clear-error)
-  (let ((last (coq-eglot--last-sentence)))
+  (let ((last (coq-eglot-session-last-sentence)))
     (if (null last)
         (progn (coq-eglot--show-goals nil)
                (coq-eglot--show-response ""))
-      (when (or ask (null (coq-eglot--sentence-answer last)))
-        (coq-eglot--set-sentence-answer
+      (when (or ask (null (coq-eglot-session-sentence-answer last)))
+        (coq-eglot-session-set-sentence-answer
          last (coq-eglot-lsp-goals (1- (overlay-end last)))))
-      (coq-eglot--show-answer (coq-eglot--sentence-answer last)))))
+      (coq-eglot--show-answer (coq-eglot-session-sentence-answer last)))))
 
 (defun coq-eglot--goals-at-position-async ()
   "Display the goals and messages at the proof position, without waiting.
@@ -1570,19 +1487,19 @@ ask the server asynchronously, and display the answer when it comes if
 the proof position did not move meanwhile.  Used after editions: the
 server may still be finishing an interrupted sentence."
   (coq-eglot--clear-error)
-  (let ((last (coq-eglot--last-sentence)))
+  (let ((last (coq-eglot-session-last-sentence)))
     (cond
      ((null last)
       (coq-eglot--show-goals nil)
       (coq-eglot--show-response ""))
-     ((coq-eglot--sentence-answer last)
-      (coq-eglot--show-answer (coq-eglot--sentence-answer last)))
+     ((coq-eglot-session-sentence-answer last)
+      (coq-eglot--show-answer (coq-eglot-session-sentence-answer last)))
      (t
       (coq-eglot-lsp-goals-async
        (1- (overlay-end last))
        (lambda (answer)
-         (when (eq (coq-eglot--last-sentence) last)
-           (coq-eglot--set-sentence-answer last answer)
+         (when (eq (coq-eglot-session-last-sentence) last)
+           (coq-eglot-session-set-sentence-answer last answer)
            (coq-eglot--show-answer answer)))
        #'ignore)))))
 
@@ -1670,7 +1587,7 @@ sentence before, if known."
         (coq-eglot--set-position (car before) (cdr before))
       ;; no sentence before, or the server did not say which: the known
       ;; sentences before START stay processed
-      (coq-eglot--pop-ends start)
+      (coq-eglot-session-forget-sentences start)
       (coq-eglot--update-overlays))
     (coq-eglot--goals-at-position)
     (coq-eglot--show-error text)
@@ -1683,16 +1600,16 @@ sentence before, if known."
 
 (defun coq-eglot--progress (progress)
   "The server checked the sentences up to the start of PROGRESS.
-PROGRESS is a `coq-eglot-lsp-progress', ignored if about an older
-version.  Move the proof position there, but not past the target, nor
-past an error."
+PROGRESS is a `coq-eglot-lsp-progress', ignored if no longer valid,
+see `coq-eglot-session-valid-p'.  Move the proof position there, but
+not past the target, nor past an error."
   (let ((pos (coq-eglot-lsp-progress-start progress)))
     (when (and coq-eglot--running
-               (eql (coq-eglot-lsp-progress-version progress)
-                    (coq-eglot-lsp-version))
+               (coq-eglot-session-valid-p
+                (coq-eglot-lsp-progress-version progress) pos)
                (> pos (coq-eglot-position))
                (<= pos (coq-eglot--checking-target coq-eglot--running))
-               (not (coq-eglot--error-range (coq-eglot-position) pos)))
+               (not (coq-eglot-session-error-range (coq-eglot-position) pos)))
       (coq-eglot--set-position pos nil))))
 
 (defun coq-eglot--next-sentence-start ()
@@ -1807,7 +1724,7 @@ failed, reported if there was no error before."
          (answer (coq-eglot-lsp-goals last))
          (bounds (and answer (coq-eglot-lsp-answer-sentence answer)))
          ;; an error may be located after LAST in this sentence
-         (error (coq-eglot--error-range
+         (error (coq-eglot-session-error-range
                  start (max (1+ last) (if bounds (cdr bounds) 0)))))
     (cond
      (error
@@ -1965,7 +1882,7 @@ ANSWER may be nil."
 (defun coq-eglot--retract (pos)
   "Move the proof position back to the last sentence ending before POS.
 A sentence ending exactly at POS stays processed.  Display the goals."
-  (coq-eglot--pop-ends pos)
+  (coq-eglot-session-forget-sentences pos)
   (coq-eglot--trace-retract pos)
   (let ((before (coq-eglot--sentence-before pos)))
     (coq-eglot--set-position (car before) (cdr before)))
@@ -1992,9 +1909,9 @@ During a check, the sentence after the part being checked, see
   (interactive)
   (coq-eglot--with-script
     (coq-eglot--check-busy)
-    (let ((last (coq-eglot--last-sentence)))
+    (let ((last (coq-eglot-session-last-sentence)))
       (when last
-        (coq-eglot--retract (or (coq-eglot--sentence-start last)
+        (coq-eglot--retract (or (coq-eglot-session-sentence-start last)
                                 (1- (overlay-end last))))))))
 
 (defun coq-eglot-goto-point ()
@@ -2175,7 +2092,7 @@ user works if the user edits it, see `coq-eglot--user-edit-p'."
     (setq coq-eglot--interrupted t))
   (when (< beg (coq-eglot-position))
     ;; a sentence ending at BEG is edited too
-    (coq-eglot--pop-ends (1- beg))
+    (coq-eglot-session-forget-sentences (1- beg))
     (coq-eglot--update-overlays)
     (coq-eglot--clear-error)
     (setq coq-eglot--edited (min beg (or coq-eglot--edited beg))))
@@ -2191,8 +2108,8 @@ user works if the user edits it, see `coq-eglot--user-edit-p'."
 Call ON-FOUND with (END . ANSWER) when found.  Do nothing if there is
 no such sentence or a request fails."
   (let* ((end (coq-eglot--skip-backward pos))
-         (kept (and (> end (point-min)) (coq-eglot--sentence-ending-at end)))
-         (answer (and kept (coq-eglot--sentence-answer kept))))
+         (kept (and (> end (point-min)) (coq-eglot-session-sentence-ending-at end)))
+         (answer (and kept (coq-eglot-session-sentence-answer kept))))
     (cond
      ((<= end (point-min)) nil)
      (answer (funcall on-found (cons end answer)))
@@ -2729,7 +2646,11 @@ Warn if processed Require sentences load outdated libraries."
                     (append coq-eglot-ignored-capabilities
                             eglot-ignored-server-capabilities))
         (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
-        (setq coq-eglot-lsp-diagnostics-function #'coq-eglot--receive-diagnostics)
+        (setq coq-eglot-lsp-diagnostics-function
+              #'coq-eglot-session-receive-diagnostics)
+        (coq-eglot-session-start #'coq-eglot-lsp-version)
+        ;; the server opens the document again, from version 0
+        (add-hook 'eglot-managed-mode-hook #'coq-eglot-session-reset nil t)
         (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)
         (setq coq-query-function #'coq-eglot-run-query)
         (setq coq-query-result-function #'coq-eglot-query-result)
@@ -2758,6 +2679,7 @@ Warn if processed Require sentences load outdated libraries."
     (kill-local-variable 'coq-processed-end-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
+    (remove-hook 'eglot-managed-mode-hook #'coq-eglot-session-reset t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot-lsp-check-load-path t)
     (remove-hook 'after-change-functions #'coq-eglot--after-change t)
     (remove-hook 'post-command-hook #'coq-eglot--post-command t)
@@ -2765,6 +2687,7 @@ Warn if processed Require sentences load outdated libraries."
     (coq-eglot--forget-active)
     (coq-eglot--cancel)
     (coq-eglot--set-position nil nil)
+    (coq-eglot-session-stop)
     (coq-eglot--clear-error)))
 
 (defun coq-eglot-setup ()
