@@ -437,6 +437,135 @@ The new server knows nothing: it checks again on demand."
   (coq-eglot-lsp-shutdown)
   (coq-eglot-lsp-ensure-server))
 
+;;; Events
+
+;; The answers and notifications of the server, normalized: the rest of
+;; the backend does not see the JSON of coq-lsp.  Each one comes with
+;; its objective context, the version of the document and the positions
+;; it is about, converted to positions of the current text.  Whether it
+;; is still valid after editions is not decided here: before the first
+;; position edited since its version, the text did not change and the
+;; positions are exact; a position after it stays after it once
+;; converted.
+
+(cl-defstruct (coq-eglot-lsp-context
+               (:constructor coq-eglot-lsp--make-context (method position)))
+  "What a request was about, kept from its sending.
+METHOD is its LSP method, a keyword.  POSITION is the buffer position it
+was sent at.  VERSION is the version of the document sent with it.  ID
+is its jsonrpc id, for `$/cancelRequest'."
+  method position version id)
+
+(cl-defstruct (coq-eglot-lsp-message
+               (:constructor coq-eglot-lsp--make-message (severity text)))
+  "A message of Coq.
+SEVERITY is `error', `warning', `notice', `info', or nil if unknown.
+TEXT is a string."
+  severity text)
+
+(cl-defstruct (coq-eglot-lsp-answer
+               (:constructor coq-eglot-lsp-make-answer
+                             (&key context version sentence goals messages
+                                   error printing-width printing-flags)))
+  "The answer of the server with the goals after a sentence.
+CONTEXT is the `coq-eglot-lsp-context' of the request, or nil.  VERSION
+is the version of the document the answer is about.  SENTENCE is
+\(START . END), the buffer positions of the sentence, or nil if the
+server did not say.  GOALS is the goal configuration of coq-lsp, the
+data displayed (the first goal may have the sorts of its hypotheses
+with the key :hyp-sorts, see `coq-eglot-lsp-hyp-sorts-function'), or
+nil outside of a proof.  MESSAGES is a list of `coq-eglot-lsp-message'.
+ERROR is the text of the error of the sentence, or nil.  PRINTING-WIDTH
+and PRINTING-FLAGS are those the goals were printed with, see
+`coq-eglot-lsp-printing-width-function' and
+`coq-eglot-lsp-printing-flags-function'."
+  context version sentence goals messages error printing-width
+  printing-flags)
+
+(cl-defstruct (coq-eglot-lsp-checked
+               (:constructor coq-eglot-lsp--make-checked (context)))
+  "The server checked up to the sentence at the position of CONTEXT.
+The answer of `petanque/get_state_at_pos' says nothing else: the version
+and the position are those of the request."
+  context)
+
+(cl-defstruct (coq-eglot-lsp-progress
+               (:constructor coq-eglot-lsp--make-progress (version start)))
+  "The server is checking VERSION of the document, up to START.
+START is the end of the last sentence checked: the server reports the
+rest of the document as still to check, from START."
+  version start)
+
+(cl-defstruct (coq-eglot-lsp-diagnostic
+               (:constructor coq-eglot-lsp--make-diagnostic
+                             (start end severity message sentence)))
+  "A diagnostic of the server.
+START and END are the buffer positions of the message, not necessarily
+of its sentence.  SEVERITY is like in `coq-eglot-lsp-message'.  MESSAGE
+is a string.  SENTENCE is (START . END) of its sentence, for errors
+only, or nil if the server did not say."
+  start end severity message sentence)
+
+(cl-defstruct (coq-eglot-lsp-diagnostics
+               (:constructor coq-eglot-lsp--make-diagnostics
+                             (version diagnostics)))
+  "All the diagnostics of VERSION of the document.
+A snapshot: it replaces the previous one, even when DIAGNOSTICS, a list
+of `coq-eglot-lsp-diagnostic', is empty."
+  version diagnostics)
+
+(cl-defstruct (coq-eglot-lsp-failure
+               (:constructor coq-eglot-lsp--make-failure
+                             (context code message cancelled)))
+  "A request failed.
+CONTEXT is its `coq-eglot-lsp-context'.  CODE is the JSON-RPC error
+code, MESSAGE its text.  CANCELLED is non-nil if the request was
+cancelled, see `coq-eglot-lsp-cancel-all': RequestCancelled of LSP for a
+request not started, Interrupted of coq-lsp for a running one."
+  context code message cancelled)
+
+(defun coq-eglot-lsp--severity (level)
+  "The severity of LSP LEVEL, a number, see `coq-eglot-lsp-message'."
+  ;; coq-lsp: Error 1, Warning 2, Notice 3, Info and Debug 4
+  (pcase level (1 'error) (2 'warning) (3 'notice) (4 'info)))
+
+(defun coq-eglot-lsp--message (message)
+  "MESSAGE of the server as a `coq-eglot-lsp-message'.
+MESSAGE is a plist with the keys :level and :text, or a string."
+  (if (stringp message)
+      (coq-eglot-lsp--make-message nil message)
+    (coq-eglot-lsp--make-message
+     (coq-eglot-lsp--severity (plist-get message :level))
+     (plist-get message :text))))
+
+(defun coq-eglot-lsp--answer (answer context width flags)
+  "ANSWER of a goals request with CONTEXT, as a `coq-eglot-lsp-answer'.
+Printed at WIDTH with FLAGS.  Nil if ANSWER is nil."
+  (when answer
+    (let ((range (plist-get answer :range)))
+      (coq-eglot-lsp-make-answer
+       :context context
+       :version (plist-get (plist-get answer :textDocument) :version)
+       :sentence (and range (coq-eglot-lsp-range range))
+       :goals (plist-get answer :goals)
+       :messages (mapcar #'coq-eglot-lsp--message
+                         (plist-get answer :messages))
+       :error (plist-get answer :error)
+       :printing-width width
+       :printing-flags flags))))
+
+(defun coq-eglot-lsp--failure (err context)
+  "ERR, the error object of a request with CONTEXT, as a failure.
+See `coq-eglot-lsp-failure'."
+  (let ((code (plist-get err :code)))
+    (coq-eglot-lsp--make-failure
+     context code (or (plist-get err :message) (format "%S" err))
+     (and (memql code '(-32800 -32001)) t))))
+
+(defun coq-eglot-lsp-version ()
+  "The version of the current buffer last sent to the server."
+  eglot--versioned-identifier)
+
 (defun coq-eglot-lsp--server-for-request ()
   "Return the server of the current buffer, after sending pending changes."
   (let ((server (or (coq-eglot-lsp-ensure-server)
@@ -457,17 +586,21 @@ stops waiting."
     (jsonrpc-request (coq-eglot-lsp--server-for-request) method params
                      :timeout nil)))
 
-(defun coq-eglot-lsp-async-request (method params on-success on-error)
-  "Send request METHOD with PARAMS to the server of the current buffer.
-Pending changes of the buffer are sent first.  Return immediately the id
-of the request, for `coq-eglot-lsp-cancel'.  ON-SUCCESS is called with
-the answer, ON-ERROR with the error object, in the current buffer if
-still live.  They are called from a timer, not from the process filter,
-so that they can send synchronous requests.  Not while waiting for the
+(defun coq-eglot-lsp--async-request (pos method params on-success on-error)
+  "Send request METHOD at POS with PARAMS to the server of the buffer.
+Pending changes of the buffer are sent first.  Return immediately its
+`coq-eglot-lsp-context'.  ON-SUCCESS is called with the answer and the
+context, ON-ERROR with a `coq-eglot-lsp-failure', in the current buffer
+if still live.  PARAMS is a function returning the parameters, called
+after the changes are sent.  ON-SUCCESS and ON-ERROR are called from a
+timer, not from the process filter, so that they can send synchronous
+requests.  Not while waiting for the
 answer to a synchronous request, maybe to another server: when it
 comes, `jsonrpc-request' would leave theirs, and them, unfinished."
-  (let ((server (coq-eglot-lsp--server-for-request))
-        (buffer (current-buffer)))
+  (let* ((server (coq-eglot-lsp--server-for-request))
+         (buffer (current-buffer))
+         (context (coq-eglot-lsp--make-context method pos)))
+    (setf (coq-eglot-lsp-context-version context) eglot--versioned-identifier)
     (cl-labels ((run (fn arg)
                   (cond
                    ((not (buffer-live-p buffer)))
@@ -476,11 +609,18 @@ comes, `jsonrpc-request' would leave theirs, and them, unfinished."
                    (t (with-current-buffer buffer (funcall fn arg)))))
                 (later (fn)
                   (lambda (arg) (run-at-time 0 nil #'run fn arg))))
-      ;; Internal, but `jsonrpc-async-request' does not return the id
-      (car (jsonrpc--async-request-1 server method params
-                                     :success-fn (later on-success)
-                                     :error-fn (later on-error)
-                                     :timeout nil)))))
+      (setf (coq-eglot-lsp-context-id context)
+            ;; Internal, but `jsonrpc-async-request' does not return the id
+            (car (jsonrpc--async-request-1
+                  server method (funcall params)
+                  :success-fn (later (lambda (answer)
+                                       (funcall on-success answer context)))
+                  :error-fn (later (lambda (err)
+                                     (funcall on-error
+                                              (coq-eglot-lsp--failure
+                                               err context))))
+                  :timeout nil)))
+      context)))
 
 (defun coq-eglot-lsp--pending-ids (server)
   "Ids of the requests sent to SERVER and not answered yet."
@@ -491,12 +631,6 @@ comes, `jsonrpc-request' would leave theirs, and them, unfinished."
     (mapcar #'car (jsonrpc--continuations server)))
    ((fboundp 'jsonrpc--request-continuations)
     (hash-table-keys (jsonrpc--request-continuations server)))))
-
-(defun coq-eglot-lsp-cancelled-p (err)
-  "Non-nil if ERR, the error of a request, says it was cancelled.
-After `$/cancelRequest': the error RequestCancelled of LSP for a request
-not started, the error Interrupted of coq-lsp for a running one."
-  (memql (plist-get err :code) '(-32800 -32001)))
 
 (defun coq-eglot-lsp-cancel-all ()
   "Ask the server of the current buffer to cancel all pending requests.
@@ -536,8 +670,8 @@ different servers may share libraries.  Ignored before coq-lsp 0.2.5."
   "Function giving the printing width of the goals, or nil.
 Called without argument in the script buffer before each goals request.
 If it returns a number N, the goals are printed with Set Printing Width
-N, otherwise with Coq's default width.  The answer gives the width with
-the key :printing-width.")
+N, otherwise with Coq's default width.  The answer gives the width, see
+`coq-eglot-lsp-answer'.")
 
 (defun coq-eglot-lsp--printing-width ()
   "Printing width of the next goals request, or nil.
@@ -550,7 +684,7 @@ See `coq-eglot-lsp-printing-width-function'."
 Called without argument in the script buffer before each goals request.
 It returns a list of Coq commands without their final dot, like \"Set
 Printing Parentheses\", run before the goals are printed.  The answer
-gives them with the key :printing-flags.")
+gives them, see `coq-eglot-lsp-answer'.")
 
 (defun coq-eglot-lsp--printing-flags ()
   "Printing flags of the next goals request.
@@ -617,32 +751,34 @@ nothing else."
                                              (concat command "."))
                                            commands " "))))))
 
-(defun coq-eglot-lsp--with-width (answer width flags)
-  "ANSWER of a goals request printed at WIDTH with FLAGS.
-With the keys :printing-width and :printing-flags."
-  (if answer
-      (plist-put (plist-put answer :printing-width width)
-                 :printing-flags flags)
-    answer))
+(defun coq-eglot-lsp--with-hyp-sorts-answer (answer messages)
+  "ANSWER, a `coq-eglot-lsp-answer', with the sorts in MESSAGES.
+See `coq-eglot-lsp--with-hyp-sorts'."
+  (when answer
+    (coq-eglot-lsp--with-hyp-sorts
+     (list :goals (coq-eglot-lsp-answer-goals answer)) messages))
+  answer)
 
 (defun coq-eglot-lsp-goals (pos &optional no-sorts)
   "Ask the goals after the sentence at buffer position POS.
-Return the answer of the server as a plist with keys :range, :goals,
-:messages and :error, and :printing-width, see
-`coq-eglot-lsp-printing-width-function', and :printing-flags, see
-`coq-eglot-lsp-printing-flags-function'.  The first goal has the sorts
-of its hypotheses if needed, see `coq-eglot-lsp-hyp-sorts-function',
-unless NO-SORTS is non-nil: the goals will not be displayed."
-  (let ((width (coq-eglot-lsp--printing-width))
-        (flags (coq-eglot-lsp--printing-flags)))
-    (let ((answer (coq-eglot-lsp--with-width
-                   (coq-eglot-lsp-request
-                    :proof/goals (coq-eglot-lsp--goals-params pos width flags))
-                   width flags)))
-      (if (and (not no-sorts)
+Return a `coq-eglot-lsp-answer', or nil if the server answered nothing.
+The first goal has the sorts of its hypotheses if needed, see
+`coq-eglot-lsp-hyp-sorts-function', unless NO-SORTS is non-nil: the
+goals will not be displayed."
+  (let* ((width (coq-eglot-lsp--printing-width))
+         (flags (coq-eglot-lsp--printing-flags))
+         (raw (coq-eglot-lsp-request
+               :proof/goals (coq-eglot-lsp--goals-params pos width flags)))
+         (context (coq-eglot-lsp--make-context :proof/goals pos)))
+    (setf (coq-eglot-lsp-context-version context) eglot--versioned-identifier)
+    (let ((answer (coq-eglot-lsp--answer raw context width flags)))
+      (if (and answer
+               (not no-sorts)
                (coq-eglot-lsp--hyp-sorts-p)
-               (> (length (plist-get (plist-get answer :goals) :goals)) 0))
-          (coq-eglot-lsp--with-hyp-sorts
+               (> (length (plist-get (coq-eglot-lsp-answer-goals answer)
+                                     :goals))
+                  0))
+          (coq-eglot-lsp--with-hyp-sorts-answer
            answer
            (condition-case nil
                (coq-eglot-lsp-query pos coq-eglot-lsp--hyp-sorts-command)
@@ -651,7 +787,9 @@ unless NO-SORTS is non-nil: the goals will not be displayed."
 
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
-See `coq-eglot-lsp-goals' and `coq-eglot-lsp-async-request'."
+ON-SUCCESS is called with a `coq-eglot-lsp-answer', or nil, ON-ERROR
+with a `coq-eglot-lsp-failure'.  See `coq-eglot-lsp-goals' and
+`coq-eglot-lsp--async-request'.  Return the context of the request."
   (let* ((width (coq-eglot-lsp--printing-width))
          (flags (coq-eglot-lsp--printing-flags))
          ;; with the sorts: the answer of the goals and the messages of
@@ -661,48 +799,60 @@ See `coq-eglot-lsp-goals' and `coq-eglot-lsp-async-request'."
          (done (lambda ()
                  (unless (or (eq answer 'none) (eq messages 'none))
                    (funcall on-success
-                            (coq-eglot-lsp--with-hyp-sorts answer messages))))))
+                            (coq-eglot-lsp--with-hyp-sorts-answer
+                             answer messages))))))
     (when (eq messages 'none)
       (coq-eglot-lsp-query-async
        pos coq-eglot-lsp--hyp-sorts-command
        (lambda (result) (setq messages result) (funcall done))
        ;; outside of a proof for instance: no sorts
-       (lambda (_error) (setq messages nil) (funcall done))))
-    (coq-eglot-lsp-async-request
-     :proof/goals (coq-eglot-lsp--goals-params pos width flags)
-     (lambda (result)
-       (setq answer (coq-eglot-lsp--with-width result width flags))
+       (lambda (_failure) (setq messages nil) (funcall done))))
+    (coq-eglot-lsp--async-request
+     pos :proof/goals
+     (lambda () (coq-eglot-lsp--goals-params pos width flags))
+     (lambda (result context)
+       (setq answer (coq-eglot-lsp--answer result context width flags))
        (funcall done))
      on-error)))
 
 (defun coq-eglot-lsp-ping (on-answer)
-  "Send a cheap request, call ON-ANSWER when the server answers it.
+  "Send a cheap request, call ON-ANSWER without argument when it is answered.
 Its answer tells that the server is ready again after an interruption."
-  (coq-eglot-lsp-async-request :proof/goals
-                               (coq-eglot-lsp--goals-params (point-min))
-                               on-answer on-answer))
+  (coq-eglot-lsp--async-request
+   (point-min) :proof/goals
+   (lambda () (coq-eglot-lsp--goals-params (point-min)))
+   (lambda (_answer _context) (funcall on-answer))
+   (lambda (_failure) (funcall on-answer))))
 
 (defun coq-eglot-lsp-check-async (pos on-success on-error)
   "Ask asynchronously the server to check up to the sentence at POS.
-No goals are computed.  See `coq-eglot-lsp-async-request'."
-  (coq-eglot-lsp-async-request
-   :petanque/get_state_at_pos
-   (list :uri (plist-get (eglot--TextDocumentIdentifier) :uri)
-         :position (coq-eglot-lsp-position pos)
-         :opts (list :memo t :hash :json-false))
-   on-success on-error))
+No goals are computed.  ON-SUCCESS is called with a
+`coq-eglot-lsp-checked', ON-ERROR with a `coq-eglot-lsp-failure'.  See
+`coq-eglot-lsp--async-request'.  Return the context of the request."
+  (coq-eglot-lsp--async-request
+   pos :petanque/get_state_at_pos
+   (lambda ()
+     (list :uri (plist-get (eglot--TextDocumentIdentifier) :uri)
+           :position (coq-eglot-lsp-position pos)
+           :opts (list :memo t :hash :json-false)))
+   (lambda (_answer context)
+     (funcall on-success (coq-eglot-lsp--make-checked context)))
+   on-error))
 
 (defun coq-eglot-lsp-query-async (pos command on-success on-error)
   "Run Coq COMMAND asynchronously in the state at POS.
 The state is the one after the sentences ending before POS.  The
 document does not change.  ON-SUCCESS is called with the messages of
-COMMAND, a list of strings.  See `coq-eglot-lsp-async-request'."
-  (coq-eglot-lsp-async-request
-   :petanque/run_at_point
-   (list :textDocument (eglot--VersionedTextDocumentIdentifier)
-         :position (coq-eglot-lsp-position pos)
-         :command command)
-   (lambda (answer)
+COMMAND, a list of strings, ON-ERROR with a `coq-eglot-lsp-failure'.
+See `coq-eglot-lsp--async-request'.  Return the context of the
+request."
+  (coq-eglot-lsp--async-request
+   pos :petanque/run_at_point
+   (lambda ()
+     (list :textDocument (eglot--VersionedTextDocumentIdentifier)
+           :position (coq-eglot-lsp-position pos)
+           :command command))
+   (lambda (answer _context)
      ;; each feedback is [LEVEL TEXT]
      (funcall on-success
               (mapcar (lambda (feedback) (aref feedback 1))
@@ -758,54 +908,58 @@ support memprof-limits.  Set `coq-eglot-strong-interrupt' to nil.")))
 
 (defvar-local coq-eglot-lsp-progress-function nil
   "Function called while the server checks the current buffer.
-It is called with the end of the last checked sentence.")
+It is called with a `coq-eglot-lsp-progress', maybe about an older
+version of the buffer.")
 
 (cl-defmethod eglot-handle-notification
   ((_server coq-eglot-lsp-server) (_method (eql $/coq/fileProgress))
    &key textDocument processing &allow-other-keys)
   "Call `coq-eglot-lsp-progress-function' of the buffer being checked.
-PROCESSING is the part of the document still to check, nothing when
-done."
+PROCESSING is the part of the document still to check: coq-lsp 0.2
+sends one range, from the end of the last sentence checked to the end
+of the document, even when the check is finished."
   (let ((buffer (coq-eglot-lsp--buffer (plist-get textDocument :uri))))
     (when (and buffer (> (length processing) 0))
       (with-current-buffer buffer
-        ;; ignore notifications about an older version of the buffer
-        (when (and coq-eglot-lsp-progress-function
-                   (eql (plist-get textDocument :version)
-                        eglot--versioned-identifier))
+        (when coq-eglot-lsp-progress-function
           (funcall coq-eglot-lsp-progress-function
-                   (car (coq-eglot-lsp-range
-                         (plist-get (aref processing 0) :range)))))))))
+                   (coq-eglot-lsp--make-progress
+                    (plist-get textDocument :version)
+                    (car (coq-eglot-lsp-range
+                          (plist-get (aref processing 0) :range))))))))))
 
 ;;; Diagnostics
 
-(defvar-local coq-eglot-lsp--diagnostics nil
-  "Last diagnostics published by the server for the current buffer.")
+(defvar-local coq-eglot-lsp-diagnostics-function nil
+  "Function called with the diagnostics of the current buffer.
+It is called with a `coq-eglot-lsp-diagnostics', maybe about an older
+version of the buffer.")
+
+(defun coq-eglot-lsp--diagnostic (diag)
+  "DIAG, a diagnostic of the server, as a `coq-eglot-lsp-diagnostic'."
+  (let ((range (coq-eglot-lsp-range (plist-get diag :range)))
+        (sentence (plist-get (plist-get diag :data) :sentenceRange)))
+    (coq-eglot-lsp--make-diagnostic
+     (car range) (cdr range)
+     (coq-eglot-lsp--severity (plist-get diag :severity))
+     (plist-get diag :message)
+     (and sentence (coq-eglot-lsp-range sentence)))))
 
 ;; Eglot still gives the diagnostics to flymake
 (cl-defmethod eglot-handle-notification :after
   ((_server coq-eglot-lsp-server)
    (_method (eql textDocument/publishDiagnostics))
    &key uri diagnostics version &allow-other-keys)
-  "Keep the DIAGNOSTICS of the buffer of URI, see `coq-eglot-lsp-error-range'.
-Not those of an older VERSION of the buffer, if given."
+  "Call `coq-eglot-lsp-diagnostics-function' of the buffer of URI.
+With its DIAGNOSTICS for VERSION, or the current version if not given."
   (let ((buffer (coq-eglot-lsp--buffer uri)))
     (when buffer
       (with-current-buffer buffer
-        (unless (and version (not (eql version eglot--versioned-identifier)))
-          (setq coq-eglot-lsp--diagnostics diagnostics))))))
-
-(defun coq-eglot-lsp-error-range (start end)
-  "Buffer range (BEG . END) of the first error located between START and END.
-Look for it in the last published diagnostics, return nil if none."
-  (let (first)
-    (cl-loop for diag across coq-eglot-lsp--diagnostics
-             for range = (coq-eglot-lsp-range (plist-get diag :range))
-             when (and (eql (plist-get diag :severity) 1)
-                       (<= start (car range)) (< (car range) end)
-                       (or (null first) (< (car range) (car first))))
-             do (setq first range))
-    first))
+        (when coq-eglot-lsp-diagnostics-function
+          (funcall coq-eglot-lsp-diagnostics-function
+                   (coq-eglot-lsp--make-diagnostics
+                    (or version eglot--versioned-identifier)
+                    (mapcar #'coq-eglot-lsp--diagnostic diagnostics))))))))
 
 (provide 'coq-eglot-lsp)
 

@@ -2478,8 +2478,9 @@ its messages and the output hook are those of the active one."
           (with-current-buffer other
             (should-not (coq-eglot--active-p))
             (add-hook 'coq-eglot-output-hook (lambda () (setq ran t)) nil t)
-            (coq-eglot--show-goals '(:goals (:goals [] :stack [] :shelf []
-                                                    :given_up [])))
+            (coq-eglot--show-goals
+             (coq-eglot-lsp-make-answer
+              :goals '(:goals [] :stack [] :shelf [] :given_up [])))
             (coq-eglot--show-response "other")
             (should (equal (coq-eglot--output-goals output) goals))
             (should-not ran)
@@ -2539,7 +2540,7 @@ position before it, instead of going back to the beginning."
       ;; answers without the range of the sentence
       (coq-eglot--set-sentence-answer (coq-eglot--last-sentence) nil)
       (cl-letf (((symbol-function 'coq-eglot-lsp-goals)
-                 (lambda (&rest _) '(:goals nil))))
+                 (lambda (&rest _) (coq-eglot-lsp-make-answer))))
         (coq-eglot--fail start (point-max) "Error." nil))
       (should (= (coq-eglot-position) position)))))
 
@@ -3603,6 +3604,102 @@ has compiled Require sentences."
               (should scheduled))
           (setq coq-eglot-compile--loaded nil
                 buffer-file-name nil))))))
+
+;; The events of the adapter, without server
+
+(defmacro with-lsp-text (text &rest body)
+  "Run BODY in a temporary buffer containing TEXT."
+  (declare (indent 1) (debug t))
+  `(with-temp-buffer
+     (insert ,text)
+     ,@body))
+
+(defun lsp-range (l1 c1 l2 c2)
+  "The LSP range from line L1 column C1 to line L2 column C2."
+  (list :start (list :line l1 :character c1)
+        :end (list :line l2 :character c2)))
+
+(ert-deftest coq-eglot-lsp-answer-normalized ()
+  "A goals answer of coq-lsp becomes a `coq-eglot-lsp-answer'.
+With buffer positions for the sentence and messages with severities."
+  (with-lsp-text "Lemma a : True.\nProof.\n"
+    (let* ((context (coq-eglot-lsp--make-context :proof/goals 20))
+           (answer (coq-eglot-lsp--answer
+                    (list :textDocument (list :uri "file:///a.v" :version 7)
+                          :range (lsp-range 1 0 1 6)
+                          :goals '(:goals [] :stack [] :shelf [] :given_up [])
+                          :messages (vector '(:level 3 :text "printed")
+                                            '(:level 2 :text "careful")
+                                            "plain")
+                          :error "Oops.")
+                    context 80 '("Set Printing All"))))
+      (should (eq (coq-eglot-lsp-answer-context answer) context))
+      (should (= (coq-eglot-lsp-answer-version answer) 7))
+      (should (equal (coq-eglot-lsp-answer-sentence answer) '(17 . 23)))
+      (should (equal (buffer-substring 17 23) "Proof."))
+      (should (equal (mapcar #'coq-eglot-lsp-message-severity
+                             (coq-eglot-lsp-answer-messages answer))
+                     '(notice warning nil)))
+      (should (equal (coq-eglot--format-messages
+                      (coq-eglot-lsp-answer-messages answer))
+                     "printed\ncareful\nplain"))
+      (should (equal (coq-eglot-lsp-answer-error answer) "Oops."))
+      (should (= (coq-eglot-lsp-answer-printing-width answer) 80))
+      (should (equal (coq-eglot-lsp-answer-printing-flags answer)
+                     '("Set Printing All")))
+      (should-not (coq-eglot-lsp--answer nil context nil nil)))))
+
+(ert-deftest coq-eglot-lsp-failure-normalized ()
+  "Failures say whether the request was cancelled, and keep its context."
+  (let ((context (coq-eglot-lsp--make-context :proof/goals 1)))
+    (dolist (code '(-32800 -32001))
+      (should (coq-eglot-lsp-failure-cancelled
+               (coq-eglot-lsp--failure (list :code code :message "x")
+                                       context))))
+    (let ((failure (coq-eglot-lsp--failure (list :code -32603 :message "Bad")
+                                           context)))
+      (should-not (coq-eglot-lsp-failure-cancelled failure))
+      (should (equal (coq-eglot-lsp-failure-message failure) "Bad"))
+      (should (eq (coq-eglot-lsp-failure-context failure) context)))))
+
+(ert-deftest coq-eglot-lsp-diagnostic-normalized ()
+  "A diagnostic has the range of its message, and of its sentence if given."
+  (with-lsp-text "Lemma a : True.\nProof. exact foo.\n"
+    (let ((diag (coq-eglot-lsp--diagnostic
+                 (list :range (lsp-range 1 13 1 16) :severity 1
+                       :message "The reference foo was not found."
+                       :data (list :sentenceRange (lsp-range 1 7 1 17))))))
+      (should (equal (buffer-substring (coq-eglot-lsp-diagnostic-start diag)
+                                       (coq-eglot-lsp-diagnostic-end diag))
+                     "foo"))
+      (should (eq (coq-eglot-lsp-diagnostic-severity diag) 'error))
+      (let ((sentence (coq-eglot-lsp-diagnostic-sentence diag)))
+        (should (equal (buffer-substring (car sentence) (cdr sentence))
+                       "exact foo."))))
+    (should-not (coq-eglot-lsp-diagnostic-sentence
+                 (coq-eglot-lsp--diagnostic
+                  (list :range (lsp-range 0 0 0 5) :severity 2
+                        :message "Warning."))))))
+
+(ert-deftest coq-eglot-error-range-from-diagnostics ()
+  "The first error between two positions, among the kept diagnostics.
+Warnings do not count, nor diagnostics of another version."
+  (with-lsp-text "Lemma a : True.\nProof. exact foo. exact bar.\n"
+    (cl-letf (((symbol-function 'coq-eglot-lsp-version) (lambda () 3)))
+      (coq-eglot--receive-diagnostics
+       (coq-eglot-lsp--make-diagnostics
+        3 (list (coq-eglot-lsp--make-diagnostic 41 44 'error "bar" nil)
+                (coq-eglot-lsp--make-diagnostic 30 33 'error "foo" nil)
+                (coq-eglot-lsp--make-diagnostic 1 6 'warning "w" nil))))
+      (should (equal (coq-eglot--error-range 1 100) '(30 . 33)))
+      (should (equal (coq-eglot--error-range 31 100) '(41 . 44)))
+      (should-not (coq-eglot--error-range 1 30))
+      ;; an older version is ignored
+      (coq-eglot--receive-diagnostics (coq-eglot-lsp--make-diagnostics 2 nil))
+      (should (equal (coq-eglot--error-range 1 100) '(30 . 33)))
+      ;; a snapshot replaces the previous one, even empty
+      (coq-eglot--receive-diagnostics (coq-eglot-lsp--make-diagnostics 3 nil))
+      (should-not (coq-eglot--error-range 1 100)))))
 
 (provide 'coq-eglot-test-basic)
 

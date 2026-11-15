@@ -168,9 +168,8 @@ SENTENCE is an overlay of `coq-eglot--sentences'."
 SENTENCE is an overlay of `coq-eglot--sentences'.  The range of ANSWER,
 if it is the one of the sentence, gives the start of the overlay: it is
 empty, at the end of the sentence, while the start is unknown."
-  (let* ((end (overlay-end sentence))
-         (range (plist-get answer :range))
-         (bounds (and range (coq-eglot-lsp-range range))))
+  (let ((end (overlay-end sentence))
+        (bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
     (when (and bounds (= (cdr bounds) end) (< (car bounds) end))
       (move-overlay sentence (car bounds) end)))
   (overlay-put sentence 'coq-eglot-answer answer))
@@ -445,8 +444,7 @@ already."
             (cons end answer)
           ;; the sentence containing the last character before POS
           (let* ((answer (coq-eglot-lsp-goals (1- end)))
-                 (range (plist-get answer :range))
-                 (bounds (and range (coq-eglot-lsp-range range))))
+                 (bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
             (cond
              ((null bounds) nil)
              ((<= (cdr bounds) pos) (cons (cdr bounds) answer))
@@ -454,6 +452,30 @@ already."
              (t (coq-eglot--sentence-before (car bounds))))))))))
 
 ;;; Errors
+
+(defvar-local coq-eglot--diagnostics nil
+  "Last diagnostics published by the server for the current buffer.
+A list of `coq-eglot-lsp-diagnostic'.")
+
+(defun coq-eglot--receive-diagnostics (diagnostics)
+  "Keep DIAGNOSTICS, a `coq-eglot-lsp-diagnostics', if about this version.
+See `coq-eglot--error-range'."
+  (when (eql (coq-eglot-lsp-diagnostics-version diagnostics)
+             (coq-eglot-lsp-version))
+    (setq coq-eglot--diagnostics
+          (coq-eglot-lsp-diagnostics-diagnostics diagnostics))))
+
+(defun coq-eglot--error-range (start end)
+  "Buffer range (BEG . END) of the first error located between START and END.
+Look for it in the last published diagnostics, return nil if none."
+  (let (first)
+    (dolist (diag coq-eglot--diagnostics)
+      (let ((beg (coq-eglot-lsp-diagnostic-start diag)))
+        (when (and (eq (coq-eglot-lsp-diagnostic-severity diag) 'error)
+                   (<= start beg) (< beg end)
+                   (or (null first) (< beg (car first))))
+          (setq first (cons beg (coq-eglot-lsp-diagnostic-end diag))))))
+    first))
 
 (defvar-local coq-eglot--error-overlays nil
   "Overlays on the sentence that failed and on the error location.")
@@ -494,7 +516,7 @@ of the error, if known, with `proof-warning-face'.  Move point to the
 error.  Run `coq-eglot-error-hook'."
   (coq-eglot--clear-error)
   (coq-eglot--error-overlay start end 'proof-boring-face 0)
-  (let ((range (coq-eglot-lsp-error-range start end)))
+  (let ((range (coq-eglot--error-range start end)))
     (when range
       (coq-eglot--error-overlay (car range) (cdr range) 'proof-warning-face 1))
     (goto-char (if range (car range) start)))
@@ -1379,9 +1401,8 @@ Return the empty string if GOALS is nil (outside of proofs)."
     (concat (car parts) (cdr parts))))
 
 (defun coq-eglot--format-messages (messages)
-  "Format MESSAGES of a sentence, as returned by the server."
-  (mapconcat (lambda (m) (if (stringp m) m (plist-get m :text)))
-             messages "\n"))
+  "Format MESSAGES of a sentence, a list of `coq-eglot-lsp-message'."
+  (mapconcat #'coq-eglot-lsp-message-text messages "\n"))
 
 (defvar coq-eglot-output-hook nil
   "Hook run in a script buffer when it displayed its goals or messages.
@@ -1398,11 +1419,13 @@ output keeps the state of the buffer it displays."
 (defun coq-eglot--show-goals-1 (answer)
   "Display the goals of ANSWER of the server, see `coq-eglot--show-goals'."
   (let* ((output (coq-eglot--output))
-         (goals (plist-get answer :goals))
+         (goals (and answer (coq-eglot-lsp-answer-goals answer)))
          (new (not (equal goals (coq-eglot--output-goals output)))))
     (setf (coq-eglot--output-goals output) goals)
-    (setf (coq-eglot--output-width output) (plist-get answer :printing-width))
-    (setf (coq-eglot--output-flags output) (plist-get answer :printing-flags))
+    (setf (coq-eglot--output-width output)
+          (and answer (coq-eglot-lsp-answer-printing-width answer)))
+    (setf (coq-eglot--output-flags output)
+          (and answer (coq-eglot-lsp-answer-printing-flags answer)))
     (if (not coq-eglot-split-goals)
         (progn
           (coq-eglot--set-buffer-text (coq-eglot--goals-name)
@@ -1498,9 +1521,11 @@ See `coq-eglot-split-goals'."
             (delete-window window)))
         (kill-buffer buffer))))
   (let ((output (coq-eglot--output)))
-    (coq-eglot--show-goals (list :goals (coq-eglot--output-goals output)
-                                 :printing-width (coq-eglot--output-width output)
-                                 :printing-flags (coq-eglot--output-flags output))))
+    (coq-eglot--show-goals
+     (coq-eglot-lsp-make-answer
+      :goals (coq-eglot--output-goals output)
+      :printing-width (coq-eglot--output-width output)
+      :printing-flags (coq-eglot--output-flags output))))
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
 
 (defun coq-eglot--show-response (text)
@@ -1516,7 +1541,8 @@ active, see `coq-eglot--displays-p'."
   "Display the goals and the messages of ANSWER of the server."
   (coq-eglot--show-goals answer)
   (coq-eglot--show-response
-   (coq-eglot--format-messages (plist-get answer :messages))))
+   (coq-eglot--format-messages
+    (and answer (coq-eglot-lsp-answer-messages answer)))))
 
 (defun coq-eglot--show-error (text)
   "Display error TEXT in the response buffer."
@@ -1650,19 +1676,24 @@ sentence before, if known."
     (coq-eglot--show-error text)
     (coq-eglot--highlight-error start end)))
 
-(defun coq-eglot--failed-request (err)
-  "Handle the failure ERR of a request: stop the running check."
+(defun coq-eglot--failed-request (failure)
+  "Handle FAILURE of a request, a `coq-eglot-lsp-failure': stop the check."
   (coq-eglot--stop)
-  (message "Coq request failed: %s" (or (plist-get err :message) err)))
+  (message "Coq request failed: %s" (coq-eglot-lsp-failure-message failure)))
 
-(defun coq-eglot--progress (pos)
-  "The server checked the sentences up to POS: move the proof position.
-Do not go past the target, nor past an error."
-  (when (and coq-eglot--running
-             (> pos (coq-eglot-position))
-             (<= pos (coq-eglot--checking-target coq-eglot--running))
-             (not (coq-eglot-lsp-error-range (coq-eglot-position) pos)))
-    (coq-eglot--set-position pos nil)))
+(defun coq-eglot--progress (progress)
+  "The server checked the sentences up to the start of PROGRESS.
+PROGRESS is a `coq-eglot-lsp-progress', ignored if about an older
+version.  Move the proof position there, but not past the target, nor
+past an error."
+  (let ((pos (coq-eglot-lsp-progress-start progress)))
+    (when (and coq-eglot--running
+               (eql (coq-eglot-lsp-progress-version progress)
+                    (coq-eglot-lsp-version))
+               (> pos (coq-eglot-position))
+               (<= pos (coq-eglot--checking-target coq-eglot--running))
+               (not (coq-eglot--error-range (coq-eglot-position) pos)))
+      (coq-eglot--set-position pos nil))))
 
 (defun coq-eglot--next-sentence-start ()
   "Return the start of the first sentence after the proof position, or nil."
@@ -1723,14 +1754,13 @@ Compile first the libraries it requires, if any."
 
 (defun coq-eglot--next-done (answer)
   "Handle ANSWER of the server for the sentence after the proof position."
-  (let* ((range (plist-get answer :range))
-         (bounds (and range (coq-eglot-lsp-range range)))
+  (let* ((bounds (and answer (coq-eglot-lsp-answer-sentence answer)))
          (then (coq-eglot--stop)))
     (cond
      ((null bounds) nil)
-     ((plist-get answer :error)
-      (coq-eglot--fail (car bounds) (cdr bounds) (plist-get answer :error)
-                       nil))
+     ((coq-eglot-lsp-answer-error answer)
+      (coq-eglot--fail (car bounds) (cdr bounds)
+                       (coq-eglot-lsp-answer-error answer) nil))
      (t
       (coq-eglot--trace-check (car bounds) (cdr bounds) answer)
       (coq-eglot--set-position (cdr bounds) answer)
@@ -1775,27 +1805,28 @@ failed, reported if there was no error before."
   (let* ((then (coq-eglot--stop))
          ;; the last sentence checked, containing LAST
          (answer (coq-eglot-lsp-goals last))
-         (range (plist-get answer :range))
-         (bounds (and range (coq-eglot-lsp-range range)))
+         (bounds (and answer (coq-eglot-lsp-answer-sentence answer)))
          ;; an error may be located after LAST in this sentence
-         (error (coq-eglot-lsp-error-range
+         (error (coq-eglot--error-range
                  start (max (1+ last) (if bounds (cdr bounds) 0)))))
     (cond
      (error
       ;; the sentence that failed and its error message, not its goals
       (let* ((answer (coq-eglot-lsp-goals (car error) t))
-             (range (plist-get answer :range))
-             (bounds (if range (coq-eglot-lsp-range range) error)))
+             (bounds (or (and answer (coq-eglot-lsp-answer-sentence answer))
+                         error)))
         (when (< start (car bounds))
           (coq-eglot--trace-check start (car bounds) nil))
         (coq-eglot--fail (car bounds) (cdr bounds)
-                         (or (plist-get answer :error) "Error.") nil)))
+                         (or (and answer (coq-eglot-lsp-answer-error answer))
+                             "Error.")
+                         nil)))
      ;; an error the diagnostics did not report
-     ((and bounds (plist-get answer :error))
+     ((and bounds (coq-eglot-lsp-answer-error answer))
       (when (< start (car bounds))
         (coq-eglot--trace-check start (car bounds) nil))
-      (coq-eglot--fail (car bounds) (cdr bounds) (plist-get answer :error)
-                       nil))
+      (coq-eglot--fail (car bounds) (cdr bounds)
+                       (coq-eglot-lsp-answer-error answer) nil))
      (t
       (when bounds
         (coq-eglot--trace-check start (cdr bounds) answer)
@@ -1871,7 +1902,7 @@ Called from the script buffer."
 
 (defun coq-eglot--trace-goals (answer)
   "The number of goals of ANSWER of the server, as a comment."
-  (let ((goals (plist-get answer :goals)))
+  (let ((goals (and answer (coq-eglot-lsp-answer-goals answer))))
     (if (null goals) ""
       (let ((n (length (plist-get goals :goals)))
             (unfocused (coq-eglot--unfocused-count goals)))
@@ -1888,7 +1919,7 @@ ANSWER may be nil."
              (and answer
                   (concat (coq-eglot--trace-comment
                            (coq-eglot--format-messages
-                            (plist-get answer :messages)))
+                            (coq-eglot-lsp-answer-messages answer)))
                           (coq-eglot--trace-goals answer)))))))
 
 (defun coq-eglot--trace-error (start end text)
@@ -2010,7 +2041,7 @@ It may still be finishing a computation that cannot be interrupted.")
 Send a cheap request: its answer, coming after the interruption, tells
 that the server is ready again."
   (setq coq-eglot--interrupting t)
-  (coq-eglot-lsp-ping (lambda (_) (setq coq-eglot--interrupting nil))))
+  (coq-eglot-lsp-ping (lambda () (setq coq-eglot--interrupting nil))))
 
 (defun coq-eglot-interrupt ()
   "Interrupt the running check, without waiting.
@@ -2169,8 +2200,7 @@ no such sentence or a request fails."
       (coq-eglot-lsp-goals-async
        (1- end)
        (lambda (answer)
-         (let* ((range (plist-get answer :range))
-                (bounds (and range (coq-eglot-lsp-range range))))
+         (let ((bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
            (cond
             ((null bounds) nil)
             ((<= (cdr bounds) pos)
@@ -2298,11 +2328,10 @@ THEN is called with the messages."
         (coq-eglot--trim-lines (mapconcat #'identity messages "\n")))
        (unless messages (message "Coq: no output"))
        (when then (funcall then messages)))
-     (lambda (err)
+     (lambda (failure)
        ;; cancelled by an edition or a new check: nothing to tell
-       (unless (coq-eglot-lsp-cancelled-p err)
-         (coq-eglot--show-error
-          (or (plist-get err :message) (format "%S" err))))))))
+       (unless (coq-eglot-lsp-failure-cancelled failure)
+         (coq-eglot--show-error (coq-eglot-lsp-failure-message failure)))))))
 
 ;;; Double hit
 
@@ -2700,6 +2729,7 @@ Warn if processed Require sentences load outdated libraries."
                     (append coq-eglot-ignored-capabilities
                             eglot-ignored-server-capabilities))
         (setq coq-eglot-lsp-progress-function #'coq-eglot--progress)
+        (setq coq-eglot-lsp-diagnostics-function #'coq-eglot--receive-diagnostics)
         (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)
         (setq coq-query-function #'coq-eglot-run-query)
         (setq coq-query-result-function #'coq-eglot-query-result)
@@ -2717,6 +2747,7 @@ Warn if processed Require sentences load outdated libraries."
         (coq-eglot--update-overlays)
         (coq-eglot--layout-on-visit))
     (setq coq-eglot-lsp-progress-function nil)
+    (setq coq-eglot-lsp-diagnostics-function nil)
     (kill-local-variable 'coq-terminator-insert-function)
     (kill-local-variable 'coq-query-function)
     (kill-local-variable 'coq-query-result-function)
