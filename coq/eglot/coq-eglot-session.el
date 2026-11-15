@@ -225,6 +225,100 @@ Among the valid diagnostics, nil if none."
           (setq first (cons beg (coq-eglot-lsp-diagnostic-end diag))))))
     first))
 
+;;; Target and work
+
+;; The target T is where the user asked to go: the sentences up to the
+;; one containing the character before T are to be processed.  The
+;; proof position, the anchor A, moves toward it as the server checks,
+;; never past it.  The work is the operation running to move A toward
+;; T: one at a time, never replaced while it runs (cancelling it could
+;; interrupt Coq in the middle of a sentence).  See ASYNC-DESIGN.md.
+
+(defvar-local coq-eglot-session--target nil
+  "Marker at the target, or nil if the user asked nothing.")
+
+(defvar-local coq-eglot-session--work nil
+  "The operation running to move the proof position, or nil.
+An object identifying it: what arrives for another one is ignored.")
+
+(defvar-local coq-eglot-session-sentence-start-function nil
+  "Function returning the start of the first sentence after a position.
+Called with the position, it returns nil if there is none.")
+
+(defvar-local coq-eglot-session-sentence-end-function nil
+  "Function guessing the end of the sentence starting at a position.")
+
+(defun coq-eglot-session-target ()
+  "The target, or nil if the user asked nothing."
+  (and coq-eglot-session--target
+       (marker-position coq-eglot-session--target)))
+
+(defun coq-eglot-session-set-target (pos)
+  "Set the target at POS, or forget it if POS is nil."
+  (if (null pos)
+      (when coq-eglot-session--target
+        (set-marker coq-eglot-session--target nil)
+        (setq coq-eglot-session--target nil))
+    (if coq-eglot-session--target
+        (set-marker coq-eglot-session--target pos)
+      (setq coq-eglot-session--target (copy-marker pos)))))
+
+(defun coq-eglot-session-target-end ()
+  "The end of the part to process: the end of the sentence before the target.
+Guessed, for the display.  Nil if the user asked nothing."
+  (let ((target (coq-eglot-session-target)))
+    (and target
+         (let ((last (1- (save-excursion (goto-char target)
+                                         (forward-comment (- (point)))
+                                         (point)))))
+           (max target
+                (if (< last (point-min)) target
+                  (funcall coq-eglot-session-sentence-end-function last)))))))
+
+(defun coq-eglot-session-start-work ()
+  "Note that an operation starts to move the proof position, return it."
+  (setq coq-eglot-session--work (list 'work)))
+
+(defun coq-eglot-session-work-p (work)
+  "Non-nil if WORK, an operation, is still the running one."
+  (and work (eq work coq-eglot-session--work)))
+
+(defun coq-eglot-session-working-p ()
+  "Non-nil if an operation moving the proof position runs."
+  (and coq-eglot-session--work t))
+
+(defun coq-eglot-session-finish-work (work)
+  "Note that WORK, an operation, is finished, if still the running one."
+  (when (coq-eglot-session-work-p work)
+    (setq coq-eglot-session--work nil)))
+
+(defun coq-eglot-session-stop-work ()
+  "Forget the target and the running operation: nothing to do any more."
+  (coq-eglot-session-set-target nil)
+  (setq coq-eglot-session--work nil))
+
+(defun coq-eglot-session-next-action ()
+  "The next operation to move the proof position toward the target, or nil.
+Nil while an operation runs, or if there is nothing to do: then the
+target is forgotten.  Otherwise (step START): process the sentence
+starting at START, the only one before the target; or (check START
+TARGET): process the sentences from START to the one containing the
+character before TARGET."
+  (let* ((target (coq-eglot-session-target))
+         (start (and target
+                     (funcall coq-eglot-session-sentence-start-function
+                              (coq-eglot-session-position)))))
+    (cond
+     (coq-eglot-session--work nil)
+     ((null target) nil)
+     ((or (null start) (>= start target))
+      (coq-eglot-session-set-target nil)
+      nil)
+     ((>= (funcall coq-eglot-session-sentence-end-function start)
+          (coq-eglot-session-target-end))
+      (list 'step start))
+     (t (list 'check start target)))))
+
 ;;; Start and stop
 
 (defun coq-eglot-session-start (version-function)
@@ -239,6 +333,7 @@ VERSION-FUNCTION gives the version the server knows, see
   "Stop the session of the current buffer, forget everything."
   (remove-hook 'before-change-functions #'coq-eglot-session--before-change t)
   (coq-eglot-session-forget-sentences (1- (point-min)))
+  (coq-eglot-session-stop-work)
   (setq coq-eglot-session--diagnostics nil
         coq-eglot-session--diagnostics-version nil)
   (coq-eglot-session-reset))

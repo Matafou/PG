@@ -110,22 +110,6 @@ window of its own: both scroll independently.  See also
 (defvar-local coq-eglot--queue-overlay nil
   "Overlay displaying the part of the script being checked.")
 
-(cl-defstruct (coq-eglot--checking
-               (:constructor coq-eglot--make-checking (target)))
-  "A check running in a script buffer.
-TARGET is a marker at the end of the part being checked.  THEN is nil,
-or a marker where the user asked to go meanwhile, further than TARGET:
-the check of the rest starts when this one is finished, see
-`coq-eglot--queue'.  The object itself identifies the check: the
-answers of the server for another one are ignored, see
-`coq-eglot--send'.  Its markers are freed when it stops, see
-`coq-eglot--stop'."
-  target then)
-
-(defvar-local coq-eglot--running nil
-  "The check running in the current script buffer, or nil.
-A `coq-eglot--checking'.")
-
 (defun coq-eglot-position ()
   "Return the proof position of the current buffer.
 See `coq-eglot-session-position'."
@@ -337,7 +321,7 @@ Run `coq-eglot-position-hook'."
                  (coq-eglot--inactive-locked-face)))
   (move-overlay coq-eglot--locked-overlay (point-min) (coq-eglot-position))
   (coq-eglot-compile-show-outdated (coq-eglot-position))
-  (if (not coq-eglot--running)
+  (if (not (coq-eglot-checking-p))
       (when (overlayp coq-eglot--queue-overlay)
         (delete-overlay coq-eglot--queue-overlay))
     (unless (overlayp coq-eglot--queue-overlay)
@@ -345,7 +329,7 @@ Run `coq-eglot-position-hook'."
       (overlay-put coq-eglot--queue-overlay 'face 'proof-queue-face))
     (move-overlay coq-eglot--queue-overlay (coq-eglot-position)
                   (max (coq-eglot-position)
-                       (coq-eglot--checking-target coq-eglot--running))))
+                       (coq-eglot-check-target))))
   (run-hooks 'coq-eglot-position-hook))
 
 (defun coq-eglot--set-position (end answer)
@@ -1090,7 +1074,7 @@ at the current width.  For OUTPUT, the current one by default."
                (buffer-live-p script))
       (with-current-buffer script
         (let ((last (coq-eglot-session-last-sentence)))
-          (when (and last (not coq-eglot--running))
+          (when (and last (not (coq-eglot-checking-p)))
             (coq-eglot-lsp-goals-async
              (1- (overlay-end last))
              (lambda (answer)
@@ -1507,73 +1491,76 @@ server may still be finishing an interrupted sentence."
 
 (defun coq-eglot--check-busy ()
   "Signal an error if a check is running."
-  (when coq-eglot--running
+  (when (coq-eglot-checking-p)
     (user-error "Coq is busy, use \\[coq-eglot-interrupt] to interrupt")))
 
-(defun coq-eglot--start (target)
-  "Mark the part from the proof position to TARGET as being checked."
-  (setq coq-eglot--running (coq-eglot--make-checking (copy-marker target)))
+;; The user sets the target, the planner starts the operations moving
+;; the proof position toward it, one at a time, see
+;; `coq-eglot-session-next-action'.  When an operation ends, the
+;; planner starts the next one, if the target is not reached.
+
+(defun coq-eglot--go (target)
+  "Process the sentences up to the one containing the character before TARGET.
+Asynchronously, see `coq-eglot--plan'."
+  (coq-eglot-session-set-target target)
   (coq-eglot--clear-error)
+  (coq-eglot--plan))
+
+(defun coq-eglot--plan ()
+  "Start the next operation toward the target, if any and none runs."
+  (pcase (coq-eglot-session-next-action)
+    (`(step ,start) (coq-eglot--step start))
+    (`(check ,start ,target) (coq-eglot--advance start target)))
   (coq-eglot--update-overlays))
 
-(defun coq-eglot--send (request-fn pos on-success)
-  "Send the request of the running check with REQUEST-FN at POS.
-ON-SUCCESS is called with the answer.  The answer is ignored if the
-check was interrupted meanwhile: an answer or an error may still come
-for a cancelled request."
-  (let ((running coq-eglot--running))
-    (condition-case err
-        (funcall request-fn pos
-                 (lambda (answer)
-                   (when (eq coq-eglot--running running)
-                     (funcall on-success answer)))
-                 (lambda (err)
-                   (when (eq coq-eglot--running running)
-                     (coq-eglot--failed-request err))))
-      ;; not sent, like without server: the check is not running
-      (error (when (eq coq-eglot--running running)
-               (coq-eglot--stop))
-             (signal (car err) (cdr err))))))
+(defun coq-eglot--continue (before)
+  "An operation ended, it started at proof position BEFORE: start the next.
+Stop if the proof position did not move since: the planner would start
+the same operation again.  It may have moved before the end, with the
+progress of the server."
+  (if (> (coq-eglot-position) before)
+      (coq-eglot--plan)
+    (coq-eglot--stop)))
 
-(defun coq-eglot--stop ()
-  "Mark the running check as finished.
-Return the position the user asked to go to meanwhile, if any, see
-`coq-eglot--queue'."
-  (let ((then nil))
-    (when coq-eglot--running
-      (set-marker (coq-eglot--checking-target coq-eglot--running) nil)
-      (let ((marker (coq-eglot--checking-then coq-eglot--running)))
-        (when marker
-          (setq then (marker-position marker))
-          (set-marker marker nil)))
-      (setq coq-eglot--running nil))
-    (coq-eglot--update-overlays)
-    then))
-
-(defun coq-eglot--queue (target)
-  "Extend the running check up to the sentence before TARGET.
-Like the queue of Proof General: the part being checked grows at once,
-the check of the rest starts when the running one is finished, unless
-it fails.  The running request is not replaced: cancelling it could
-interrupt Coq.  Signal an error if TARGET is not after the part being
-checked: moving back while checking is not possible."
-  (let ((end (coq-eglot--checking-target coq-eglot--running)))
-    (when (<= target end)
-      (coq-eglot--check-busy))
-    (set-marker end (max target
-                         (coq-eglot--guess-end
-                          (1- (coq-eglot--skip-backward target)))))
-    (let ((then (coq-eglot--checking-then coq-eglot--running)))
-      (if then
-          (set-marker then target)
-        (setf (coq-eglot--checking-then coq-eglot--running)
-              (copy-marker target))))
+(defun coq-eglot--start-work ()
+  "Note that an operation starts to move the proof position, return it."
+  (prog1 (coq-eglot-session-start-work)
     (coq-eglot--update-overlays)))
 
-(defun coq-eglot--continue (then)
-  "Process up to THEN, the position asked during the last check, if any."
-  (when then
-    (coq-eglot--advance then)))
+(defun coq-eglot--send (work request-fn pos on-success)
+  "Send the request of WORK, the running operation, with REQUEST-FN at POS.
+ON-SUCCESS is called with the answer.  The answer is ignored if WORK
+was cancelled meanwhile: an answer or an error may still come for a
+cancelled request."
+  (condition-case err
+      (funcall request-fn pos
+               (lambda (answer)
+                 (when (coq-eglot-session-work-p work)
+                   (funcall on-success answer)))
+               (lambda (failure)
+                 (when (coq-eglot-session-work-p work)
+                   (coq-eglot--failed-request failure))))
+    ;; not sent, like without server: nothing runs
+    (error (when (coq-eglot-session-work-p work)
+             (coq-eglot--stop))
+           (signal (car err) (cdr err)))))
+
+(defun coq-eglot--stop ()
+  "Forget the target and the running operation: nothing is checked."
+  (coq-eglot-session-stop-work)
+  (coq-eglot--update-overlays))
+
+(defun coq-eglot--queue (target)
+  "Move the target further, to TARGET, during a check.
+Like the queue of Proof General: the part being checked grows at once,
+the check of the rest starts when the running operation is finished,
+unless it fails.  The running request is not replaced: cancelling it
+could interrupt Coq.  Signal an error if TARGET is not after the part
+being checked: moving back while checking is not possible."
+  (when (<= target (coq-eglot-check-target))
+    (coq-eglot--check-busy))
+  (coq-eglot-session-set-target target)
+  (coq-eglot--update-overlays))
 
 (defun coq-eglot--fail (start end text answer)
   "The sentence between START and END failed with error TEXT.
@@ -1600,15 +1587,16 @@ sentence before, if known."
 
 (defun coq-eglot--progress (progress)
   "The server checked the sentences up to the start of PROGRESS.
+While an operation moves the proof position.
 PROGRESS is a `coq-eglot-lsp-progress', ignored if no longer valid,
 see `coq-eglot-session-valid-p'.  Move the proof position there, but
 not past the target, nor past an error."
   (let ((pos (coq-eglot-lsp-progress-start progress)))
-    (when (and coq-eglot--running
+    (when (and (coq-eglot-session-working-p)
                (coq-eglot-session-valid-p
                 (coq-eglot-lsp-progress-version progress) pos)
                (> pos (coq-eglot-position))
-               (<= pos (coq-eglot--checking-target coq-eglot--running))
+               (<= pos (coq-eglot-check-target))
                (not (coq-eglot-session-error-range (coq-eglot-position) pos)))
       (coq-eglot--set-position pos nil))))
 
@@ -1625,25 +1613,24 @@ Only used to display the part being checked."
     (if (eq (coq-script-parse-cmdend-forward) 'cmd) (point)
       (line-end-position))))
 
-(defun coq-eglot--compile-then (start end continue)
+(defun coq-eglot--compile-then (work start end continue)
   "Compile the libraries required between START and END, then CONTINUE.
-CONTINUE is called with nil, or with the start of the first Require
-sentence whose compilation failed.  It is called right away if there
-is nothing to compile, never if the running check is cancelled
-meanwhile.  See `coq-eglot-compile-requires'.  If the compilation
-signals an error, like a missing program, the running check stops: it
-is not left running without anything to wait for."
-  (let ((running coq-eglot--running))
-    (unless (condition-case err
-                (coq-eglot-compile-requires
-                 start end
-                 (lambda (failed)
-                   (when (eq coq-eglot--running running)
-                     (funcall continue failed))))
-              (error (when (eq coq-eglot--running running)
-                       (coq-eglot--stop))
-                     (signal (car err) (cdr err))))
-      (funcall continue nil))))
+For WORK, the running operation.  CONTINUE is called with nil, or with
+the start of the first Require sentence whose compilation failed.  It
+is called right away if there is nothing to compile, never if WORK is
+cancelled meanwhile.  See `coq-eglot-compile-requires'.  If the
+compilation signals an error, like a missing program, the check stops:
+it is not left running without anything to wait for."
+  (unless (condition-case err
+              (coq-eglot-compile-requires
+               start end
+               (lambda (failed)
+                 (when (coq-eglot-session-work-p work)
+                   (funcall continue failed))))
+            (error (when (coq-eglot-session-work-p work)
+                     (coq-eglot--stop))
+                   (signal (car err) (cdr err))))
+    (funcall continue nil)))
 
 (defun coq-eglot--compilation-failed (start)
   "Report that the compilation for the Require sentence at START failed."
@@ -1652,75 +1639,80 @@ is not left running without anything to wait for."
            coq--compile-response-buffer))
   (coq-eglot--highlight-error start (coq-eglot--guess-end start)))
 
-(defun coq-eglot--next ()
-  "Process the sentence after the proof position, asynchronously.
-Compile first the libraries it requires, if any."
-  (let ((start (coq-eglot--next-sentence-start)))
-    (when start
-      (coq-eglot--start (coq-eglot--guess-end start))
-      (coq-eglot--compile-then
-       start (1+ start)
-       (lambda (failed)
-         (if (not failed)
-             ;; inside the sentence: at the start of the buffer, the
-             ;; server finds no sentence
-             (coq-eglot--send #'coq-eglot-lsp-goals-async (1+ start)
-                              #'coq-eglot--next-done)
-           (coq-eglot--stop)
-           (coq-eglot--compilation-failed failed)))))))
+(defun coq-eglot--step (start)
+  "Process the sentence starting at START, after the proof position.
+Compile first the libraries it requires, if any.  One request: the
+goals after the sentence, which the server checks first."
+  (let ((work (coq-eglot--start-work))
+        (before (coq-eglot-position)))
+    (coq-eglot--compile-then
+     work start (1+ start)
+     (lambda (failed)
+       (if (not failed)
+           ;; inside the sentence: at the start of the buffer, the
+           ;; server finds no sentence
+           (coq-eglot--send work #'coq-eglot-lsp-goals-async (1+ start)
+                            (lambda (answer)
+                              (coq-eglot--step-done work answer before)))
+         (coq-eglot--stop)
+         (coq-eglot--compilation-failed failed))))))
 
-(defun coq-eglot--next-done (answer)
-  "Handle ANSWER of the server for the sentence after the proof position."
-  (let* ((bounds (and answer (coq-eglot-lsp-answer-sentence answer)))
-         (then (coq-eglot--stop)))
+(defun coq-eglot--step-done (work answer before)
+  "Handle ANSWER of the server for WORK, the sentence after the position.
+WORK started at proof position BEFORE."
+  (coq-eglot-session-finish-work work)
+  (let ((bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
     (cond
-     ((null bounds) nil)
+     ((null bounds) (coq-eglot--stop))
      ((coq-eglot-lsp-answer-error answer)
+      (coq-eglot--stop)
       (coq-eglot--fail (car bounds) (cdr bounds)
                        (coq-eglot-lsp-answer-error answer) nil))
      (t
       (coq-eglot--trace-check (car bounds) (cdr bounds) answer)
       (coq-eglot--set-position (cdr bounds) answer)
       (coq-eglot--show-answer answer)
-      (coq-eglot--continue then)))))
+      (coq-eglot--continue before)))))
 
-(defun coq-eglot--advance (target)
-  "Process the sentences up to the one containing the character before TARGET.
+(defun coq-eglot--advance (start target)
+  "Process the sentences from START up to the one before TARGET.
+The one containing the character before TARGET.
 Asynchronously: the libraries required there are compiled, then the
 server is asked to check up to it, without goals.  If a compilation
 fails, the server checks up to the Require sentence."
   (let ((last (1- (coq-eglot--skip-backward target)))
-        (start (coq-eglot--next-sentence-start)))
-    ;; nothing to do if no sentence starts before TARGET
-    (when (and start (< start target))
-      (coq-eglot--start (max target (coq-eglot--guess-end last)))
-      (coq-eglot--compile-then
-       start target
-       (lambda (failed)
-         (coq-eglot--check start
-                           (if failed (1- (coq-eglot--skip-backward failed))
-                             last)
-                           failed))))))
+        (work (coq-eglot--start-work))
+        (before (coq-eglot-position)))
+    (coq-eglot--compile-then
+     work start target
+     (lambda (failed)
+       (coq-eglot--check work before start
+                         (if failed (1- (coq-eglot--skip-backward failed))
+                           last)
+                         failed)))))
 
-(defun coq-eglot--check (start last failed)
+(defun coq-eglot--check (work before start last failed)
   "Ask the server to check from START up to the sentence containing LAST.
+For WORK, the running operation, started at proof position BEFORE.
 FAILED is the start of a Require sentence after LAST whose compilation
 failed, or nil.  It is reported after the check."
   (if (< last start)
       (progn
         (coq-eglot--stop)
         (coq-eglot--compilation-failed failed))
-    (coq-eglot--send #'coq-eglot-lsp-check-async last
-                     (lambda (_answer)
-                       (coq-eglot--advance-done start last failed)))))
+    (coq-eglot--send work #'coq-eglot-lsp-check-async last
+                     (lambda (_checked)
+                       (coq-eglot--advance-done work before start last
+                                                failed)))))
 
-(defun coq-eglot--advance-done (start last &optional failed)
+(defun coq-eglot--advance-done (work before start last &optional failed)
   "The server checked from START up to the sentence containing LAST.
+For WORK, the operation finished, started at proof position BEFORE.
 Stop at the first error, or ask the goals after the last sentence.
 FAILED is the start of a Require sentence after LAST whose compilation
 failed, reported if there was no error before."
-  (let* ((then (coq-eglot--stop))
-         ;; the last sentence checked, containing LAST
+  (coq-eglot-session-finish-work work)
+  (let* (;; the last sentence checked, containing LAST
          (answer (coq-eglot-lsp-goals last))
          (bounds (and answer (coq-eglot-lsp-answer-sentence answer)))
          ;; an error may be located after LAST in this sentence
@@ -1728,6 +1720,7 @@ failed, reported if there was no error before."
                  start (max (1+ last) (if bounds (cdr bounds) 0)))))
     (cond
      (error
+      (coq-eglot--stop)
       ;; the sentence that failed and its error message, not its goals
       (let* ((answer (coq-eglot-lsp-goals (car error) t))
              (bounds (or (and answer (coq-eglot-lsp-answer-sentence answer))
@@ -1740,6 +1733,7 @@ failed, reported if there was no error before."
                          nil)))
      ;; an error the diagnostics did not report
      ((and bounds (coq-eglot-lsp-answer-error answer))
+      (coq-eglot--stop)
       (when (< start (car bounds))
         (coq-eglot--trace-check start (car bounds) nil))
       (coq-eglot--fail (car bounds) (cdr bounds)
@@ -1750,8 +1744,9 @@ failed, reported if there was no error before."
         (coq-eglot--set-position (cdr bounds) answer)
         (coq-eglot--show-answer answer))
       (if failed
-          (coq-eglot--compilation-failed failed)
-        (coq-eglot--continue then))))))
+          (progn (coq-eglot--stop)
+                 (coq-eglot--compilation-failed failed))
+        (coq-eglot--continue before))))))
 
 ;;; Trace
 
@@ -1896,11 +1891,12 @@ During a check, the sentence after the part being checked, see
 `coq-eglot--queue'."
   (interactive)
   (coq-eglot--with-script
-    (if (not coq-eglot--running)
-        (coq-eglot--next)
+    (if (not (coq-eglot-checking-p))
+        (let ((start (coq-eglot--next-sentence-start)))
+          (when start
+            (coq-eglot--go (coq-eglot--guess-end start))))
       ;; the sentence after the part being checked
-      (let ((start (coq-eglot--skip-forward
-                    (coq-eglot--checking-target coq-eglot--running))))
+      (let ((start (coq-eglot--skip-forward (coq-eglot-check-target))))
         (when (< start (point-max))
           (coq-eglot--queue (coq-eglot--guess-end start)))))))
 
@@ -1922,17 +1918,17 @@ forward, after the part being checked, see `coq-eglot--queue'."
   (interactive)
   (coq-eglot--with-script
     (cond
-     (coq-eglot--running (coq-eglot--queue (point)))
+     ((coq-eglot-checking-p) (coq-eglot--queue (point)))
      ((< (point) (coq-eglot-position)) (coq-eglot--retract (point)))
-     (t (coq-eglot--advance (point))))))
+     (t (coq-eglot--go (point))))))
 
 (defun coq-eglot-process-buffer ()
   "Process the whole buffer, also during a check, see `coq-eglot--queue'."
   (interactive)
   (coq-eglot--with-script
-    (if coq-eglot--running
+    (if (coq-eglot-checking-p)
         (coq-eglot--queue (point-max))
-      (coq-eglot--advance (point-max)))))
+      (coq-eglot--go (point-max)))))
 
 (defun coq-eglot-retract-buffer ()
   "Move the proof position to the beginning of the buffer."
@@ -1969,7 +1965,7 @@ computation that cannot be interrupted, restart it: see
   (interactive)
   (coq-eglot--with-script
     (cond
-     (coq-eglot--running
+     ((coq-eglot-checking-p)
       (coq-eglot--cancel)
       (coq-eglot--wait-interruption)
       (coq-eglot--goals-at-position-async)
@@ -2085,8 +2081,8 @@ or right after it for an edition by a program, see
 user works if the user edits it, see `coq-eglot--user-edit-p'."
   (when (coq-eglot--user-edit-p)
     (setq coq-eglot--command-buffer (current-buffer)))
-  (when (< beg (if coq-eglot--running
-                   (coq-eglot--checking-target coq-eglot--running)
+  (when (< beg (if (coq-eglot-checking-p)
+                   (coq-eglot-check-target)
                  (coq-eglot-position)))
     (coq-eglot--cancel)
     (setq coq-eglot--interrupted t))
@@ -2162,7 +2158,7 @@ position moves there if the buffer did not change meanwhile."
          (1- beg)
          (lambda (found)
            (when (and (= tick (buffer-chars-modified-tick))
-                      (not coq-eglot--running)
+                      (not (coq-eglot-checking-p))
                       (> (car found) (coq-eglot-position)))
              (coq-eglot--set-position (car found) (cdr found))
              (coq-eglot--show-answer (cdr found)))))))))
@@ -2286,13 +2282,14 @@ Run when Eglot starts or stops managing the buffer."
 ;; works.
 
 (defun coq-eglot-checking-p ()
-  "Non-nil if the server checks a part of the current script buffer."
-  (and coq-eglot--running t))
+  "Non-nil if the server checks a part of the current script buffer.
+The user asked to go further than the proof position, see
+`coq-eglot-session-target'."
+  (and (coq-eglot-session-target) t))
 
 (defun coq-eglot-check-target ()
   "End of the part of the current script buffer being checked, or nil."
-  (and coq-eglot--running
-       (marker-position (coq-eglot--checking-target coq-eglot--running))))
+  (coq-eglot-session-target-end))
 
 (defun coq-eglot-move-proof-position (target)
   "Move the proof position of the current script buffer to TARGET.
@@ -2301,12 +2298,12 @@ works, see `coq-eglot-working-buffer'.  During a check, only further
 than the part being checked: return nil if TARGET is before its end,
 non-nil otherwise."
   (cond
-   (coq-eglot--running
+   ((coq-eglot-checking-p)
     (let ((end (coq-eglot-check-target)))
       (cond ((> target end) (coq-eglot--queue target) t)
             ((= target end) t))))
    ((< target (coq-eglot-position)) (coq-eglot--retract target) t)
-   ((> target (coq-eglot-position)) (coq-eglot--advance target) t)
+   ((> target (coq-eglot-position)) (coq-eglot--go target) t)
    (t t)))
 
 (defun coq-eglot-next-sentence-position (pos)
@@ -2649,6 +2646,11 @@ Warn if processed Require sentences load outdated libraries."
         (setq coq-eglot-lsp-diagnostics-function
               #'coq-eglot-session-receive-diagnostics)
         (coq-eglot-session-start #'coq-eglot-lsp-version)
+        (setq coq-eglot-session-sentence-start-function
+              (lambda (pos)
+                (let ((start (coq-eglot--skip-forward pos)))
+                  (and (< start (point-max)) start))))
+        (setq coq-eglot-session-sentence-end-function #'coq-eglot--guess-end)
         ;; the server opens the document again, from version 0
         (add-hook 'eglot-managed-mode-hook #'coq-eglot-session-reset nil t)
         (setq coq-terminator-insert-function #'coq-eglot-terminator-insert)

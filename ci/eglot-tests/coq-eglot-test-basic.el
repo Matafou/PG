@@ -60,7 +60,7 @@
 
 (defun wait-for-coq ()
   "Wait until the running check is finished."
-  (while coq-eglot--running
+  (while (coq-eglot-checking-p)
     (accept-process-output nil 0.02)))
 
 (defun run (command)
@@ -1552,7 +1552,7 @@ running: the buffer is not busy afterwards."
     (cl-letf (((symbol-function 'coq-eglot-lsp-ensure-server) #'ignore))
       (goto-marker "split")
       (should-error (coq-eglot-goto-point) :type 'user-error)
-      (should-not coq-eglot--running))
+      (should-not (coq-eglot-checking-p)))
     (run #'coq-eglot-goto-point)
     (should (position-at-marker-p "split"))))
 
@@ -1930,7 +1930,7 @@ In two directories, so two servers.  The twin is bound to `twin'."
                             (mapcar (lambda (buffer)
                                       (with-current-buffer buffer
                                         (list (buffer-name)
-                                              :running coq-eglot--running
+                                              :running (coq-eglot-checking-p)
                                               :timer (and coq-eglot-twin--follow-timer t)
                                               :position (coq-eglot-position)
                                               :out-of-sync coq-eglot-twin--out-of-sync
@@ -1938,7 +1938,7 @@ In two directories, so two servers.  The twin is bound to `twin'."
                                     (list (current-buffer) coq-eglot--twin))))
     (while (cl-some (lambda (buffer)
                       (with-current-buffer buffer
-                        (or coq-eglot--running coq-eglot-twin--follow-timer
+                        (or (coq-eglot-checking-p) coq-eglot-twin--follow-timer
                             coq-eglot-twin--following
                             coq-eglot-twin--show-timer
                             (and coq-eglot-twin--twins
@@ -2273,10 +2273,10 @@ and the proof position follows the progress of the server."
   (with-file "eglot_slow.v"
     (force-new-check)
     (coq-eglot-process-buffer)
-    (should coq-eglot--running)
+    (should (coq-eglot-checking-p))
     (should (eq (overlay-get coq-eglot--queue-overlay 'face) 'proof-queue-face))
     (let ((positions nil))
-      (while coq-eglot--running
+      (while (coq-eglot-checking-p)
         (cl-pushnew (coq-eglot-position) positions)
         (accept-process-output nil 0.02))
       ;; several intermediate positions were displayed
@@ -2296,7 +2296,7 @@ edited sentence and the goals are displayed when the server is ready."
                           (>= (how-many "Qed\\." (point-min) (coq-eglot-position))
                               2))
                         10))
-    (should coq-eglot--running)
+    (should (coq-eglot-checking-p))
     (goto-char (coq-eglot-position))
     (search-backward "vm_compute")
     ;; a pending request on the part not checked yet, like the hover
@@ -2318,7 +2318,7 @@ edited sentence and the goals are displayed when the server is ready."
       ;; answers that the document is not ready, or drops the request
       ;; when it is cancelled first
       (should-not hover-answered))
-    (should-not coq-eglot--running)
+    (should-not (coq-eglot-checking-p))
     (accept-process-output nil 1)
     ;; just before the edited sentence
     (should (string-match-p "Proof\\.\\'"
@@ -2331,10 +2331,10 @@ General: the rest is checked after, unless the check fails."
   (with-test-file
     (goto-marker "definition")
     (coq-eglot-goto-point)
-    (should coq-eglot--running)
+    (should (coq-eglot-checking-p))
     (coq-eglot-assert-next-command)
     ;; the part being checked grows at once
-    (should (>= (coq-eglot--checking-target coq-eglot--running)
+    (should (>= (coq-eglot-check-target)
                 (save-excursion (goto-marker "statement") (point))))
     (wait-for-coq)
     (should (position-at-marker-p "statement"))
@@ -2369,7 +2369,7 @@ The next command works."
     (coq-eglot-process-buffer)
     (sleep-for 0.5)
     (coq-eglot-interrupt)
-    (should-not coq-eglot--running)
+    (should-not (coq-eglot-checking-p))
     (should (< (point-min) (coq-eglot-position)))
     (should-not (position-at-marker-p "last"))
     (run #'coq-eglot-process-buffer)
@@ -2389,7 +2389,7 @@ The next command works."
   (goto-marker "cbn")
   (coq-eglot-goto-point)
   (sleep-for 0.5)
-  (should coq-eglot--running))
+  (should (coq-eglot-checking-p)))
 
 (ert-deftest coq-eglot-second-interrupt-restarts ()
   "Interrupting does not wait for the server.  Interrupting again while
@@ -2437,11 +2437,11 @@ another buffer of the server: no answer will come, it is not busy."
       (force-new-check)
       (let ((slow (current-buffer)))
         (coq-eglot-process-buffer)
-        (should coq-eglot--running)
+        (should (coq-eglot-checking-p))
         (with-test-file
           (funcall command))
         (with-current-buffer slow
-          (should-not coq-eglot--running)
+          (should-not (coq-eglot-checking-p))
           (should-not coq-eglot--interrupting)
           (should-not (overlay-buffer coq-eglot--queue-overlay))
           ;; not busy: a new command runs
@@ -2456,11 +2456,11 @@ it is no longer the buffer where the user works."
   (with-file "eglot_slow.v"
     (force-new-check)
     (coq-eglot-process-buffer)
-    (should coq-eglot--running)
-    (let ((target (coq-eglot--checking-target coq-eglot--running)))
+    (should (coq-eglot-checking-p))
+    (let ((target coq-eglot-session--target))
       (coq-eglot-set-working-buffer (current-buffer))
       (run-hooks 'kill-buffer-hook)
-      (should-not coq-eglot--running)
+      (should-not (coq-eglot-checking-p))
       (should-not (marker-buffer target))
       (should-not (coq-eglot-working-buffer)))))
 
@@ -2525,7 +2525,7 @@ reports the error and stops before the sentence."
                (lambda (&rest _) (error "No coqdep"))))
       (goto-marker "split")
       (should-error (coq-eglot-goto-point))
-      (should-not coq-eglot--running))))
+      (should-not (coq-eglot-checking-p)))))
 
 (ert-deftest coq-eglot-fail-unknown-sentence-before ()
   "A failure whose sentence before is unknown keeps the known proof
@@ -2832,7 +2832,7 @@ The sentences before it are checked."
     (coq-eglot-goto-point)
     (should (coq-eglot-compile-running-p))
     (coq-eglot-interrupt)
-    (should-not coq-eglot--running)
+    (should-not (coq-eglot-checking-p))
     (should-not (coq-eglot-compile-running-p))
     (should-not (cl-some (lambda (p) (process-get p 'coq-compilation-job))
                          (process-list)))
@@ -3800,6 +3800,63 @@ The first error between two positions, warnings do not count."
                  (coq-eglot-lsp--make-diagnostics
                   1 (list (diagnostic 20 22)))))
     (should-not (coq-eglot-session-error-range 1 100))))
+
+(defmacro with-planner (text &rest body)
+  "Run BODY with a session on TEXT, sentences ending with a dot."
+  (declare (indent 1) (debug t))
+  `(with-session ,text
+     (setq coq-eglot-session-sentence-start-function
+           (lambda (pos)
+             (save-excursion
+               (goto-char pos)
+               (skip-chars-forward " \n")
+               (and (< (point) (point-max)) (point)))))
+     (setq coq-eglot-session-sentence-end-function
+           (lambda (pos)
+             (save-excursion
+               (goto-char pos)
+               (if (search-forward "." nil t) (point) (point-max)))))
+     ,@body))
+
+(ert-deftest coq-eglot-session-planner ()
+  "The planner starts one operation at a time toward the target: one
+sentence, or a check of several, and forgets the target once reached."
+  (with-planner "A. B. C."
+    ;; nothing asked
+    (should-not (coq-eglot-session-next-action))
+    ;; inside the first sentence: one step
+    (coq-eglot-session-set-target 2)
+    (should (equal (coq-eglot-session-target-end) 3))
+    (should (equal (coq-eglot-session-next-action) '(step 1)))
+    ;; further: a check
+    (coq-eglot-session-set-target 9)
+    (should (equal (coq-eglot-session-next-action) '(check 1 9)))
+    ;; nothing while an operation runs
+    (let ((work (coq-eglot-session-start-work)))
+      (should (coq-eglot-session-working-p))
+      (should-not (coq-eglot-session-next-action))
+      (coq-eglot-session-finish-work work))
+    ;; the first two sentences processed: one step left
+    (coq-eglot-session-add-sentence 6 nil)
+    (should (equal (coq-eglot-session-next-action) '(step 7)))
+    ;; reached: the target is forgotten
+    (coq-eglot-session-add-sentence 9 nil)
+    (should-not (coq-eglot-session-next-action))
+    (should-not (coq-eglot-session-target))))
+
+(ert-deftest coq-eglot-session-stale-work ()
+  "An operation stopped, or replaced by another, is no longer running:
+what arrives for it is ignored."
+  (with-planner "A. B."
+    (let ((work (coq-eglot-session-start-work)))
+      (coq-eglot-session-stop-work)
+      (should-not (coq-eglot-session-work-p work))
+      (let ((other (coq-eglot-session-start-work)))
+        (should-not (coq-eglot-session-work-p work))
+        (should (coq-eglot-session-work-p other))
+        ;; finishing a stale operation does not finish the running one
+        (coq-eglot-session-finish-work work)
+        (should (coq-eglot-session-working-p))))))
 
 (provide 'coq-eglot-test-basic)
 
