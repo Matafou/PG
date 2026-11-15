@@ -2220,6 +2220,46 @@ Typing right at the proof position does not move it."
     (should (string-match-p "\\`1 goal\n\n *=+\n *forall n : nat"
                             (buffer-text "*goals*")))))
 
+;; The base: the known sentences
+
+(defun sentence-overlays ()
+  "The overlays of the known sentences in the current buffer, in order."
+  (sort (seq-filter (lambda (overlay) (overlay-get overlay 'coq-eglot-sentence))
+                    (overlays-in (point-min) (point-max)))
+        (lambda (a b) (< (overlay-start a) (overlay-start b)))))
+
+(ert-deftest coq-eglot-sentences-overlays ()
+  "The sentences processed one by one are overlays on their text.
+An edition deletes those it touches, the others stay."
+  (with-test-file
+    (dotimes (_ 3) (run #'coq-eglot-assert-next-command))
+    (let ((overlays (sentence-overlays)))
+      (should (= (length overlays) 3))
+      (should (equal (reverse coq-eglot--sentences) overlays))
+      (should (equal (mapcar (lambda (overlay)
+                               (buffer-substring (overlay-start overlay)
+                                                 (overlay-end overlay)))
+                             (cdr overlays))
+                     '("Lemma l : forall n, double n = n + n /\\ True."
+                       "Proof.")))
+      (should (= (overlay-end (car (last overlays))) (coq-eglot-position))))
+    ;; an edition in the second sentence
+    (goto-char (overlay-start (cadr coq-eglot--sentences)))
+    (insert " ")
+    (end-of-command)
+    (should (= (length (sentence-overlays)) 1))
+    (should (equal (sentence-overlays) coq-eglot--sentences))))
+
+(ert-deftest coq-eglot-sentences-removed-by-others ()
+  "Overlays of the sentences deleted by another package are forgotten."
+  (with-test-file
+    (dotimes (_ 2) (run #'coq-eglot-assert-next-command))
+    (remove-overlays)
+    (should (= (coq-eglot-position) (point-min)))
+    (should-not coq-eglot--sentences)
+    (run #'coq-eglot-assert-next-command)
+    (should (= (length (sentence-overlays)) 1))))
+
 (defun force-new-check ()
   "Insert a fresh definition at the beginning of the buffer.
 The server keeps the results of the sentences it checked, even in a
@@ -2497,7 +2537,7 @@ position before it, instead of going back to the beginning."
                                  (search-backward "rewrite"))))
       ;; the answer kept for the position is forgotten, the server
       ;; answers without the range of the sentence
-      (setcdr (car coq-eglot--ends) nil)
+      (coq-eglot--set-sentence-answer (coq-eglot--last-sentence) nil)
       (cl-letf (((symbol-function 'coq-eglot-lsp-goals)
                  (lambda (&rest _) '(:goals nil))))
         (coq-eglot--fail start (point-max) "Error." nil))
