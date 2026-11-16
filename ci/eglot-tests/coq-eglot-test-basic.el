@@ -3790,7 +3790,7 @@ executed."
     (run #'coq-eglot-goto-point)
     (let ((diag (seq-find (lambda (diag)
                             (eq (coq-eglot-lsp-diagnostic-severity diag) 'error))
-                          coq-eglot-session--diagnostics)))
+                          (mapcar #'cdr coq-eglot-session--diagnostics))))
       (should diag)
       (let ((sentence (coq-eglot-lsp-diagnostic-sentence diag)))
         (should sentence)
@@ -4108,6 +4108,34 @@ sentence the server did not tell of between."
     (coq-eglot-sentences-observe (execution 10 12))
     ;; C. is not known, D. is: C. may end before D.
     (should-not (coq-eglot-sentences-previous-end 11))))
+
+(ert-deftest coq-eglot-session-diagnostics-whole-sentence ()
+  "An error depends on all its sentence: an edition after its message but
+in its sentence forgets it.  A warning, without sentence range, up to
+the end of its message."
+  (with-sentences "Lemma a : True. Proof. exact foo. Qed."
+    (let* ((exact (save-excursion (goto-char (point-min))
+                                  (search-forward "exact") (match-beginning 0)))
+           (foo (+ exact 6))
+           (end (+ exact 10)))
+      ;; an error with its sentence, a warning in a known sentence
+      (coq-eglot-sentences-observe (execution 1 16))
+      (should (coq-eglot-session-receive-diagnostics
+               (coq-eglot-lsp--make-diagnostics
+                1 (list (coq-eglot-lsp--make-diagnostic
+                         foo (+ foo 3) 'error "foo" (cons exact end))
+                        (coq-eglot-lsp--make-diagnostic 1 6 'warning "w" nil)))))
+      (should (coq-eglot-session-error-range 1 100))
+      ;; after the message, in the sentence
+      (edit-at (+ foo 3))
+      (should-not (coq-eglot-session-error-range 1 100))
+      (should (= (length coq-eglot-session--diagnostics) 1))
+      ;; a warning has no sentence range: kept up to the end of its
+      ;; message, nothing decides on it
+      (edit-at 10)
+      (should (= (length coq-eglot-session--diagnostics) 1))
+      (edit-at 5)
+      (should-not coq-eglot-session--diagnostics))))
 
 (provide 'coq-eglot-test-basic)
 

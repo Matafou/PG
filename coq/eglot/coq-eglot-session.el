@@ -286,9 +286,19 @@ Kept when its goals are not, see `coq-eglot-session-add-sentence'."
 ;;; Diagnostics
 
 (defvar-local coq-eglot-session--diagnostics nil
-  "The diagnostics of the server still valid, a list.
-Of `coq-eglot-lsp-diagnostic': those of the last snapshot accepted,
-before the first position edited since.")
+  "The diagnostics of the server still valid, a list of (END . DIAG).
+DIAG is a `coq-eglot-lsp-diagnostic' of the last snapshot accepted, END
+the end of its sentence, see `coq-eglot-session--sentence-end': a
+diagnostic depends on all its sentence, Coq executes it again whole.
+Kept while the text did not change before END since its version.")
+
+(defun coq-eglot-session--sentence-end (diag)
+  "The end of the sentence of DIAG, a `coq-eglot-lsp-diagnostic'.
+Its sentence range, which the server gives for the errors (see
+`coq-eglot-lsp--options'), otherwise the end of its message: the
+warnings, which nothing uses to decide."
+  (max (coq-eglot-lsp-diagnostic-end diag)
+       (or (cdr (coq-eglot-lsp-diagnostic-sentence diag)) 0)))
 
 (defun coq-eglot-session-receive-diagnostics (diagnostics)
   "Record DIAGNOSTICS, a `coq-eglot-lsp-diagnostics' snapshot.
@@ -303,9 +313,12 @@ previous one.  Return non-nil if recorded."
       (let ((valid-p (coq-eglot-session-validity version)))
         (setq coq-eglot-session--diagnostics-version version)
         (setq coq-eglot-session--diagnostics
-              (seq-filter (lambda (diag)
-                            (funcall valid-p (coq-eglot-lsp-diagnostic-end diag)))
-                          (coq-eglot-lsp-diagnostics-diagnostics diagnostics))))
+              (seq-filter (lambda (entry) (funcall valid-p (car entry)))
+                          (mapcar (lambda (diag)
+                                    (cons (coq-eglot-session--sentence-end diag)
+                                          diag))
+                                  (coq-eglot-lsp-diagnostics-diagnostics
+                                   diagnostics)))))
       t)))
 
 (defun coq-eglot-session-observe (event)
@@ -315,16 +328,17 @@ A function of `coq-eglot-lsp-event-functions'."
     (coq-eglot-session-receive-diagnostics event)))
 
 (defun coq-eglot-session--forget-diagnostics (pos)
-  "Forget the diagnostics ending at POS or after: an edition at POS."
+  "Forget the diagnostics whose sentence ends at POS or after.
+An edition at POS: a sentence ending at POS is edited too."
   (setq coq-eglot-session--diagnostics
-        (seq-remove (lambda (diag) (>= (coq-eglot-lsp-diagnostic-end diag) pos))
+        (seq-remove (lambda (entry) (>= (car entry) pos))
                     coq-eglot-session--diagnostics)))
 
 (defun coq-eglot-session-error (start end)
   "The first error located between START and END, a diagnostic, or nil.
 Among the valid diagnostics, see `coq-eglot-session-error-range'."
   (let (first)
-    (dolist (diag coq-eglot-session--diagnostics)
+    (dolist (diag (mapcar #'cdr coq-eglot-session--diagnostics))
       (let ((beg (coq-eglot-lsp-diagnostic-start diag)))
         (when (and (eq (coq-eglot-lsp-diagnostic-severity diag) 'error)
                    (<= start beg) (< beg end)
@@ -337,7 +351,7 @@ Among the valid diagnostics, see `coq-eglot-session-error-range'."
   "Buffer range (BEG . END) of the first error located between START and END.
 Among the valid diagnostics, nil if none."
   (let (first)
-    (dolist (diag coq-eglot-session--diagnostics)
+    (dolist (diag (mapcar #'cdr coq-eglot-session--diagnostics))
       (let ((beg (coq-eglot-lsp-diagnostic-start diag)))
         (when (and (eq (coq-eglot-lsp-diagnostic-severity diag) 'error)
                    (<= start beg) (< beg end)
