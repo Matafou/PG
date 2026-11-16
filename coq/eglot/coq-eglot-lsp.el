@@ -381,13 +381,20 @@ file, unless DIR has one, see `coq-eglot-lsp-check-load-path'."
   (let ((server (eglot-current-server)))
     (and (cl-typep server 'coq-eglot-lsp-server) server)))
 
+(defun coq-eglot-lsp--connect-timed-out-p (start)
+  "Non-nil if a connection started at time START waited too long.
+More than `eglot-connect-timeout' seconds; never if it is nil, as for
+Eglot."
+  (and (numberp eglot-connect-timeout)
+       (>= (- (float-time) start) eglot-connect-timeout)))
+
 (defun coq-eglot-lsp-ensure-server (&optional no-wait)
   "Return the Coq server of the current buffer, starting it if needed.
 Unlike `eglot-ensure', start it now, not after the current command.  If
 it is still connecting, started by another command or by Eglot, wait
-for it, at most `eglot-connect-timeout' seconds: do not start another
-one.  If NO-WAIT is non-nil, do not wait: return nil if it is not
-connected yet."
+for it, at most `eglot-connect-timeout' seconds, without limit if
+nil: do not start another one.  If NO-WAIT is non-nil, do not wait:
+return nil if it is not connected yet."
   (or (coq-eglot-lsp-current-server)
       (progn
         (unless (coq-eglot-lsp-connecting-servers)
@@ -399,9 +406,10 @@ connected yet."
             (apply #'eglot (eglot--guess-contact))))
         (unless no-wait
           ;; Eglot waits at most `eglot-sync-connect' seconds
-          (with-timeout ((or eglot-connect-timeout 30))
+          (let ((start (float-time)))
             (while (and (not (coq-eglot-lsp-current-server))
-                        (coq-eglot-lsp-connecting-servers))
+                        (coq-eglot-lsp-connecting-servers)
+                        (not (coq-eglot-lsp--connect-timed-out-p start)))
               (accept-process-output nil 0.05))))
         (coq-eglot-lsp-current-server))))
 
@@ -667,7 +675,7 @@ if it cannot be started, like without program: see
 Right now if it is connected.  Otherwise start the connection without
 waiting, see `coq-eglot-lsp-connect', and call FN in the buffer when
 connected; with nil if the connection fails, or takes more than
-`eglot-connect-timeout' seconds."
+`eglot-connect-timeout' seconds, if not nil."
   (let ((server (coq-eglot-lsp-connect)))
     (if server
         (funcall fn server)
@@ -686,7 +694,7 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
       (let ((server (coq-eglot-lsp-current-server)))
         (if (and (null server)
                  (coq-eglot-lsp-connecting-servers)
-                 (< (- (float-time) start) (or eglot-connect-timeout 30)))
+                 (not (coq-eglot-lsp--connect-timed-out-p start)))
             ;; still connecting
             (setq coq-eglot-lsp--waiting-timer
                   (run-at-time 0.05 nil #'coq-eglot-lsp--watch-connection

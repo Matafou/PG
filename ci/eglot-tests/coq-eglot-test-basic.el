@@ -3875,6 +3875,48 @@ the other requests waiting are sent all the same."
                                 (coq-eglot-lsp-failure-message (car failures))))
         (should-not (coq-eglot-lsp-connecting-p))))))
 
+(ert-deftest coq-eglot-connect-timeout-nil ()
+  "Without `eglot-connect-timeout', the requests wait for the server as
+long as it connects, as Eglot does; with it, they fail after it."
+  (with-temp-buffer
+    (let ((connected nil) (sent nil) (failures nil))
+      (cl-letf (((symbol-function 'coq-eglot-lsp-connect)
+                 (lambda () (and connected 'server)))
+                ((symbol-function 'coq-eglot-lsp-current-server)
+                 (lambda () (and connected 'server)))
+                ((symbol-function 'coq-eglot-lsp-connecting-servers)
+                 (lambda () (and (not connected) '(connecting))))
+                ((symbol-function 'eglot--signal-textDocument/didChange)
+                 #'ignore)
+                ((symbol-function 'jsonrpc--async-request-1)
+                 (lambda (_server method _params &rest _args)
+                   (push method sent)
+                   (list 1))))
+        (let ((request (lambda (method)
+                         (coq-eglot-lsp--async-request
+                          1 method #'ignore #'ignore
+                          (lambda (failure) (push failure failures)))))
+              ;; started long ago
+              (start (- (float-time) 1000)))
+          (funcall request :first)
+          (let ((eglot-connect-timeout nil))
+            (coq-eglot-lsp--watch-connection (current-buffer) start)
+            (accept-process-output nil 0.1)
+            (should (coq-eglot-lsp-connecting-p))
+            (should-not failures)
+            (setq connected t)
+            (coq-eglot-lsp--watch-connection (current-buffer) start)
+            (should (equal sent '(:first)))
+            (should-not (coq-eglot-lsp-connecting-p)))
+          ;; with a timeout
+          (setq connected nil)
+          (funcall request :second)
+          (let ((eglot-connect-timeout 30))
+            (coq-eglot-lsp--watch-connection (current-buffer) start)
+            (should (wait-until (lambda () failures) 2))
+            (should (equal sent '(:first)))))
+        (coq-eglot-lsp--forget-waiting)))))
+
 (ert-deftest coq-eglot-deferred-send-error-stops-check ()
   "If the request of a check cannot be sent once the server connects, the
 check stops: the buffer is not busy."
