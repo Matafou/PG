@@ -73,17 +73,24 @@ Learned from the server, or forgotten by an edition.")
 ;;; Learning
 
 (defun coq-eglot-sentences--insert (ranges start end)
-  "RANGES with (START . END), which replaces the ranges it overlaps."
-  (if (or (null ranges) (>= start (cdar ranges)))
-      ;; after all the others: the server executes in order
-      (cons (cons start end) ranges)
+  "RANGES with (START . END), which replaces the ranges it overlaps.
+RANGES itself if it is already there."
+  (cond
+   ((or (null ranges) (>= start (cdar ranges)))
+    ;; after all the others: the server executes in order
+    (cons (cons start end) ranges))
+   ((equal (car ranges) (cons start end))
+    ;; the last one again, like the goals after the last check
+    ranges)
+   ((member (cons start end) ranges) ranges)
+   (t
     (let ((kept (seq-remove (lambda (range)
                               (and (< (car range) end) (> (cdr range) start)))
                             ranges))
           (after nil))
       (while (and kept (> (cdar kept) end))
         (push (pop kept) after))
-      (nconc (nreverse after) (cons (cons start end) kept)))))
+      (nconc (nreverse after) (cons (cons start end) kept))))))
 
 (defun coq-eglot-sentences-learn (version start end)
   "Record the sentence from START to END of VERSION, if still valid.
@@ -91,10 +98,11 @@ See `coq-eglot-sentences-valid-function'.  Return non-nil if new."
   (when (and version (< start end)
              (funcall coq-eglot-sentences-valid-function version end))
     (let* ((index (coq-eglot-sentences--index))
-           (ranges (coq-eglot-sentences-ranges index)))
-      (unless (member (cons start end) ranges)
-        (setf (coq-eglot-sentences-ranges index)
-              (coq-eglot-sentences--insert ranges start end))
+           (ranges (coq-eglot-sentences-ranges index))
+           (new (coq-eglot-sentences--insert ranges start end)))
+      ;; in order, the usual case, the list is not walked
+      (unless (eq new ranges)
+        (setf (coq-eglot-sentences-ranges index) new)
         (coq-eglot-sentences--changed)
         t))))
 

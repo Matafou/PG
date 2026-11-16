@@ -103,6 +103,15 @@ a missing server should not go unnoticed."
         (ert-fail "No usable Coq language server")
       (ert-skip "No usable Coq language server"))))
 
+(defun skip-unless-execinfo ()
+  "Skip the test if the server does not tell the sentences it executes.
+Before coq-lsp 0.2.4, see `coq-eglot-lsp-execution'.  In a script
+buffer: the server depends on it."
+  (let* ((exe (ignore-errors (car (coq-eglot-lsp-server-command))))
+         (version (and exe (coq-eglot-lsp--server-version exe))))
+    (unless (and version (not (version< version "0.2.4")))
+      (ert-skip "The server does not tell the sentences it executes"))))
+
 (defmacro with-test-file (&rest body)
   "Run BODY in a buffer visiting eglot_test.v, kill it afterwards."
   (declare (indent 0) (debug t))
@@ -3772,6 +3781,7 @@ when they are updated again with nothing new."
 right sentence: the server told the bounds of all the sentences it
 executed."
   (with-test-file
+    (skip-unless-execinfo)
     (force-new-check)
     (goto-marker "split")
     (run #'coq-eglot-goto-point)
@@ -3825,6 +3835,125 @@ the target is forgotten, the buffer is not busy."
                                   messages))))))
       (coq-eglot-lsp-kill-connecting-servers)
       (coq-eglot-lsp-shutdown))))
+
+;; Errors and stops while connecting
+
+(ert-deftest coq-eglot-deferred-send-error ()
+  "A request failing to be sent once the server connects gets its error;
+the other requests waiting are sent all the same."
+  (with-temp-buffer
+    (let ((connected nil) (sent nil) (failures nil) (answers nil))
+      (cl-letf (((symbol-function 'coq-eglot-lsp-connect)
+                 (lambda () (and connected 'server)))
+                ((symbol-function 'coq-eglot-lsp-current-server)
+                 (lambda () (and connected 'server)))
+                ((symbol-function 'coq-eglot-lsp-connecting-servers)
+                 (lambda () (and (not connected) '(connecting))))
+                ((symbol-function 'eglot--signal-textDocument/didChange)
+                 #'ignore)
+                ((symbol-function 'jsonrpc--async-request-1)
+                 (lambda (_server method _params &rest args)
+                   (push method sent)
+                   (funcall (plist-get args :success-fn) 'answer)
+                   (list (length sent)))))
+        (coq-eglot-lsp--async-request
+         1 :first (lambda () (error "No parameters"))
+         (lambda (answer _context) (push answer answers))
+         (lambda (failure) (push failure failures)))
+        (coq-eglot-lsp--async-request
+         1 :second (lambda () nil)
+         (lambda (answer _context) (push answer answers))
+         (lambda (failure) (push failure failures)))
+        (should (coq-eglot-lsp-connecting-p))
+        (should-not sent)
+        (setq connected t)
+        (should (wait-until (lambda () (and failures answers)) 2))
+        (should (equal sent '(:second)))
+        (should (equal answers '(answer)))
+        (should (= (length failures) 1))
+        (should (string-match-p "No parameters"
+                                (coq-eglot-lsp-failure-message (car failures))))
+        (should-not (coq-eglot-lsp-connecting-p))))))
+
+(ert-deftest coq-eglot-deferred-send-error-stops-check ()
+  "If the request of a check cannot be sent once the server connects, the
+check stops: the buffer is not busy."
+  (with-test-file
+    (coq-eglot-restart-server)
+    (goto-marker "split")
+    (coq-eglot-goto-point)
+    (should (coq-eglot-lsp-connecting-p))
+    (cl-letf (((symbol-function 'eglot--signal-textDocument/didChange)
+               (lambda () (error "Cannot send"))))
+      (should (wait-until (lambda () (not (coq-eglot-busy-p))) 30)))
+    (should-not (coq-eglot-checking-p))))
+
+(defmacro with-connecting-server (&rest body)
+  "Run BODY in eglot_compile_c.v, with a server that never connects."
+  (declare (indent 0) (debug t))
+  `(with-file (expand-file-name "eglot_compile_c.v" compile-directory)
+     (unwind-protect
+         (progn
+           (coq-eglot-lsp-shutdown)
+           (with-fake-server "[ \"$1\" = --version ] && echo 0.2.5 || sleep 30"
+             (goto-char (point-max))
+             (coq-eglot-goto-point)
+             (should (coq-eglot-lsp-connecting-servers))
+             ,@body))
+       (coq-eglot-lsp-kill-connecting-servers)
+       (coq-eglot-lsp-shutdown))))
+
+(ert-deftest coq-eglot-exit-while-connecting ()
+  "Exiting while the server connects stops it: it never becomes the
+server of the buffer."
+  (with-connecting-server
+    (coq-eglot-exit)
+    (should-not (coq-eglot-lsp-connecting-servers))
+    (should-not (coq-eglot-busy-p))
+    (accept-process-output nil 0.3)
+    (should-not (coq-eglot-lsp-current-server))
+    (should-not (coq-eglot-lsp-connecting-servers))))
+
+(ert-deftest coq-eglot-restart-while-connecting ()
+  "Restarting while the server connects starts another one."
+  (with-connecting-server
+    (let ((old (coq-eglot-lsp-connecting-servers)))
+      (coq-eglot-restart-server)
+      (let ((new (coq-eglot-lsp-connecting-servers)))
+        (should new)
+        (should-not (seq-intersection old new))
+        (should-not (seq-some #'jsonrpc-running-p old))))))
+
+(ert-deftest coq-eglot-exit-while-connecting-two-buffers ()
+  "Exiting while the server connects stops it for all the buffers of the
+project: those waiting for it are not busy anymore, and say nothing."
+  (with-connecting-server
+    (let ((other (find-file-noselect
+                  (expand-file-name "eglot_compile_b.v" compile-directory)))
+          (messages nil))
+      (unwind-protect
+          (progn
+            (with-current-buffer other
+              (goto-char (point-max))
+              (coq-eglot-goto-point)
+              (should (coq-eglot-busy-p)))
+            (cl-letf* ((message-fn (symbol-function 'message))
+                       ((symbol-function 'message)
+                        (lambda (format &rest args)
+                          (when format
+                            (push (apply #'format-message format args)
+                                  messages))
+                          (apply message-fn format args))))
+              (coq-eglot-exit)
+              (accept-process-output nil 0.3))
+            (with-current-buffer other
+              (should-not (coq-eglot-busy-p))
+              (should-not (coq-eglot-checking-p)))
+            (should-not (seq-find (lambda (text)
+                                    (string-match-p "did not start" text))
+                                  messages)))
+        (with-current-buffer other (set-buffer-modified-p nil))
+        (kill-buffer other)))))
 
 ;; The session, with the server
 
@@ -4181,6 +4310,24 @@ the end of its message."
       (should (= (length coq-eglot-session--diagnostics) 1))
       (edit-at 5)
       (should-not coq-eglot-session--diagnostics))))
+
+(ert-deftest coq-eglot-session-diagnostics-late ()
+  "An error of an older version, arriving after an edition after its
+message but in its sentence, is not kept."
+  (with-sentences "Lemma a : True. Proof. exact foo. Qed."
+    (let* ((exact (save-excursion (goto-char (point-min))
+                                  (search-forward "exact") (match-beginning 0)))
+           (foo (+ exact 6))
+           (end (+ exact 10))
+           (version test-version))
+      (edit-at (+ foo 3))
+      (coq-eglot-session-receive-diagnostics
+       (coq-eglot-lsp--make-diagnostics
+        version (list (coq-eglot-lsp--make-diagnostic
+                       foo (+ foo 3) 'error "foo" (cons exact end)))))
+      (should-not (coq-eglot-session-error-range 1 100))
+      (should-not coq-eglot-session--diagnostics)
+      (should-not (coq-eglot-sentences-range-ending-at end)))))
 
 (provide 'coq-eglot-test-basic)
 

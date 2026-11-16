@@ -155,7 +155,10 @@ Run it once with --version, and keep the answer by file name."
 (defconst coq-eglot-lsp-minimal-version "0.2.3"
   "Oldest version of coq-lsp supported.
 It added the range of the sentence to the answer of proof/goals, and
-the request petanque/get_state_at_pos.")
+the request petanque/get_state_at_pos.  Before 0.2.4, the server does
+not tell the range of each sentence it executes, see
+`coq-eglot-lsp-execution': going back to a sentence the server checked
+in a row with others may take two steps, the first one too far back.")
 
 (defun coq-eglot-lsp--check-server-version (program)
   "Signal a user error if the server PROGRAM is too old.
@@ -418,23 +421,69 @@ then, `eglot-current-server' does not find it."
                                      (process-get process 'jsonrpc-connection))
                                    (process-list)))))))
 
+(defun coq-eglot-lsp--abandon-requests (server)
+  "Forget the requests sent to SERVER and not answered, with their timeouts.
+When it dies, their error functions are not called."
+  ;; internal: an alist of (ID METHOD SUCCESS ERROR TIMER) since jsonrpc
+  ;; 1.0.24 (Emacs 30), a hash table of (SUCCESS ERROR TIMER) before
+  (let ((cancel (lambda (continuation)
+                  (let ((timer (car (last continuation))))
+                    (when (timerp timer) (cancel-timer timer))))))
+    (cond
+     ((fboundp 'jsonrpc--continuations)
+      (mapc cancel (jsonrpc--continuations server)))
+     ((fboundp 'jsonrpc--request-continuations)
+      (maphash (lambda (_id continuation) (funcall cancel continuation))
+               (jsonrpc--request-continuations server)))))
+  (jsonrpc-forget-pending-continuations server))
+
 (defun coq-eglot-lsp-kill-connecting-servers ()
   "Kill the servers of the current buffer still connecting.
-See `coq-eglot-lsp-connecting-servers'.  The Eglot of Emacs 29 reports
-their aborted initialization as an error: ignored."
+See `coq-eglot-lsp-connecting-servers'.  Their initialization is
+abandoned first: Eglot would report it failed, as an error from the
+sentinel of the process."
   (dolist (server (coq-eglot-lsp-connecting-servers))
-    (ignore-errors (jsonrpc-shutdown server))))
+    (ignore-errors
+      (coq-eglot-lsp--abandon-requests server)
+      (jsonrpc-shutdown server))))
+
+(defvar-local coq-eglot-lsp--waiting nil
+  "Functions waiting for the server of the buffer to be connected.
+Each one is called with the server once connected, or with nil if the
+connection failed, see `coq-eglot-lsp--when-connected'.  The last one
+first.")
+
+(defvar-local coq-eglot-lsp--waiting-timer nil
+  "Timer watching the connection of the server, see `coq-eglot-lsp--waiting'.")
+
+(defun coq-eglot-lsp--buffers-waiting ()
+  "The buffers of the project of the current buffer waiting for its server.
+See `coq-eglot-lsp--waiting'."
+  (let ((project (eglot--current-project)))
+    (seq-filter (lambda (buffer)
+                  (with-current-buffer buffer
+                    (and coq-eglot-lsp--waiting
+                         (equal (eglot--current-project) project))))
+                (buffer-list))))
 
 (defun coq-eglot-lsp-shutdown ()
   "Stop the server of the current buffer, even if it is busy.
-Return the buffers it managed."
-  (let ((server (coq-eglot-lsp-current-server)))
+Also if it is still connecting: like a connected one, it is the server
+of all the buffers of the project, and the requests waiting for it in
+any of them are forgotten, see `coq-eglot-lsp--waiting'.  Return the
+buffers it managed, and those that waited for it."
+  (let ((server (coq-eglot-lsp-current-server))
+        (waiting (coq-eglot-lsp--buffers-waiting))
+        (buffers nil))
+    (dolist (buffer waiting)
+      (with-current-buffer buffer (coq-eglot-lsp--forget-waiting)))
+    (coq-eglot-lsp-kill-connecting-servers)
     (when server
-      (let ((buffers (eglot--managed-buffers server)))
-        ;; a busy server does not answer the shutdown request: it is
-        ;; killed after the timeout, which signals an error
-        (ignore-errors (eglot-shutdown server nil 0.3 t))
-        buffers))))
+      (setq buffers (eglot--managed-buffers server))
+      ;; a busy server does not answer the shutdown request: it is
+      ;; killed after the timeout, which signals an error
+      (ignore-errors (eglot-shutdown server nil 0.3 t)))
+    (seq-uniq (append buffers waiting))))
 
 ;;; Events
 
@@ -593,15 +642,6 @@ stops waiting."
     (jsonrpc-request (coq-eglot-lsp--server-for-request) method params
                      :timeout nil)))
 
-(defvar-local coq-eglot-lsp--waiting nil
-  "Functions waiting for the server of the buffer to be connected.
-Each one is called with the server once connected, or with nil if the
-connection failed, see `coq-eglot-lsp--when-connected'.  The last one
-first.")
-
-(defvar-local coq-eglot-lsp--waiting-timer nil
-  "Timer watching the connection of the server, see `coq-eglot-lsp--waiting'.")
-
 (defun coq-eglot-lsp-connect ()
   "Start the Coq server of the current buffer if needed, without waiting.
 Return it if connected, nil if it is still connecting.  Signal an error
@@ -610,6 +650,13 @@ if it cannot be started, like without program: see
   (or (coq-eglot-lsp-ensure-server t)
       (and (null (coq-eglot-lsp-connecting-servers))
            (user-error "No Coq language server for this buffer"))))
+
+(defun coq-eglot-lsp--forget-waiting ()
+  "Forget the requests of the buffer waiting for its server to connect."
+  (setq coq-eglot-lsp--waiting nil)
+  (when coq-eglot-lsp--waiting-timer
+    (cancel-timer coq-eglot-lsp--waiting-timer)
+    (setq coq-eglot-lsp--waiting-timer nil)))
 
 (defun coq-eglot-lsp-connecting-p ()
   "Non-nil if requests of the buffer wait for its server to connect."
@@ -646,9 +693,12 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
                                buffer start))
           (let ((waiting (reverse coq-eglot-lsp--waiting)))
             (setq coq-eglot-lsp--waiting nil)
+            ;; one failing must not starve the others: they
+            ;; report their own errors, see `coq-eglot-lsp--async-request'
             (dolist (fn waiting)
               (with-current-buffer buffer
-                (funcall fn server)))))))))
+                (with-demoted-errors "Coq: %S"
+                  (funcall fn server))))))))))
 
 (defun coq-eglot-lsp--async-request (pos method params on-success on-error)
   "Send request METHOD at POS with PARAMS to the server of the buffer.
@@ -679,21 +729,31 @@ to a synchronous request, maybe to another server: when it comes,
              (funcall (later on-error)
                       (coq-eglot-lsp--make-failure
                        context nil "The Coq language server did not start" nil))
-           (eglot--signal-textDocument/didChange)
-           (setf (coq-eglot-lsp-context-version context)
-                 eglot--versioned-identifier)
-           (setf (coq-eglot-lsp-context-id context)
-                 ;; Internal, but `jsonrpc-async-request' does not return
-                 ;; the id
-                 (car (jsonrpc--async-request-1
-                       server method (funcall params)
-                       :success-fn (later (lambda (answer)
-                                            (funcall on-success answer context)))
-                       :error-fn (later (lambda (err)
-                                          (funcall on-error
-                                                   (coq-eglot-lsp--failure
-                                                    err context))))
-                       :timeout nil))))))
+           ;; maybe called later, from a timer, see
+           ;; `coq-eglot-lsp--when-connected': an error reaches no
+           ;; caller, it must be an answer
+           (condition-case err
+               (progn
+                 (eglot--signal-textDocument/didChange)
+                 (setf (coq-eglot-lsp-context-version context)
+                       eglot--versioned-identifier)
+                 (setf (coq-eglot-lsp-context-id context)
+                       ;; Internal, but `jsonrpc-async-request' does not
+                       ;; return the id
+                       (car (jsonrpc--async-request-1
+                             server method (funcall params)
+                             :success-fn (later (lambda (answer)
+                                                  (funcall on-success
+                                                           answer context)))
+                             :error-fn (later (lambda (err)
+                                                (funcall on-error
+                                                         (coq-eglot-lsp--failure
+                                                          err context))))
+                             :timeout nil))))
+             (error
+              (funcall (later on-error)
+                       (coq-eglot-lsp--make-failure
+                        context nil (error-message-string err) nil)))))))
       context)))
 
 (defun coq-eglot-lsp--pending-ids (server)
@@ -711,7 +771,7 @@ to a synchronous request, maybe to another server: when it comes,
 Including those sent by Eglot on its own, like hover.  Their answers,
 errors for cancelled requests, still come later.  Those waiting for the
 server to connect are not sent, and get no answer."
-  (setq coq-eglot-lsp--waiting nil)
+  (coq-eglot-lsp--forget-waiting)
   (let ((server (coq-eglot-lsp-current-server)))
     (when server
       (dolist (id (coq-eglot-lsp--pending-ids server))
