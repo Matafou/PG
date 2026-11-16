@@ -761,6 +761,14 @@ See `coq-eglot-lsp--with-hyp-sorts'."
      (list :goals (coq-eglot-lsp-answer-goals answer)) messages))
   answer)
 
+(defun coq-eglot-lsp-goals-options ()
+  "What the next goals request depends on, besides the position.
+A list: the printing width, the printing flags, and whether the sorts
+of the hypotheses are asked.  For the key of a request."
+  (list (coq-eglot-lsp--printing-width)
+        (coq-eglot-lsp--printing-flags)
+        (and (coq-eglot-lsp--hyp-sorts-p) t)))
+
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
 ON-SUCCESS is called with a `coq-eglot-lsp-answer', or nil if the

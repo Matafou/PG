@@ -3984,6 +3984,41 @@ what arrives for it is ignored."
         (coq-eglot-session-finish-work work)
         (should (coq-eglot-session-working-p))))))
 
+(ert-deftest coq-eglot-goals-asked-again-after-edition ()
+  "Goals asked again after an edition are asked to the server again: the
+answer of the request sent before would not be valid."
+  (with-session "Lemma a : True. Proof. idtac. Qed."
+    (let ((sent 0))
+      (cl-letf (((symbol-function 'coq-eglot-lsp-goals-options) #'ignore)
+                ((symbol-function 'coq-eglot-lsp-goals-async)
+                 (lambda (&rest _) (cl-incf sent))))
+        (coq-eglot--ask-goals 10 #'ignore)
+        ;; the same question: the same request
+        (coq-eglot--ask-goals 10 #'ignore)
+        (should (= sent 1))
+        ;; after an edition, even after the position: a new request
+        (edit-at 12)
+        (coq-eglot--ask-goals 10 #'ignore)
+        (should (= sent 2))))))
+
+(ert-deftest coq-eglot-query-latest-wins ()
+  "Only the answer of the last query sent is displayed, even if an older
+one comes after it.  The queries make the buffer busy."
+  (with-test-file
+    (run #'coq-eglot-assert-next-command)
+    (let ((answers nil))
+      (cl-letf (((symbol-function 'coq-eglot-lsp-query-async)
+                 (lambda (_pos _command on-success _on-error)
+                   (push on-success answers))))
+        (coq-eglot-run-query "Check 1")
+        (coq-eglot-run-query "Check 2")
+        (should (coq-eglot-busy-p))
+        ;; the second answers first, then the first
+        (funcall (car answers) '("second"))
+        (funcall (cadr answers) '("first"))
+        (should (equal (buffer-text "*response*") "second"))
+        (should-not (coq-eglot-busy-p))))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here

@@ -395,7 +395,10 @@ CALLBACK is called with the answer when it comes, if still valid, see
 `coq-eglot--answer-valid-p'; not if the request fails.  Asking again
 what is asked waits for the same answer, see `coq-eglot-session-ask'."
   (coq-eglot-session-ask
-   (cons 'goals pos)
+   ;; what the answer depends on: no answer for an older text, or for
+   ;; other printing options, see `coq-eglot-session-ask'
+   (append (list 'goals pos (coq-eglot-session-clock))
+           (coq-eglot-lsp-goals-options))
    (lambda (answer)
      (when (and answer (coq-eglot--answer-valid-p answer))
        (funcall callback answer)))
@@ -2262,9 +2265,15 @@ setting printing flags, see `coq-eglot-run-query'."
            flags)))
   (coq-eglot-run-query command flags))
 
+(defvar-local coq-eglot--last-query 0
+  "Number of the last query sent: only its answer is displayed.")
+
 (defun coq-eglot--query (command flags then)
   "Run Coq COMMAND after FLAGS, then THEN, see `coq-eglot-run-query'.
-THEN is called with the messages."
+THEN is called with the messages, once displayed.  Only the answer of
+the last query sent is displayed: an older one coming after it is
+ignored.  The query is a request of the session, see
+`coq-eglot-busy-p'."
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
@@ -2278,20 +2287,30 @@ THEN is called with the messages."
                                               coq-eglot--printing-flags flags)
                                       "")
                            command)))
-    ;; in the last processed sentence: the state after it
-    (coq-eglot-lsp-query-async
-     (1- (coq-eglot-position)) sentences
-     (lambda (messages)
-       (with-current-buffer script
-         (coq-eglot--trace-query command flags messages))
-       (coq-eglot--show-response
-        (coq-eglot--trim-lines (mapconcat #'identity messages "\n")))
-       (unless messages (message "Coq: no output"))
-       (when then (funcall then messages)))
-     (lambda (failure)
-       ;; cancelled by an edition or a new check: nothing to tell
-       (unless (coq-eglot-lsp-failure-cancelled failure)
-         (coq-eglot--show-error (coq-eglot-lsp-failure-message failure)))))))
+    (let ((number (cl-incf coq-eglot--last-query)))
+      (coq-eglot-session-ask
+       (list 'query number)
+       (lambda (result)
+         (when (= number coq-eglot--last-query)
+           (pcase result
+             (`(messages . ,messages)
+              (with-current-buffer script
+                (coq-eglot--trace-query command flags messages))
+              (coq-eglot--show-response
+               (coq-eglot--trim-lines (mapconcat #'identity messages "\n")))
+              (unless messages (message "Coq: no output"))
+              (when then (funcall then messages)))
+             (`(failure . ,failure)
+              ;; cancelled by an edition or a new check: nothing to tell
+              (unless (coq-eglot-lsp-failure-cancelled failure)
+                (coq-eglot--show-error
+                 (coq-eglot-lsp-failure-message failure)))))))
+       (lambda (done)
+         ;; in the last processed sentence: the state after it
+         (coq-eglot-lsp-query-async
+          (1- (coq-eglot-position)) sentences
+          (lambda (messages) (funcall done (cons 'messages messages)))
+          (lambda (failure) (funcall done (cons 'failure failure)))))))))
 
 ;;; Double hit
 

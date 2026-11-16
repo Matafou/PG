@@ -101,7 +101,6 @@ Each element is (VERSION . DATE).")
 (defvar-local coq-eglot-session--diagnostics-version nil
   "The version of the last snapshot of diagnostics accepted, or nil.")
 
-(defvar coq-eglot-session--requests)   ; see "Requests in flight"
 
 (defvar-local coq-eglot-session-sentence-end-function nil
   "Function guessing the end of the sentence at a position.
@@ -139,14 +138,13 @@ and the positions before BEG do not move."
       (if (and last (coq-eglot-session--same-sentence-p (car last) beg))
           (setcdr last date)
         (push (cons beg date) coq-eglot-session--points))))
-  (coq-eglot-session--forget-diagnostics beg)
-  ;; the requests about a position at BEG or after: their answers would
-  ;; not be valid, and the position now designates another text
-  (setq coq-eglot-session--requests
-        (seq-remove (lambda (entry)
-                      (and (consp (car entry)) (numberp (cdar entry))
-                           (>= (cdar entry) beg)))
-                    coq-eglot-session--requests)))
+  (coq-eglot-session--forget-diagnostics beg))
+
+(defun coq-eglot-session-clock ()
+  "The local clock, the date of the last edition.
+In the key of a request, see `coq-eglot-session-ask': a request asked
+after an edition never waits for the answer of one asked before."
+  coq-eglot-session--clock)
 
 (defun coq-eglot-session--edited (pos)
   "I(POS): the date of the last edition at POS or before, 0 if none."
@@ -167,6 +165,14 @@ The clock if newer than all the dated versions: not edited since."
         (pop dates))
       ;; older than all the dated ones: nothing is valid
       (if dates (cdar dates) -1)))))
+
+(defun coq-eglot-session-validity (version)
+  "A predicate telling if what the server said about VERSION is valid.
+Called with a position, see `coq-eglot-session-valid-p'.  The date of
+VERSION is computed once: for the many diagnostics of a snapshot."
+  (let ((date (and version (coq-eglot-session--date version))))
+    (lambda (pos)
+      (and date (<= (coq-eglot-session--edited pos) date)))))
 
 (defun coq-eglot-session-valid-p (version pos)
   "Non-nil if what the server said about VERSION up to POS is still valid.
@@ -290,12 +296,12 @@ previous one.  Return non-nil if recorded."
                (not (and coq-eglot-session--diagnostics-version
                          (< version coq-eglot-session--diagnostics-version)))
                (coq-eglot-session-valid-p version (point-min)))
-      (setq coq-eglot-session--diagnostics-version version)
-      (setq coq-eglot-session--diagnostics
-            (seq-filter (lambda (diag)
-                          (coq-eglot-session-valid-p
-                           version (coq-eglot-lsp-diagnostic-end diag)))
-                        (coq-eglot-lsp-diagnostics-diagnostics diagnostics)))
+      (let ((valid-p (coq-eglot-session-validity version)))
+        (setq coq-eglot-session--diagnostics-version version)
+        (setq coq-eglot-session--diagnostics
+              (seq-filter (lambda (diag)
+                            (funcall valid-p (coq-eglot-lsp-diagnostic-end diag)))
+                          (coq-eglot-lsp-diagnostics-diagnostics diagnostics))))
       t)))
 
 (defun coq-eglot-session--forget-diagnostics (pos)
@@ -429,7 +435,12 @@ character before TARGET."
 ;; moves the proof position: the goals at a position, for instance.
 ;; One per key: asking again what is already asked waits for the same
 ;; answer, see `coq-eglot-session-ask'.  Who asked is not kept, only
-;; what to do with the answer.
+;; what to do with the answer.  The key says all what the answer
+;; depends on, including the date of the text (`coq-eglot-session-clock'):
+;; after an edition, a new request is sent, it does not wait for an
+;; answer that will not be valid.  The requests stay until answered,
+;; even if their answer will be ignored: the session is at rest only
+;; when the server answered everything.
 
 (defvar-local coq-eglot-session--requests nil
   "The requests in flight, a list of (KEY . CALLBACKS).
