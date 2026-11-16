@@ -198,7 +198,10 @@ See `coq-eglot-strong-interrupt'."
    ;; Pretty print as strings
    :pp_type 0
    ;; The range of the sentence of an error, in its diagnostic
-   :send_diags_extra_data t))
+   :send_diags_extra_data t
+   ;; The range of each sentence before it is executed, see
+   ;; `coq-eglot-lsp-execution' (coq-lsp >= 0.2.4)
+   :send_execinfo t))
 
 (cl-defmethod eglot-initialization-options ((_server coq-eglot-lsp-server))
   (coq-eglot-lsp--options))
@@ -497,6 +500,14 @@ and the position are those of the request."
 START is the end of the last sentence checked: the server reports the
 rest of the document as still to check, from START."
   version start)
+
+(cl-defstruct (coq-eglot-lsp-execution
+               (:constructor coq-eglot-lsp--make-execution
+                             (version start end)))
+  "The server starts to execute the sentence from START to END of VERSION.
+Sent before each sentence: the bounds of all the sentences checked,
+not that they are checked."
+  version start end)
 
 (cl-defstruct (coq-eglot-lsp-diagnostic
                (:constructor coq-eglot-lsp--make-diagnostic
@@ -798,6 +809,8 @@ Return the context of the request."
      (lambda () (coq-eglot-lsp--goals-params pos width flags))
      (lambda (result context)
        (setq answer (coq-eglot-lsp--answer result context width flags))
+       ;; whoever asked, the observers learn from it
+       (when answer (coq-eglot-lsp--publish answer))
        (funcall done))
      on-error)))
 
@@ -892,34 +905,66 @@ version %s or later is needed."
      "The Coq server cannot interrupt computations: its OCaml does not \
 support memprof-limits.  Set `coq-eglot-strong-interrupt' to nil.")))
 
-(defvar-local coq-eglot-lsp-progress-function nil
-  "Function called while the server checks the current buffer.
-It is called with a `coq-eglot-lsp-progress', maybe about an older
-version of the buffer.")
+;;; Publication of the events
+
+;; The notifications, and the answers of the goals, are published to
+;; the observers of the buffer they are about: the functions of
+;; `coq-eglot-lsp-event-functions'.  Each observer takes the events it
+;; is interested in: the sentences (coq-eglot-sentences.el), the
+;; session, the interface.  Whether an event is still valid is decided
+;; by the observers.
+
+(defvar-local coq-eglot-lsp-event-functions nil
+  "Functions called with each event of the server about the buffer.
+An abnormal hook, local to the script buffer.  The events are
+`coq-eglot-lsp-answer' (the goals after a sentence, whoever asked),
+`coq-eglot-lsp-execution', `coq-eglot-lsp-progress' and
+`coq-eglot-lsp-diagnostics', maybe about an older version of the
+buffer.")
+
+(defun coq-eglot-lsp--publish (event)
+  "Publish EVENT to the observers of the current buffer.
+See `coq-eglot-lsp-event-functions'."
+  (run-hook-with-args 'coq-eglot-lsp-event-functions event))
+
+(defun coq-eglot-lsp--publish-in (uri event-fn)
+  "Publish the event of EVENT-FN to the observers of the buffer of URI.
+EVENT-FN is called in the buffer, if any, to make the event."
+  (let ((buffer (coq-eglot-lsp--buffer uri)))
+    (when buffer
+      (with-current-buffer buffer
+        (when coq-eglot-lsp-event-functions
+          (coq-eglot-lsp--publish (funcall event-fn)))))))
 
 (cl-defmethod eglot-handle-notification
   ((_server coq-eglot-lsp-server) (_method (eql $/coq/fileProgress))
    &key textDocument processing &allow-other-keys)
-  "Call `coq-eglot-lsp-progress-function' of the buffer being checked.
+  "Publish a `coq-eglot-lsp-progress' for the buffer being checked.
 PROCESSING is the part of the document still to check: coq-lsp 0.2
 sends one range, from the end of the last sentence checked to the end
 of the document, even when the check is finished."
-  (let ((buffer (coq-eglot-lsp--buffer (plist-get textDocument :uri))))
-    (when (and buffer (> (length processing) 0))
-      (with-current-buffer buffer
-        (when coq-eglot-lsp-progress-function
-          (funcall coq-eglot-lsp-progress-function
-                   (coq-eglot-lsp--make-progress
-                    (plist-get textDocument :version)
-                    (car (coq-eglot-lsp-range
-                          (plist-get (aref processing 0) :range))))))))))
+  (when (> (length processing) 0)
+    (coq-eglot-lsp--publish-in
+     (plist-get textDocument :uri)
+     (lambda ()
+       (coq-eglot-lsp--make-progress
+        (plist-get textDocument :version)
+        (car (coq-eglot-lsp-range (plist-get (aref processing 0) :range))))))))
+
+(cl-defmethod eglot-handle-notification
+  ((_server coq-eglot-lsp-server) (_method (eql $/coq/executionInformation))
+   &key textDocument range &allow-other-keys)
+  "Publish a `coq-eglot-lsp-execution' for the buffer being checked.
+RANGE is the sentence the server starts to execute."
+  (when range
+    (coq-eglot-lsp--publish-in
+     (plist-get textDocument :uri)
+     (lambda ()
+       (let ((bounds (coq-eglot-lsp-range range)))
+         (coq-eglot-lsp--make-execution (plist-get textDocument :version)
+                                        (car bounds) (cdr bounds)))))))
 
 ;;; Diagnostics
-
-(defvar-local coq-eglot-lsp-diagnostics-function nil
-  "Function called with the diagnostics of the current buffer.
-It is called with a `coq-eglot-lsp-diagnostics', maybe about an older
-version of the buffer.")
 
 (defun coq-eglot-lsp--diagnostic (diag)
   "DIAG, a diagnostic of the server, as a `coq-eglot-lsp-diagnostic'."
@@ -936,16 +981,14 @@ version of the buffer.")
   ((_server coq-eglot-lsp-server)
    (_method (eql textDocument/publishDiagnostics))
    &key uri diagnostics version &allow-other-keys)
-  "Call `coq-eglot-lsp-diagnostics-function' of the buffer of URI.
+  "Publish a `coq-eglot-lsp-diagnostics' for the buffer of URI.
 With its DIAGNOSTICS for VERSION, or the current version if not given."
-  (let ((buffer (coq-eglot-lsp--buffer uri)))
-    (when buffer
-      (with-current-buffer buffer
-        (when coq-eglot-lsp-diagnostics-function
-          (funcall coq-eglot-lsp-diagnostics-function
-                   (coq-eglot-lsp--make-diagnostics
-                    (or version eglot--versioned-identifier)
-                    (mapcar #'coq-eglot-lsp--diagnostic diagnostics))))))))
+  (coq-eglot-lsp--publish-in
+   uri
+   (lambda ()
+     (coq-eglot-lsp--make-diagnostics
+      (or version eglot--versioned-identifier)
+      (mapcar #'coq-eglot-lsp--diagnostic diagnostics)))))
 
 (provide 'coq-eglot-lsp)
 

@@ -28,6 +28,7 @@
 
 (require 'cl-lib)
 (require 'coq-eglot-lsp)                ; the structures of the events
+(require 'coq-eglot-sentences)
 
 ;;; Validity: the dates of the editions
 
@@ -138,7 +139,10 @@ and the positions before BEG do not move."
       (if (and last (coq-eglot-session--same-sentence-p (car last) beg))
           (setcdr last date)
         (push (cons beg date) coq-eglot-session--points))))
-  (coq-eglot-session--forget-diagnostics beg))
+  (coq-eglot-session--forget-diagnostics beg)
+  ;; the bounds of the sentences, after the date: see
+  ;; coq-eglot-sentences.el
+  (coq-eglot-sentences-observe-edit beg))
 
 (defun coq-eglot-session-clock ()
   "The local clock, the date of the last edition.
@@ -304,11 +308,30 @@ previous one.  Return non-nil if recorded."
                           (coq-eglot-lsp-diagnostics-diagnostics diagnostics))))
       t)))
 
+(defun coq-eglot-session-observe (event)
+  "Observe EVENT of the server: record the snapshots of diagnostics.
+A function of `coq-eglot-lsp-event-functions'."
+  (when (coq-eglot-lsp-diagnostics-p event)
+    (coq-eglot-session-receive-diagnostics event)))
+
 (defun coq-eglot-session--forget-diagnostics (pos)
   "Forget the diagnostics ending at POS or after: an edition at POS."
   (setq coq-eglot-session--diagnostics
         (seq-remove (lambda (diag) (>= (coq-eglot-lsp-diagnostic-end diag) pos))
                     coq-eglot-session--diagnostics)))
+
+(defun coq-eglot-session-error (start end)
+  "The first error located between START and END, a diagnostic, or nil.
+Among the valid diagnostics, see `coq-eglot-session-error-range'."
+  (let (first)
+    (dolist (diag coq-eglot-session--diagnostics)
+      (let ((beg (coq-eglot-lsp-diagnostic-start diag)))
+        (when (and (eq (coq-eglot-lsp-diagnostic-severity diag) 'error)
+                   (<= start beg) (< beg end)
+                   (or (null first)
+                       (< beg (coq-eglot-lsp-diagnostic-start first))))
+          (setq first diag))))
+    first))
 
 (defun coq-eglot-session-error-range (start end)
   "Buffer range (BEG . END) of the first error located between START and END.
@@ -502,16 +525,22 @@ No target, no operation running, no request in flight."
 VERSION-FUNCTION gives the version the server knows, see
 `coq-eglot-session-version-function'."
   (setq coq-eglot-session-version-function version-function)
+  (setq coq-eglot-sentences-valid-function #'coq-eglot-session-valid-p)
   (coq-eglot-session-reset)
+  (add-hook 'coq-eglot-lsp-event-functions #'coq-eglot-sentences-observe nil t)
+  (add-hook 'coq-eglot-lsp-event-functions #'coq-eglot-session-observe nil t)
   (add-hook 'before-change-functions #'coq-eglot-session--before-change nil t))
 
 (defun coq-eglot-session-stop ()
   "Stop the session of the current buffer, forget everything."
   (remove-hook 'before-change-functions #'coq-eglot-session--before-change t)
+  (remove-hook 'coq-eglot-lsp-event-functions #'coq-eglot-sentences-observe t)
+  (remove-hook 'coq-eglot-lsp-event-functions #'coq-eglot-session-observe t)
   (coq-eglot-session-forget-sentences (1- (point-min)))
   (coq-eglot-session-stop-work)
   (coq-eglot-session-forget-requests)
   (setq coq-eglot-session--points nil)
+  (coq-eglot-sentences-clear)
   (setq coq-eglot-session--diagnostics nil
         coq-eglot-session--diagnostics-version nil)
   (coq-eglot-session-reset))

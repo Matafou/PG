@@ -3765,6 +3765,22 @@ when they are updated again with nothing new."
     (wait-for-coq)
     (should-not (string-search "…" (coq-eglot--lighter)))))
 
+(ert-deftest coq-eglot-move-back-exact-at-once ()
+  "After one check of several sentences, moving back goes at once to the
+right sentence: the server told the bounds of all the sentences it
+executed."
+  (with-test-file
+    (force-new-check)
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    ;; the bounds of each sentence are known, not only of the last one
+    (goto-marker "statement")
+    (should (= (coq-eglot-sentences-previous-end (point)) (point)))
+    (should (coq-eglot-sentences-range-ending-at (point)))
+    (coq-eglot-goto-point)
+    ;; before any answer
+    (should (position-at-marker-p "statement"))))
+
 ;; The session, with the server
 
 (ert-deftest coq-eglot-session-error-sentence ()
@@ -4018,6 +4034,80 @@ one comes after it.  The queries make the buffer busy."
         (funcall (cadr answers) '("first"))
         (should (equal (buffer-text "*response*") "second"))
         (should-not (coq-eglot-busy-p))))))
+
+;; The bounds of the sentences, without server
+
+(defmacro with-sentences (text &rest body)
+  "Run BODY with a session on TEXT, sentences ending with a dot."
+  (declare (indent 1) (debug t))
+  `(with-planner ,text
+     (setq coq-eglot-sentences-start-function
+           coq-eglot-session-sentence-start-function)
+     ,@body))
+
+(defun execution (start end &optional version)
+  "The event of the execution of the sentence from START to END."
+  (coq-eglot-lsp--make-execution (or version test-version) start end))
+
+(ert-deftest coq-eglot-sentences-learned ()
+  "The bounds learned from the executions, the answers and the errors,
+kept in order; an overlapping range replaces the old one."
+  (with-sentences "A. B. C. D."
+    (let ((changes 0))
+      (add-hook 'coq-eglot-sentences-change-hook (lambda () (cl-incf changes))
+                nil t)
+      (coq-eglot-sentences-observe (execution 1 3))
+      (coq-eglot-sentences-observe (execution 4 6))
+      ;; the same again changes nothing
+      (coq-eglot-sentences-observe (execution 4 6))
+      (should (= changes 2))
+      ;; an answer for a later sentence, an error for an earlier one
+      (coq-eglot-sentences-observe
+       (coq-eglot-lsp-make-answer :version 1 :sentence '(10 . 12)))
+      (coq-eglot-sentences-observe
+       (coq-eglot-lsp--make-diagnostics
+        1 (list (coq-eglot-lsp--make-diagnostic 7 8 'error "e" '(7 . 9)))))
+      (should (equal (coq-eglot-sentences--ranges)
+                     '((10 . 12) (7 . 9) (4 . 6) (1 . 3))))
+      ;; an overlapping range replaces
+      (coq-eglot-sentences-observe (execution 4 9))
+      (should (equal (coq-eglot-sentences--ranges)
+                     '((10 . 12) (4 . 9) (1 . 3)))))))
+
+(ert-deftest coq-eglot-sentences-edition ()
+  "An edition forgets the sentences ending at it or after, a late event
+about the text before it is still learned, not about the text after."
+  (with-sentences "A. B. C."
+    (coq-eglot-sentences-observe (execution 1 3))
+    (coq-eglot-sentences-observe (execution 4 6))
+    (coq-eglot-sentences-observe (execution 7 9))
+    ;; right at the end of B.: B. is edited too
+    (edit-at 6)
+    (should (equal (coq-eglot-sentences--ranges) '((1 . 3))))
+    ;; late: about version 1, before the edition, and after it
+    (coq-eglot-sentences-observe (execution 4 5 1))
+    (coq-eglot-sentences-observe (execution 8 10 1))
+    (should (equal (coq-eglot-sentences--ranges) '((4 . 5) (1 . 3))))))
+
+(ert-deftest coq-eglot-sentences-previous-end ()
+  "The end of the sentence before a position, if surely known: no
+sentence the server did not tell of between."
+  (with-sentences "A. B. C. D."
+    ;; nothing known: sure only before the first sentence
+    (should (= (coq-eglot-sentences-previous-end 1) 1))
+    (should-not (coq-eglot-sentences-previous-end 5))
+    (coq-eglot-sentences-observe (execution 1 3))
+    (coq-eglot-sentences-observe (execution 4 6))
+    ;; inside B., or right after it, or before C.
+    (should (= (coq-eglot-sentences-previous-end 5) 3))
+    (should (= (coq-eglot-sentences-previous-end 6) 6))
+    (should (= (coq-eglot-sentences-previous-end 7) 6))
+    ;; inside C., not known: it may end before
+    (should-not (coq-eglot-sentences-previous-end 8))
+    (should-not (coq-eglot-sentences-previous-end 11))
+    (coq-eglot-sentences-observe (execution 10 12))
+    ;; C. is not known, D. is: C. may end before D.
+    (should-not (coq-eglot-sentences-previous-end 11))))
 
 (provide 'coq-eglot-test-basic)
 
