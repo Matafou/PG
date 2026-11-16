@@ -129,6 +129,14 @@
 
 ;;; tests
 
+(defun coq-test-query-result (command)
+  "The answer of the query COMMAND, see `coq-query-result'.
+With Proof General, it is given before `coq-query-result' returns."
+  (let ((output 'none))
+    (coq-query-result command (lambda (answer) (setq output answer)))
+    (should-not (eq output 'none))
+    output))
+
 (ert-deftest coq-test-queries-common-keys ()
   "The query keys are in `coq-mode-map', the other C-c C-a keys of
 Proof General still work."
@@ -253,7 +261,7 @@ the user in `coq-goals-mode-map'.  See also
                     #'coq-ask-adapt-printing-width-and-show))))
     (with-temp-buffer
       (should-error (coq-run-query "Check x") :type 'user-error)
-      (should-error (coq-query-result "Check x") :type 'user-error))))
+      (should-error (coq-query-result "Check x" #'ignore) :type 'user-error))))
 
 (ert-deftest coq-test-queries-show ()
   "`coq-Show' shows the answer to the command at point in the locked
@@ -285,7 +293,7 @@ region, asks for a goal number elsewhere."
     (should (eql coq-shell-current-line-width 51))
     ;; one column less, see `coq-adapt-printing-width'
     (should (string-match-p "\\_<50\\_>"
-                            (coq-query-result "Test Printing Width")))
+                            (coq-test-query-result "Test Printing Width")))
     ;; also when the width is not adapted automatically
     (let ((coq-auto-adapt-printing-width nil))
       (cl-letf (((symbol-function 'read-number) (lambda (&rest _) 61)))
@@ -293,7 +301,7 @@ region, asks for a goal number elsewhere."
       (coq-test-queries-wait)
       (should (eql coq-shell-current-line-width 61))
       (should (string-match-p "\\_<60\\_>"
-                              (coq-query-result "Test Printing Width"))))))
+                              (coq-test-query-result "Test Printing Width"))))))
 
 (ert-deftest coq-test-queries-store-same-window ()
   "Storing again updates the window that displays *response-freeze*.
@@ -364,7 +372,7 @@ the response at the top of the buffer *response-freeze*."
       (coq-change-search-blacklist "\"foo_\"")
       (coq-test-queries-wait)
       (should (equal coq-search-blacklist-current-string "\"foo_\""))
-      (let ((table (coq-query-result "Print Table Search Blacklist")))
+      (let ((table (coq-test-query-result "Print Table Search Blacklist")))
         (should (string-match-p "foo_" table))
         (should-not (string-match-p "Private_" table))))))
 
@@ -386,7 +394,7 @@ next command, Coq state unchanged."
                (save-excursion (goto-char (point-max))
                                (search-backward "destruct"))))
     ;; nor run: the goal is not destructed
-    (should (string-match-p "n = x -> True" (coq-query-result "Show")))
+    (should (string-match-p "n = x -> True" (coq-test-query-result "Show")))
     ;; there is already an "as"
     (coq-insert-as-in-next-command)
     (should (string-suffix-p "destruct n as [ | n0 ].\n" (buffer-string)))))
@@ -394,8 +402,8 @@ next command, Coq state unchanged."
 (ert-deftest coq-test-queries-result ()
   "`coq-query-result' returns the answer of a query, nil on an error."
   (coq-test-queries-with-file
-    (should (string-match-p "x\\s-*:\\s-*nat" (coq-query-result "Check x")))
-    (should-not (coq-query-result "Check unknown_identifier"))))
+    (should (string-match-p "x\\s-*:\\s-*nat" (coq-test-query-result "Check x")))
+    (should-not (coq-test-query-result "Check unknown_identifier"))))
 
 (ert-deftest coq-test-queries-insert-intros ()
   "`coq-insert-intros' inserts the names given by Show Intros."

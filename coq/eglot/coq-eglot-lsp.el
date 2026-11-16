@@ -630,26 +630,6 @@ See `coq-eglot-lsp-failure'."
   "The version of the current buffer last sent to the server."
   eglot--versioned-identifier)
 
-(defun coq-eglot-lsp--server-for-request ()
-  "Return the server of the current buffer, after sending pending changes."
-  (let ((server (or (coq-eglot-lsp-ensure-server)
-                    (user-error "No Coq language server for this buffer"))))
-    (eglot--signal-textDocument/didChange)
-    server))
-
-(defvar coq-eglot-lsp--in-request nil
-  "Non-nil while waiting for the answer to a synchronous request.
-See `coq-eglot-lsp-request'.")
-
-(defun coq-eglot-lsp-request (method params)
-  "Send request METHOD with PARAMS to the server of the current buffer.
-Pending changes of the buffer are sent first.  Return the answer, or
-signal an error.  No timeout: checking may be long, \\[keyboard-quit]
-stops waiting."
-  (let ((coq-eglot-lsp--in-request t))
-    (jsonrpc-request (coq-eglot-lsp--server-for-request) method params
-                     :timeout nil)))
-
 (defun coq-eglot-lsp-connect ()
   "Start the Coq server of the current buffer if needed, without waiting.
 Return it if connected, nil if it is still connecting.  Signal an error
@@ -717,18 +697,15 @@ called with the answer and the context, ON-ERROR with a
 `coq-eglot-lsp-failure', in the current buffer if still live: also if
 the server does not connect.  PARAMS is a function returning the
 parameters, called after the changes are sent.  ON-SUCCESS and
-ON-ERROR are called from a timer, not from the process filter, so that
-they can send synchronous requests.  Not while waiting for the answer
-to a synchronous request, maybe to another server: when it comes,
-`jsonrpc-request' would leave theirs, and them, unfinished."
+ON-ERROR are called from a timer, not from the process filter: they
+may send other requests.  No request of the backend waits for its
+answer: while waiting in `jsonrpc-request', the answers of the others
+would come, and callbacks sending other requests would run, nested."
   (let ((buffer (current-buffer))
         (context (coq-eglot-lsp--make-context method pos)))
     (cl-labels ((run (fn arg)
-                  (cond
-                   ((not (buffer-live-p buffer)))
-                   (coq-eglot-lsp--in-request
-                    (run-at-time 0.01 nil #'run fn arg))
-                   (t (with-current-buffer buffer (funcall fn arg)))))
+                  (when (buffer-live-p buffer)
+                    (with-current-buffer buffer (funcall fn arg))))
                 (later (fn)
                   (lambda (arg) (run-at-time 0 nil #'run fn arg))))
       (coq-eglot-lsp--when-connected
@@ -988,18 +965,6 @@ request."
               (mapcar (lambda (feedback) (aref feedback 1))
                       (plist-get answer :feedback))))
    on-error))
-
-(defun coq-eglot-lsp-query (pos command)
-  "Run Coq COMMAND in the state at POS and return its messages.
-Like `coq-eglot-lsp-query-async', but wait for the answer.  Return a
-list of strings, or signal an error if COMMAND fails."
-  (mapcar (lambda (feedback) (aref feedback 1))
-          (plist-get (coq-eglot-lsp-request
-                      :petanque/run_at_point
-                      (list :textDocument (eglot--VersionedTextDocumentIdentifier)
-                            :position (coq-eglot-lsp-position pos)
-                            :command command))
-                     :feedback)))
 
 ;;; Notifications
 

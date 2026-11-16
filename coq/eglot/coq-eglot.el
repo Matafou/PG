@@ -2265,24 +2265,46 @@ This is `coq-query-function' for the Eglot backend."
      (lambda (_messages)
        (when then (funcall then))))))
 
-(defun coq-eglot-query-result (command)
-  "Run Coq COMMAND at the proof position and return its answer.
-Wait for it, display nothing.  Return nil if Coq answers an error, or
-outside of the processed part.  This is `coq-query-result-function'
-for the Eglot backend, used by the insertions built from a query, like
-`coq-insert-intros'.  Signal an error during a check: the server would
-answer only after it."
+(defvar-local coq-eglot--query-results 0
+  "Number of the last query sent by `coq-eglot-query-result'.")
+
+(defun coq-eglot-query-result (command callback)
+  "Run Coq COMMAND at the proof position, call CALLBACK with its answer.
+Without waiting, display nothing.  With nil if Coq answers an error,
+or outside of the processed part.  Not called if the answer is stale
+when it comes: the proof position moved, or the text before it was
+edited.  Nor if it is cancelled, like by \\[coq-eglot-interrupt].
+The request is one of the session, see `coq-eglot-busy-p'.  This is
+`coq-query-result-function' for the Eglot backend, used by the
+insertions built from a query, like `coq-insert-intros'."
   (coq-eglot--with-script
-    (coq-eglot--check-busy)
-    (when (> (coq-eglot-position) (point-min))
-      (condition-case nil
-          (string-join (coq-eglot-lsp-query
-                        (1- (coq-eglot-position))
-                        (if (string-match-p "\\.[ \t\n]*\\'" command)
-                            command
-                          (concat command ".")))
-                       "\n")
-        (jsonrpc-error nil)))))
+    (let ((position (coq-eglot-position)))
+      (if (<= position (point-min))
+          (funcall callback nil)
+        (let ((pos (1- position))
+              (context nil))
+          (unless (string-match-p "\\.[ \t\n]*\\'" command)
+            (setq command (concat command ".")))
+          (coq-eglot-session-ask
+           (list 'query-result (cl-incf coq-eglot--query-results))
+           (lambda (result)
+             (when (and result
+                        (= (coq-eglot-position) position)
+                        (coq-eglot-session-valid-p
+                         (coq-eglot-lsp-context-version context) pos))
+               (pcase result
+                 (`(messages . ,messages)
+                  (funcall callback (string-join messages "\n")))
+                 (`(failure . ,failure)
+                  (unless (coq-eglot-lsp-failure-cancelled failure)
+                    (funcall callback nil))))))
+           (lambda (done)
+             (setq context
+                   (coq-eglot-lsp-query-async
+                    pos command
+                    (lambda (messages) (funcall done (cons 'messages messages)))
+                    (lambda (failure)
+                      (funcall done (cons 'failure failure))))))))))))
 
 (defun coq-eglot-query (command &optional flags)
   "Run Coq COMMAND at the proof position, read in the minibuffer.

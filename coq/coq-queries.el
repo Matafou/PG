@@ -52,17 +52,45 @@ See `coq-query-function' for the arguments."
   (funcall coq-query-function command flags then))
 
 (defvar-local coq-query-result-function nil
-  "Function running a query and returning its answer, set by each backend.
-It is called with the argument COMMAND, the query without its final
-dot, for instance \"Show Intros\".  It waits for the answer and returns
-it as a string, without displaying it, or nil if Coq answers an error.")
+  "Function running a query and giving its answer, set by each backend.
+It is called with the arguments COMMAND CALLBACK.  COMMAND is the query
+without its final dot, for instance \"Show Intros\".  CALLBACK is
+called once in the script buffer with the answer as a string, without
+displaying it, or with nil if Coq answers an error.  Maybe later: the
+function need not wait for the answer.  Then CALLBACK is not called if
+the answer is no longer about the current state of Coq, for instance
+after the script was edited before the proof position, or if the query
+is cancelled.")
 
-(defun coq-query-result (command)
-  "Run the query COMMAND and return its answer, nil on an error.
+(defun coq-query-result (command callback)
+  "Run the query COMMAND and call CALLBACK with its answer, nil on an error.
 See `coq-query-result-function'."
   (unless coq-query-result-function
     (user-error "Coq: no backend to run queries in this buffer"))
-  (funcall coq-query-result-function command))
+  (funcall coq-query-result-function command callback))
+
+(defun coq-query-result-at (pos command fn)
+  "Run the query COMMAND, then call FN with its answer at POS.
+POS moves with the text until the answer comes, see
+`coq-query-result'.  If point did not move since, FN is called at point
+and may move it, as a command would; otherwise point stays where it
+is.  An error of FN is displayed as a message: it is not signaled to a
+command."
+  (let ((marker (copy-marker pos)))
+    (coq-query-result
+     command
+     (lambda (output)
+       (let ((buffer (marker-buffer marker)))
+         (when buffer
+           (with-current-buffer buffer
+             (condition-case err
+                 (if (= (point) marker)
+                     (funcall fn output)
+                   (save-excursion
+                     (goto-char marker)
+                     (funcall fn output)))
+               (error (message "%s" (error-message-string err))))
+             (set-marker marker nil))))))))
 
 (defcustom coq-query-flags
   '(("All" . "Set Printing All")
@@ -572,7 +600,8 @@ Set by each backend, called without argument in the script buffer.")
   "Insert an \"as\" clause in the next command, from the names Coq gives.
 The next command is the one after the processed part of the script, see
 `coq-processed-end-function'.  It is run with the tactical infoH as a
-query, see `coq-query-result', which leaves the state of Coq unchanged."
+query, see `coq-query-result', which leaves the state of Coq unchanged.
+The clause is inserted before its final dot once Coq answers."
   (interactive)
   (unless coq-processed-end-function
     (user-error "Coq: no backend to run the next command in this buffer"))
@@ -583,24 +612,25 @@ query, see `coq-query-result', which leaves the state of Coq unchanged."
     (let* ((pt (point))
            (_ (coq-script-parse-cmdend-forward))
            (cmd (buffer-substring pt (point)))
+           ;; just before its final dot
+           (before-dot (save-excursion (coq-script-parse-cmdend-backward)
+                                       (point)))
            (newcmd (and (not (coq-tactic-already-has-an-as-close cmd))
-                        (coq-hack-cmd-for-infoH cmd)))
-           ;; not a composed tactic, see `coq-hack-cmd-for-infoH'
-           (output (and newcmd
-                        (string-prefix-p "infoH " newcmd)
-                        (coq-query-result
-                         (replace-regexp-in-string "\\.\\s-*\\'" "" newcmd))))
-           (substr (and output
-                        (string-match "<infoH>\\([^<]*\\)</infoH>" output)
-                        (match-string 1 output))))
-      ;; nothing if substr contains only spaces and |
-      (when (and substr (string-match-p "[^|[:space:]]" substr))
-        ;; TODO: look for eqn:XX and go before it.
-        ;; Go just before the last "."
-        (goto-char (funcall coq-processed-end-function))
-        (coq-script-parse-cmdend-forward)
-        (coq-script-parse-cmdend-backward)
-        (insert (concat " as [" substr "]"))))))
+                        (coq-hack-cmd-for-infoH cmd))))
+      ;; not a composed tactic, see `coq-hack-cmd-for-infoH'
+      (when (and newcmd (string-prefix-p "infoH " newcmd))
+        (coq-query-result-at
+         before-dot (replace-regexp-in-string "\\.\\s-*\\'" "" newcmd)
+         (lambda (output)
+           (let ((substr (and output
+                              (string-match "<infoH>\\([^<]*\\)</infoH>"
+                                            output)
+                              (match-string 1 output))))
+             ;; nothing if substr contains only spaces and |
+             (when (and substr (string-match-p "[^|[:space:]]" substr))
+               ;; TODO: look for eqn:XX and go before it.
+               (save-excursion
+                 (insert (concat " as [" substr "]")))))))))))
 
 (defvar-local coq-show-at-point-function nil
   "Function showing the state of Coq at point, set by each backend, or nil.
@@ -710,19 +740,21 @@ See `coq-insert-intros' to insert them."
   "Insert an intros or move command with names given by Show Intros.
 Based on idea mentioned in Coq reference manual."
   (interactive)
-  (let* ((output (or (coq-query-result "Show Intros") "")))
-    (indent-region (point)
-                   (progn (insert (coq--format-intros output))
-                          (save-excursion
-                            ;; t if the backend does not define it
-                            (insert (if (or (not (boundp 'coq-one-command-per-line))
-                                            coq-one-command-per-line)
-                                        "\n" " "))
-                            (point))))
-    ;; The electric terminator moves the point in all sorts of strange
-    ;; ways, so we run it last
-    (let ((last-command-event ?.)) ;; Insert a dot
-      (coq-terminator-insert))))
+  (coq-query-result-at
+   (point) "Show Intros"
+   (lambda (output)
+     (indent-region (point)
+                    (progn (insert (coq--format-intros (or output "")))
+                           (save-excursion
+                             ;; t if the backend does not define it
+                             (insert (if (or (not (boundp 'coq-one-command-per-line))
+                                             coq-one-command-per-line)
+                                         "\n" " "))
+                             (point))))
+     ;; The electric terminator moves the point in all sorts of strange
+     ;; ways, so we run it last
+     (let ((last-command-event ?.)) ;; Insert a dot
+       (coq-terminator-insert)))))
 
 (defun coq-replace-branch-with-yas-holes (s)
   "Replace occurrences of RE in by REPi in S. i is incremented at each replacement."
@@ -755,35 +787,38 @@ Goals that are marked as \"only printing\" are ignored."
 (defun coq-insert-named-goal-selectors ()
   "Insert named goal selectors for the open goals."
   (interactive)
-  (let ((output (coq-query-result "Show Existentials")))
-    (when output
-      (let* ((goal-names (coq-get-goal-names output))
-             ;; NOTE: Adding braces would be great, but it messes up indentation.
-             (format-selector (lambda (name) (format "[%s]: #." name)))
-             (goal-selectors (cl-mapcar format-selector goal-names))
-             (snippet (string-join goal-selectors "\n")))
-        (if (equal goal-selectors nil)
-            (error "Couldn't find any named goals")
-          (coq-insert-template snippet))))))
+  (coq-query-result-at
+   (point) "Show Existentials"
+   (lambda (output)
+     (when output
+       (let* ((goal-names (coq-get-goal-names output))
+              ;; NOTE: Adding braces would be great, but it messes up indentation.
+              (format-selector (lambda (name) (format "[%s]: #." name)))
+              (goal-selectors (cl-mapcar format-selector goal-names))
+              (snippet (string-join goal-selectors "\n")))
+         (if (equal goal-selectors nil)
+             (error "Couldn't find any named goals")
+           (coq-insert-template snippet)))))))
 
 (defun coq-insert-match ()
   "Insert a match expression from a type name by Show Match.
 Based on idea mentioned in Coq reference manual.
 Also insert holes at insertion positions."
   (interactive)
-  (let* ((cmd))
-    (setq cmd (read-string "Build match for type: "))
-    (let ((thematch (coq-query-result (concat "Show Match " cmd))))
-      ;; nil on an error
-      (when thematch
-        (if (and coq-use-yasnippet (fboundp 'yas-expand-snippet))
-            (yas-expand-snippet (coq-replace-branch-with-yas-holes thematch))
-          (let ((start (point)))
-            (insert thematch)
-            (indent-region start (point) nil)
-            (goto-char start)
-            (search-forward "#")
-            (delete-char -1)))))))
+  (let ((cmd (read-string "Build match for type: ")))
+    (coq-query-result-at
+     (point) (concat "Show Match " cmd)
+     (lambda (thematch)
+       ;; nil on an error
+       (when thematch
+         (if (and coq-use-yasnippet (fboundp 'yas-expand-snippet))
+             (yas-expand-snippet (coq-replace-branch-with-yas-holes thematch))
+           (let ((start (point)))
+             (insert thematch)
+             (indent-region start (point) nil)
+             (goto-char start)
+             (search-forward "#")
+             (delete-char -1))))))))
 
 ;;; Keys
 

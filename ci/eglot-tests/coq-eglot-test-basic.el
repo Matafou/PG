@@ -69,6 +69,24 @@ See `coq-eglot-busy-p'."
   (funcall command)
   (wait-for-coq))
 
+(defun query-result (command)
+  "The answer of the query COMMAND, see `coq-query-result'.
+`none' if it does not come."
+  (let ((output 'none))
+    (coq-query-result command (lambda (answer) (setq output answer)))
+    (wait-for-coq)
+    output))
+
+(defun lsp-query (pos command)
+  "The messages of COMMAND run at POS by the server, a list of strings."
+  (let ((result 'none))
+    (coq-eglot-lsp-query-async pos command
+                               (lambda (messages) (setq result messages))
+                               (lambda (failure) (setq result failure)))
+    (should (wait-until (lambda () (not (eq result 'none))) 60))
+    (should (listp result))
+    result))
+
 (defmacro as-user (buffer &rest body)
   "Run BODY in BUFFER as a command of the user there.
 In the selected window, displaying BUFFER, with `this-command' set: an
@@ -307,12 +325,12 @@ are chosen by name, like in Proof General."
   "`coq-query-result' returns the answer of a query, nil on an error."
   (with-test-file
     (should (eq coq-query-result-function #'coq-eglot-query-result))
-    (should-not (coq-query-result "Check 0"))
+    (should-not (query-result "Check 0"))
     (goto-marker "definition")
     (run #'coq-eglot-goto-point)
     (should (string-match-p "double\\s-*:\\s-*nat -> nat"
-                            (coq-query-result "Check double")))
-    (should-not (coq-query-result "Check unknown_identifier"))
+                            (query-result "Check double")))
+    (should-not (query-result "Check unknown_identifier"))
     ;; nothing displayed
     (should-not (string-match-p "nat -> nat" (buffer-text "*response*")))))
 
@@ -325,7 +343,7 @@ Proof General."
     (should (eq (key-binding (kbd "C-c C-a C-i")) #'coq-insert-intros))
     (let ((position (coq-eglot-position))
           (proof-double-hit-enable nil))
-      (coq-insert-intros)
+      (run #'coq-insert-intros)
       (should (looking-back "intros n\\." (line-beginning-position)))
       ;; inserted after the proof position, which does not move
       (should (= (coq-eglot-position) position)))))
@@ -340,11 +358,53 @@ General."
     (let ((coq-use-yasnippet nil)
           (start (point)))
       (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "nat")))
-        (coq-insert-match))
+        (run #'coq-insert-match))
       (let ((text (buffer-substring start (point-max))))
         (should (string-match-p "match\\s-+with" text))
         (should (string-match-p "| O =>" text))
         (should (string-match-p "| S [[:alnum:]_]+ =>" text))))))
+
+(ert-deftest coq-eglot-query-result-without-waiting ()
+  "`coq-query-result' does not wait: the insertion comes with the answer,
+at the place where it was asked, even if point moved since."
+  (with-test-file
+    (goto-marker "statement")
+    (run #'coq-eglot-goto-point)
+    (let ((proof-double-hit-enable nil)
+          (asked (point)))
+      (cl-letf (((symbol-function 'jsonrpc-request)
+                 (lambda (&rest _) (error "Synchronous request"))))
+        (coq-insert-intros)
+        ;; not yet
+        (should (= (point) asked))
+        (should (coq-eglot-busy-p))
+        (goto-char (point-min))
+        (wait-for-coq))
+      (should (= (point) (point-min)))
+      (goto-char asked)
+      (should (looking-at "intros n\\.")))))
+
+(ert-deftest coq-eglot-query-result-stale ()
+  "The answer of `coq-query-result' is dropped if the proof position
+moved before it came, or if the query is cancelled, like by a restart."
+  (with-test-file
+    (goto-marker "statement")
+    (run #'coq-eglot-goto-point)
+    (let ((called nil))
+      (coq-query-result "Show Intros" (lambda (_) (setq called t)))
+      (coq-eglot-undo-last-command)
+      (wait-for-coq)
+      (should-not called)
+      (goto-marker "statement")
+      (run #'coq-eglot-goto-point)
+      ;; cancelled, the proof position stays
+      (coq-query-result "Show Intros" (lambda (_) (setq called t)))
+      (coq-eglot-restart-server)
+      (wait-for-coq)
+      (accept-process-output nil 0.2)
+      (should-not called)
+      ;; and when nothing changes, it comes
+      (should (string-match-p "n" (query-result "Show Intros"))))))
 
 (ert-deftest coq-eglot-insertions-without-query ()
   "The insertions without query of Proof General: keys, menu, Require."
@@ -1497,7 +1557,7 @@ in another project: compile/ has a _CoqProject."
                 (run #'coq-eglot-process-buffer)
                 (should (string-match-p
                          (format "/%s/lib/" (regexp-quote switch))
-                         (car (coq-eglot-lsp-query
+                         (car (lsp-query
                                (point-max)
                                "Locate Library Corelib.Init.Prelude.")))))
               ;; the other buffer keeps its server
@@ -3337,7 +3397,7 @@ given by Coq, like in Proof General."
     (goto-marker "as")
     (run #'coq-eglot-goto-point)
     (let ((position (coq-eglot-position)))
-      (coq-insert-as-in-next-command)
+      (run #'coq-insert-as-in-next-command)
       (should (search-forward-regexp
                "destruct l as \\[ *| *[[:alnum:]_']+ +[[:alnum:]_']+ *\\]\\."
                (line-end-position 2) t))
@@ -3702,7 +3762,7 @@ With buffer positions for the sentence and messages with severities."
   "Moving forward and back, failing, showing the goals: no command waits
 for the server."
   (with-test-file
-    (cl-letf (((symbol-function 'coq-eglot-lsp-request)
+    (cl-letf (((symbol-function 'jsonrpc-request)
                (lambda (&rest _) (error "Synchronous request"))))
       (goto-marker "split")
       (run #'coq-eglot-goto-point)

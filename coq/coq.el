@@ -950,13 +950,16 @@ arguments."
        'no-response-display 'empty-action-list 'dont-show-when-silent)))
   (when then (funcall then)))
 
-(defun coq-pg-query-result (command)
-  "Send the query COMMAND to Coq and return its answer, nil on an error.
-This is `coq-query-result-function' for Proof General, see it."
+(defun coq-pg-query-result (command callback)
+  "Send the query COMMAND to Coq, call CALLBACK with its answer.
+With nil on an error.  Wait for the answer: CALLBACK is called before
+returning.  This is `coq-query-result-function' for Proof General, see
+it."
   (proof-shell-ready-prover)
   (let ((output (proof-shell-invisible-cmd-get-result (concat command " ."))))
-    (unless (proof-string-match coq-error-regexp output)
-      output)))
+    (funcall callback
+             (unless (proof-string-match coq-error-regexp output)
+               output))))
 
   ;; (let* ((cmd) (postform (if (eq postformatcmd nil) 'identity postformatcmd)))
 
