@@ -904,16 +904,10 @@ Once for several moves, see `coq-eglot-twin--show-position'."
       (when (and coq-eglot-twin-synchronize
                  (buffer-live-p coq-eglot--twin)
                  (not (coq-eglot-twin--leader-p)))
+        ;; without waiting for its server: its requests wait for it
+        ;; to connect, see `coq-eglot-lsp--when-connected'
         (condition-case err
-            (cond
-             ((coq-eglot-lsp-ensure-server t)
-              (coq-eglot-twin--move (coq-eglot-twin--target)))
-             ;; later: waiting for its server here would block the
-             ;; answers to the leader
-             ((coq-eglot-lsp-connecting-servers)
-              (setq coq-eglot-twin--follow-timer
-                    (run-at-time 0.1 nil #'coq-eglot-twin--follow buffer)))
-             (t (error "No Coq language server")))
+            (coq-eglot-twin--move (coq-eglot-twin--target))
           (error (setq coq-eglot-twin--following nil)
                  (message "Coq: %s does not follow its twin: %s"
                           (buffer-name) (error-message-string err))))))))

@@ -76,7 +76,8 @@ POS moves with the text until the answer comes, see
 changed meanwhile, by default the empty text at POS: like if something
 was typed at POS.  An edition elsewhere does not matter.  If point did
 not move since, FN is called at point and may move it, as a command
-would; otherwise point stays where it is.  The changes of FN are undone
+would; otherwise point stays where it is, and FN is called without
+snippets, see `coq-use-yasnippet'.  The changes of FN are undone
 on their own, not with those made before or after.  An error of FN is
 displayed as a message: it is not signaled to a command, and its
 changes are undone."
@@ -104,9 +105,12 @@ changes are undone."
                    (atomic-change-group
                      (if (= (point) marker)
                          (funcall fn output)
-                       (save-excursion
-                         (goto-char marker)
-                         (funcall fn output))))
+                       ;; plain text: a snippet would be edited away
+                       ;; from point
+                       (let ((coq-use-yasnippet nil))
+                         (save-excursion
+                           (goto-char marker)
+                           (funcall fn output)))))
                  (error (message "%s" (error-message-string err))))
                (undo-boundary))
              (dolist (m (list marker start-marker end-marker))

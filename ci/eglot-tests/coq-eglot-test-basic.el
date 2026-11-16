@@ -440,6 +440,30 @@ moved before it came, or if the query is cancelled, like by a restart."
       ;; and when nothing changes, it comes
       (should (string-match-p "n" (query-result "Show Intros"))))))
 
+(ert-deftest coq-eglot-insert-match-snippet ()
+  "With snippets, the match is a snippet if point is still where it was
+asked, plain text otherwise: a snippet would be edited away from point."
+  (with-test-file
+    (goto-marker "definition")
+    (run #'coq-eglot-goto-point)
+    (forward-line 1)
+    (let ((coq-use-yasnippet t)
+          (snippets 0)
+          (start (point)))
+      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "nat"))
+                ((symbol-function 'yas-expand-snippet)
+                 (lambda (text) (cl-incf snippets) (insert text))))
+        (run #'coq-insert-match)
+        (should (= snippets 1))
+        (delete-region start (point-max))
+        (save-excursion (insert "\n(* end *)\n"))
+        (coq-insert-match)
+        (goto-char (point-max))
+        (wait-for-coq)
+        (should (= snippets 1))
+        (goto-char start)
+        (should (looking-at "match\\s-+"))))))
+
 (ert-deftest coq-eglot-insertions-without-query ()
   "The insertions without query of Proof General: keys, menu, Require."
   (with-test-file
@@ -2477,6 +2501,39 @@ The next command works."
     (run #'coq-eglot-process-buffer)
     (should (position-at-marker-p "last"))))
 
+(ert-deftest coq-eglot-interrupt-request ()
+  "Interrupting cancels a request in flight, like an insertion waiting
+for its answer: it is not called, the buffer is no longer busy."
+  (with-test-file
+    (goto-marker "statement")
+    (run #'coq-eglot-goto-point)
+    (let ((called nil))
+      (coq-query-result "Show Intros" (lambda (_) (setq called t)))
+      (should (coq-eglot-busy-p))
+      (should-not (coq-eglot-checking-p))
+      (coq-eglot-interrupt)
+      (should (coq-eglot-session-settled-p))
+      (wait-for-coq)
+      (accept-process-output nil 0.2)
+      (should-not called))))
+
+(ert-deftest coq-eglot-interrupt-connecting ()
+  "Interrupting while the server connects forgets what waits for it,
+without sending anything that would wait for the connection again."
+  (with-test-file
+    (coq-eglot-restart-server)
+    (goto-marker "split")
+    (coq-eglot-goto-point)
+    (should (coq-eglot-lsp-connecting-p))
+    (coq-eglot-interrupt)
+    (should-not (coq-eglot-lsp-connecting-p))
+    (should-not coq-eglot--interrupting)
+    (should-not (coq-eglot-busy-p))
+    (should-not (coq-eglot-checking-p))
+    ;; the next command works
+    (run #'coq-eglot-goto-point)
+    (should (position-at-marker-p "split"))))
+
 (defun wait-until (pred seconds)
   "Wait until PRED returns non-nil, at most SECONDS.  Return its value."
   (let ((start (float-time)) value)
@@ -3449,10 +3506,12 @@ for Coq: replaced, or given an \"as\" clause."
         ;; before the answer
         (search-forward "destruct l.")
         (replace-match replacement t t)
-        (wait-for-coq)
-        (goto-char (match-beginning 0))
-        (should (looking-at (concat (regexp-quote replacement) "\n")))
-        (replace-match "destruct l.\n" t t)))))
+        ;; the callbacks may change the match data
+        (let ((start (copy-marker (match-beginning 0))))
+          (wait-for-coq)
+          (goto-char start)
+          (should (looking-at (concat (regexp-quote replacement) "\n")))
+          (replace-match "destruct l.\n" t t))))))
 
 (ert-deftest coq-eglot-output-buffers-keys ()
   "The goals and response buffers have the common keys of the queries
@@ -3939,7 +3998,12 @@ the target is forgotten, the buffer is not busy."
                 (goto-char (point-max))
                 (let ((eglot-connect-timeout 1))
                   (coq-eglot-goto-point)
-                  (should (wait-until (lambda () (not (coq-eglot-busy-p))) 10)))
+                  ;; the Eglot of Emacs 29 signals its own timeout
+                  ;; from a timer: only a message, unless debugging
+                  ;; errors, as ERT does
+                  (let ((debug-on-error nil))
+                    (should (wait-until (lambda () (not (coq-eglot-busy-p)))
+                                        10))))
                 (should-not (coq-eglot-checking-p))
                 (should (seq-find (lambda (text)
                                     (string-match-p "did not start" text))

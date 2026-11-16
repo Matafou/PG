@@ -2065,22 +2065,34 @@ that the server is ready again."
                               (force-mode-line-update)))))))
 
 (defun coq-eglot-interrupt ()
-  "Interrupt the running check, without waiting.
-The proof position stays where the server was.  If the server does not
-answer since the last interruption, because it is finishing a
-computation that cannot be interrupted, restart it: see
-`coq-eglot-restart-server'."
+  "Interrupt the running check and the requests in flight, without waiting.
+Like the queries or the insertions waiting for their answer.  The proof
+position stays where the server was.  If the server does not answer
+since the last interruption, because it is finishing a computation that
+cannot be interrupted, restart it: see `coq-eglot-restart-server'.
+While the server connects, only forget what waits for it: the
+connection goes on."
   (interactive)
   (coq-eglot--with-script
-    (cond
-     ((coq-eglot-checking-p)
-      (coq-eglot--cancel)
-      (coq-eglot--wait-interruption)
-      (coq-eglot--goals-at-position-async)
-      (message "Coq: interrupted (%s again to restart the server if it stays busy)"
-               (substitute-command-keys "\\[coq-eglot-interrupt]")))
-     (coq-eglot--interrupting (coq-eglot-restart-server))
-     (t (message "Coq: nothing to interrupt")))))
+    (let ((checking (coq-eglot-checking-p)))
+      (cond
+       ;; even if requests are in flight, like the goals asked then
+       (coq-eglot--interrupting (coq-eglot-restart-server))
+       ((and (or checking (not (coq-eglot-session-settled-p)))
+             (or (coq-eglot-lsp-connecting-p)
+                 (not (coq-eglot-lsp-current-server))))
+        ;; nothing sent yet: no ping, no goals, they would wait for the
+        ;; connection again
+        (coq-eglot--cancel)
+        (message "Coq: %s" (if checking "interrupted" "request cancelled")))
+       ((or checking (not (coq-eglot-session-settled-p)))
+        (coq-eglot--cancel)
+        (coq-eglot--wait-interruption)
+        (when checking (coq-eglot--goals-at-position-async))
+        (message "Coq: %s (%s again to restart the server if it stays busy)"
+                 (if checking "interrupted" "request cancelled")
+                 (substitute-command-keys "\\[coq-eglot-interrupt]")))
+       (t (message "Coq: nothing to interrupt"))))))
 
 (defun coq-eglot--forget-checks (buffers)
   "Forget the checks of BUFFERS, whose server stopped.
