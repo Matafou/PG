@@ -384,6 +384,40 @@ at the place where it was asked, even if point moved since."
       (goto-char asked)
       (should (looking-at "intros n\\.")))))
 
+(ert-deftest coq-eglot-insert-intros-editions ()
+  "An insertion is dropped if something was typed where it goes while
+waiting for Coq, not for an edition elsewhere.  It is undone on its own,
+not with the edition before it."
+  (with-test-file
+    (goto-marker "statement")
+    (run #'coq-eglot-goto-point)
+    (let ((proof-double-hit-enable nil)
+          (asked (point)))
+      ;; typed at the place
+      (coq-insert-intros)
+      (insert "X")
+      (wait-for-coq)
+      (should (looking-back "\\.X" (line-beginning-position)))
+      (delete-char -1)
+      ;; an edition elsewhere, then the insertion
+      (undo-boundary)
+      (coq-insert-intros)
+      (save-excursion (goto-char (point-max)) (insert "(* end *)"))
+      (wait-for-coq)
+      (goto-char asked)
+      (should (looking-at "intros n\\."))
+      (should (string-suffix-p "(* end *)" (buffer-string)))
+      ;; undone in two steps, the insertion first
+      (undo-boundary)
+      (undo-start)
+      (undo-more 1)
+      (undo-more 1)
+      (goto-char asked)
+      (should-not (looking-at "intros"))
+      (should (string-suffix-p "(* end *)" (buffer-string)))
+      (undo-more 1)
+      (should-not (string-suffix-p "(* end *)" (buffer-string))))))
+
 (ert-deftest coq-eglot-query-result-stale ()
   "The answer of `coq-query-result' is dropped if the proof position
 moved before it came, or if the query is cancelled, like by a restart."
@@ -3402,6 +3436,23 @@ given by Coq, like in Proof General."
                "destruct l as \\[ *| *[[:alnum:]_']+ +[[:alnum:]_']+ *\\]\\."
                (line-end-position 2) t))
       (should (= (coq-eglot-position) position)))))
+
+(ert-deftest coq-eglot-insert-as-changed ()
+  "The \"as\" clause is not inserted if the command changed while waiting
+for Coq: replaced, or given an \"as\" clause."
+  (with-test-file
+    (goto-marker "as")
+    (run #'coq-eglot-goto-point)
+    (dolist (replacement '("exact I." "destruct l as [|a b]."))
+      (save-excursion
+        (coq-insert-as-in-next-command)
+        ;; before the answer
+        (search-forward "destruct l.")
+        (replace-match replacement t t)
+        (wait-for-coq)
+        (goto-char (match-beginning 0))
+        (should (looking-at (concat (regexp-quote replacement) "\n")))
+        (replace-match "destruct l.\n" t t)))))
 
 (ert-deftest coq-eglot-output-buffers-keys ()
   "The goals and response buffers have the common keys of the queries

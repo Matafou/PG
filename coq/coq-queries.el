@@ -69,28 +69,48 @@ See `coq-query-result-function'."
     (user-error "Coq: no backend to run queries in this buffer"))
   (funcall coq-query-result-function command callback))
 
-(defun coq-query-result-at (pos command fn)
+(defun coq-query-result-at (pos command fn &optional start end)
   "Run the query COMMAND, then call FN with its answer at POS.
 POS moves with the text until the answer comes, see
-`coq-query-result'.  If point did not move since, FN is called at point
-and may move it, as a command would; otherwise point stays where it
-is.  An error of FN is displayed as a message: it is not signaled to a
-command."
-  (let ((marker (copy-marker pos)))
+`coq-query-result'.  FN is not called if the text from START to END
+changed meanwhile, by default the empty text at POS: like if something
+was typed at POS.  An edition elsewhere does not matter.  If point did
+not move since, FN is called at point and may move it, as a command
+would; otherwise point stays where it is.  The changes of FN are undone
+on their own, not with those made before or after.  An error of FN is
+displayed as a message: it is not signaled to a command, and its
+changes are undone."
+  (let* ((start (or start pos))
+         (end (or end pos))
+         (empty (= start end))
+         (text (buffer-substring-no-properties start end))
+         (marker (copy-marker pos))
+         ;; outside of the target: what is typed just before or after a
+         ;; text is not in it, what is typed at an empty one is
+         (start-marker (copy-marker start (not empty)))
+         (end-marker (copy-marker end empty)))
     (coq-query-result
      command
      (lambda (output)
        (let ((buffer (marker-buffer marker)))
          (when buffer
            (with-current-buffer buffer
-             (condition-case err
-                 (if (= (point) marker)
-                     (funcall fn output)
-                   (save-excursion
-                     (goto-char marker)
-                     (funcall fn output)))
-               (error (message "%s" (error-message-string err))))
-             (set-marker marker nil))))))))
+             (if (not (equal (buffer-substring-no-properties
+                              start-marker end-marker)
+                             text))
+                 (message "Coq: the text changed, nothing inserted")
+               (undo-boundary)
+               (condition-case err
+                   (atomic-change-group
+                     (if (= (point) marker)
+                         (funcall fn output)
+                       (save-excursion
+                         (goto-char marker)
+                         (funcall fn output))))
+                 (error (message "%s" (error-message-string err))))
+               (undo-boundary))
+             (dolist (m (list marker start-marker end-marker))
+               (set-marker m nil)))))))))
 
 (defcustom coq-query-flags
   '(("All" . "Set Printing All")
@@ -601,7 +621,8 @@ Set by each backend, called without argument in the script buffer.")
 The next command is the one after the processed part of the script, see
 `coq-processed-end-function'.  It is run with the tactical infoH as a
 query, see `coq-query-result', which leaves the state of Coq unchanged.
-The clause is inserted before its final dot once Coq answers."
+The clause is inserted before its final dot once Coq answers, if the
+command did not change meanwhile."
   (interactive)
   (unless coq-processed-end-function
     (user-error "Coq: no backend to run the next command in this buffer"))
@@ -630,7 +651,9 @@ The clause is inserted before its final dot once Coq answers."
              (when (and substr (string-match-p "[^|[:space:]]" substr))
                ;; TODO: look for eqn:XX and go before it.
                (save-excursion
-                 (insert (concat " as [" substr "]")))))))))))
+                 (insert (concat " as [" substr "]"))))))
+         ;; not if the command changed meanwhile
+         pt (point))))))
 
 (defvar-local coq-show-at-point-function nil
   "Function showing the state of Coq at point, set by each backend, or nil.
