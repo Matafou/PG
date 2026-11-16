@@ -14,10 +14,10 @@
 ;; version of the document and the positions they are about, and the
 ;; interface, coq-eglot.el, which displays and runs the commands.
 ;;
-;; - The journal of the versions tells whether an event about an older
-;;   version is still valid: the text before the first position edited
-;;   since did not change.  coq-lsp applies the same rule, it does not
-;;   tell the client what it forgets.
+;; - The dates of the editions tell whether an event about an older
+;;   version is still valid: no edition before the end of what it is
+;;   about since that version.  coq-lsp applies the same rule, it does
+;;   not tell the client what it forgets.
 ;; - The known sentences: overlays on the processed sentences.
 ;; - The diagnostics: the last snapshot published by the server, on the
 ;;   part of the text where it is still valid.
@@ -29,10 +29,55 @@
 (require 'cl-lib)
 (require 'coq-eglot-lsp)                ; the structures of the events
 
-;;; Versions
+;;; Validity: the dates of the editions
 
-(defvar-local coq-eglot-session--diagnostics-version nil
-  "The version of the last snapshot of diagnostics accepted, or nil.")
+;; The question: an answer or a notification of the server is about
+;; version V of the document and about a part of it ending at X.  Is
+;; it still true of the current text?  It is if no edition was made at
+;; X or before since V: a sentence depends on all the text before it,
+;; and only on it (coq-lsp keeps the common prefix of two versions and
+;; checks again the rest).  An edition right at the end of a sentence
+;; counts: it may extend the sentence.
+;;
+;; A local clock dates the editions and the versions: it advances at
+;; each edition.  The date of V is the date of its text, the clock
+;; when V was the version of the buffer.  For a position X:
+;;
+;;   I(X) = date of the last edition at X or before, 0 if none
+;;
+;; and what was said about V up to X is valid iff I(X) <= date(V).
+;;
+;; I is constant by intervals and grows with X (the last edition at X
+;; or before is also at Y or before, for Y > X): it is kept as its
+;; points of change, `coq-eglot-session--points', positions increasing
+;; with the dates.  An edition at P, at date D:
+;;
+;; 1. removes the points at P or after: for X >= P, I(X) is now D, the
+;;    latest date, whatever they said;
+;; 2. adds the point (P . D).
+;;
+;; The positions of the points stay right without markers: an edition
+;; at P moves only the text after P, where no point is left.  Each
+;; point is added once and removed at most once.
+;;
+;; Merging the editions of a sentence: two points (P1 . D1) and
+;; (P2 . D2) in the same sentence, P1 < P2, become (P1 . D2), the
+;; latest date wins.  It is safe: only I(X) for X between P1 and P2
+;; changes, to a later date, which makes fewer answers valid, never
+;; more.  And it is exact at the ends of sentences, where the answers
+;; mostly are (no end of sentence between P1 and P2): typing in a
+;; sentence makes one point, not one per character.  If the guess of
+;; the sentence is wrong, merging stays safe.
+;;
+;; The versions: Eglot gives a version to the text when it sends the
+;; changes, several editions may be in one version (since Emacs 30).
+;; The exact time does not matter: before an edition, the version of
+;; the buffer is still the one of the text before it, it gets the date
+;; of now if it has none yet (`coq-eglot-session--before-change').  A
+;; version newer than all those dated was not edited since: valid
+;; everywhere.  A version between two dated ones never was the version
+;; of the buffer at an edition, it gets the date of the older one,
+;; which can only make it less valid.
 
 (defvar-local coq-eglot-session-version-function nil
   "Function returning the version of the document the server knows.
@@ -40,72 +85,96 @@ Called without argument in the script buffer, see
 `coq-eglot-lsp-version'.  A version changes only when the changes of
 the buffer are sent, several editions may be in one version.")
 
-(defvar-local coq-eglot-session--journal nil
-  "The versions edited since they were sent, the most recent first.
-Each element is (VERSION . EDITED): EDITED is the smallest position
-edited since the text of VERSION was sent.  A version without element,
-more recent than the first one, was not edited since.  See
-`coq-eglot-session-valid-p'.")
+(defvar-local coq-eglot-session--clock 0
+  "The local clock: the date of the last edition.")
 
-(defvar-local coq-eglot-session--floor 0
-  "The versions before this one are forgotten: nothing about them is valid.")
+(defvar-local coq-eglot-session--points nil
+  "The points of change of I, the last one first.
+Each element is (POS . DATE): the last edition at POS or before has
+DATE, until the next point.  The positions and the dates decrease
+along the list.  See the comment above.")
 
-(defconst coq-eglot-session--journal-size 50
-  "Number of versions kept in `coq-eglot-session--journal'.")
+(defvar-local coq-eglot-session--dates nil
+  "The dates of the versions, the most recent version first.
+Each element is (VERSION . DATE).")
+
+(defvar-local coq-eglot-session--diagnostics-version nil
+  "The version of the last snapshot of diagnostics accepted, or nil.")
+
+(defvar-local coq-eglot-session-sentence-end-function nil
+  "Function guessing the end of the sentence at a position.
+Called with a position, it returns the end of the sentence containing
+it, or starting at it.  Also used to merge the editions of a sentence,
+see the comment above.")
 
 (defun coq-eglot-session--version ()
   "The version of the document the server knows."
   (funcall coq-eglot-session-version-function))
 
+(defun coq-eglot-session--same-sentence-p (pos1 pos2)
+  "Non-nil if POS1 and POS2 are in the same sentence, POS1 < POS2.
+Guessed: no end of sentence between them.  Nil if there is no way to
+guess."
+  (and coq-eglot-session-sentence-end-function
+       (>= (funcall coq-eglot-session-sentence-end-function pos1) pos2)))
+
 (defun coq-eglot-session--before-change (beg _end)
-  "Record an edition at BEG in the journal of the versions.
-Before the change: the version is still the one of the text before it."
+  "Date the edition at BEG, see the comment above.
+Before the change: the version is still the one of the text before it,
+and the positions before BEG do not move."
   (let ((version (coq-eglot-session--version)))
-    (unless (eql (caar coq-eglot-session--journal) version)
-      (push (cons version beg) coq-eglot-session--journal))
-    (dolist (entry coq-eglot-session--journal)
-      (setcdr entry (min (cdr entry) beg))))
-  ;; nothing is valid about these versions any more
-  (let ((kept (cl-loop for entry in coq-eglot-session--journal
-                       for i from 1
-                       while (and (> (cdr entry) (point-min))
-                                  (<= i coq-eglot-session--journal-size))
-                       collect entry)))
-    (when (< (length kept) (length coq-eglot-session--journal))
-      (setq coq-eglot-session--floor
-            (1+ (car (nth (length kept) coq-eglot-session--journal))))
-      (setq coq-eglot-session--journal kept)))
+    ;; the text of VERSION is the one before this edition
+    (unless (assoc version coq-eglot-session--dates)
+      (push (cons version coq-eglot-session--clock) coq-eglot-session--dates)))
+  (let ((date (cl-incf coq-eglot-session--clock)))
+    ;; 1. the points at BEG or after are covered by this edition
+    (while (and coq-eglot-session--points
+                (>= (caar coq-eglot-session--points) beg))
+      (pop coq-eglot-session--points))
+    ;; 2. the point of this edition, merged with the previous one if in
+    ;; the same sentence: the latest date wins
+    (let ((last (car coq-eglot-session--points)))
+      (if (and last (coq-eglot-session--same-sentence-p (car last) beg))
+          (setcdr last date)
+        (push (cons beg date) coq-eglot-session--points))))
   (coq-eglot-session--forget-diagnostics beg))
 
-(defun coq-eglot-session-edited (version)
-  "The smallest position edited since the text of VERSION was sent.
-Nil if not edited since, 0 if VERSION is forgotten."
-  (cond
-   ((< version coq-eglot-session--floor) 0)
-   (t
-    ;; the oldest version recorded since VERSION: its editions are
-    ;; after VERSION
-    (let ((edited nil))
-      (dolist (entry coq-eglot-session--journal)
-        (when (>= (car entry) version)
-          (setq edited (cdr entry))))
-      edited))))
+(defun coq-eglot-session--edited (pos)
+  "I(POS): the date of the last edition at POS or before, 0 if none."
+  (let ((points coq-eglot-session--points))
+    (while (and points (> (caar points) pos))
+      (pop points))
+    (if points (cdar points) 0)))
+
+(defun coq-eglot-session--date (version)
+  "The date of the text of VERSION, see the comment above.
+The clock if newer than all the dated versions: not edited since."
+  (let ((dates coq-eglot-session--dates))
+    (cond
+     ((or (null dates) (> version (caar dates))) coq-eglot-session--clock)
+     (t
+      ;; the most recent dated version not newer than VERSION
+      (while (and dates (> (caar dates) version))
+        (pop dates))
+      ;; older than all the dated ones: nothing is valid
+      (if dates (cdar dates) -1)))))
 
 (defun coq-eglot-session-valid-p (version pos)
-  "Non-nil if what the server said about VERSION before POS is still valid.
-The text before POS did not change since VERSION: POS is before the
-first position edited since.  POS is a position of the current text:
-positions of VERSION before the first edition are the same, those
-after it stay after it once converted, see coq-eglot-lsp.el."
-  (let ((edited (and version (coq-eglot-session-edited version))))
-    (and version (or (null edited) (< pos edited)))))
+  "Non-nil if what the server said about VERSION up to POS is still valid.
+No edition at POS or before since VERSION, see the comment above.  POS
+is a position of the current text: the positions of VERSION before the
+first edition are the same, those after it stay after it once
+converted, see coq-eglot-lsp.el."
+  (and version
+       (<= (coq-eglot-session--edited pos)
+           (coq-eglot-session--date version))))
 
 (defun coq-eglot-session-reset ()
-  "Forget the journal of the versions: the server opens the document again.
+  "Forget the dates of the versions: the server opens the document again.
 Its versions start again from 0: the diagnostics kept stay, but the
-next snapshot replaces them whatever its version."
-  (setq coq-eglot-session--journal nil
-        coq-eglot-session--floor 0
+next snapshot replaces them whatever its version.  The dates of the
+editions stay, they are about the text."
+  (setq coq-eglot-session--dates nil
         coq-eglot-session--diagnostics-version nil))
 
 ;;; The known sentences
@@ -245,8 +314,6 @@ An object identifying it: what arrives for another one is ignored.")
   "Function returning the start of the first sentence after a position.
 Called with the position, it returns nil if there is none.")
 
-(defvar-local coq-eglot-session-sentence-end-function nil
-  "Function guessing the end of the sentence starting at a position.")
 
 (defun coq-eglot-session-target ()
   "The target, or nil if the user asked nothing."
@@ -334,6 +401,7 @@ VERSION-FUNCTION gives the version the server knows, see
   (remove-hook 'before-change-functions #'coq-eglot-session--before-change t)
   (coq-eglot-session-forget-sentences (1- (point-min)))
   (coq-eglot-session-stop-work)
+  (setq coq-eglot-session--points nil)
   (setq coq-eglot-session--diagnostics nil
         coq-eglot-session--diagnostics-version nil)
   (coq-eglot-session-reset))

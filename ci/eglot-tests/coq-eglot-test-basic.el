@@ -3736,20 +3736,24 @@ position edited since, the smallest one if several editions."
     (should-not (coq-eglot-session-valid-p 2 20))
     (should-not (coq-eglot-session-valid-p 1 20))
     (should (coq-eglot-session-valid-p 1 9))
-    ;; a version never edited, between two recorded ones, has the text
-    ;; of the next one: it counts its editions
+    ;; a version never dated, between two dated ones, gets the date of
+    ;; the older one: less valid, never more
     (setq test-version 4)
     (edit-at 60)
-    (should (coq-eglot-session-valid-p 3 20))
-    (should-not (coq-eglot-session-valid-p 3 60))
+    (should-not (coq-eglot-session-valid-p 3 20))
+    (should (coq-eglot-session-valid-p 3 9))
+    (should (coq-eglot-session-valid-p 4 59))
+    (should-not (coq-eglot-session-valid-p 4 60))
+    ;; a version newer than all the dated ones was not edited since
+    (should (coq-eglot-session-valid-p 5 90))
     (should (coq-eglot-session-valid-p 4 59))
     (should-not (coq-eglot-session-valid-p 4 60))
     ;; no version: nothing valid
     (should-not (coq-eglot-session-valid-p nil 1))))
 
-(ert-deftest coq-eglot-session-forgotten-versions ()
-  "An edition at the beginning makes the versions before useless: they are
-forgotten, nothing about them is valid, even later."
+(ert-deftest coq-eglot-session-edition-at-beginning ()
+  "An edition at the beginning makes nothing valid about the versions
+before it, even what was before other editions."
   (with-session (make-string 100 ?a)
     (edit-at 30)
     (setq test-version 2)
@@ -3759,11 +3763,49 @@ forgotten, nothing about them is valid, even later."
     (should-not (coq-eglot-session-valid-p 1 1))
     (should-not (coq-eglot-session-valid-p 2 1))
     (should (coq-eglot-session-valid-p 3 49))
-    (should (= (length coq-eglot-session--journal) 1))
+    (should-not (coq-eglot-session-valid-p 3 50))
+    ;; an edition at the beginning covers all the points after it
+    (should (= (length coq-eglot-session--points) 2))
     ;; the server opens the document again: versions from 0
     (coq-eglot-session-reset)
     (setq test-version 0)
     (should (coq-eglot-session-valid-p 0 90))))
+
+(ert-deftest coq-eglot-session-merged-editions ()
+  "The editions in the same sentence are one point, the latest date wins:
+typing a sentence does not make one point per character.  Exact at the
+ends of sentences."
+  (with-session "Lemma a : True. Proof. idtac. Qed."
+    (setq coq-eglot-session-sentence-end-function
+          (lambda (pos)
+            (save-excursion (goto-char pos)
+                            (if (search-forward "." nil t) (point)
+                              (point-max)))))
+    (let ((proof-end (save-excursion (goto-char (point-min))
+                                     (search-forward "Proof.")
+                                     (point))))
+      ;; typing in "idtac."
+      (dolist (offset '(1 2 3 4))
+        (edit-at (+ proof-end offset)))
+      (should (= (length coq-eglot-session--points) 1))
+      ;; the sentences before are still valid, not the edited one
+      (should (coq-eglot-session-valid-p 1 proof-end))
+      (should-not (coq-eglot-session-valid-p 1 (+ proof-end 10)))
+      ;; after the merge, still valid up to the end of Proof.
+      (setq test-version 2)
+      (edit-at (+ proof-end 8))
+      (should (= (length coq-eglot-session--points) 1))
+      (should (coq-eglot-session-valid-p 2 proof-end))
+      (should-not (coq-eglot-session-valid-p 2 (+ proof-end 10)))
+      ;; an edition in another sentence is another point
+      (edit-at 3)
+      (should (= (length coq-eglot-session--points) 1))
+      (setq test-version 3)
+      (let ((last (- (point-max) 1)))
+        (edit-at last)
+        (should (= (length coq-eglot-session--points) 2))
+        (should (coq-eglot-session-valid-p 3 (1- last)))
+        (should-not (coq-eglot-session-valid-p 3 last))))))
 
 (defun diagnostic (start end &optional severity)
   "A diagnostic from START to END, an error by default."
