@@ -761,37 +761,13 @@ See `coq-eglot-lsp--with-hyp-sorts'."
      (list :goals (coq-eglot-lsp-answer-goals answer)) messages))
   answer)
 
-(defun coq-eglot-lsp-goals (pos &optional no-sorts)
-  "Ask the goals after the sentence at buffer position POS.
-Return a `coq-eglot-lsp-answer', or nil if the server answered nothing.
-The first goal has the sorts of its hypotheses if needed, see
-`coq-eglot-lsp-hyp-sorts-function', unless NO-SORTS is non-nil: the
-goals will not be displayed."
-  (let* ((width (coq-eglot-lsp--printing-width))
-         (flags (coq-eglot-lsp--printing-flags))
-         (raw (coq-eglot-lsp-request
-               :proof/goals (coq-eglot-lsp--goals-params pos width flags)))
-         (context (coq-eglot-lsp--make-context :proof/goals pos)))
-    (setf (coq-eglot-lsp-context-version context) eglot--versioned-identifier)
-    (let ((answer (coq-eglot-lsp--answer raw context width flags)))
-      (if (and answer
-               (not no-sorts)
-               (coq-eglot-lsp--hyp-sorts-p)
-               (> (length (plist-get (coq-eglot-lsp-answer-goals answer)
-                                     :goals))
-                  0))
-          (coq-eglot-lsp--with-hyp-sorts-answer
-           answer
-           (condition-case nil
-               (coq-eglot-lsp-query pos coq-eglot-lsp--hyp-sorts-command)
-             (error nil)))
-        answer))))
-
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
-ON-SUCCESS is called with a `coq-eglot-lsp-answer', or nil, ON-ERROR
-with a `coq-eglot-lsp-failure'.  See `coq-eglot-lsp-goals' and
-`coq-eglot-lsp--async-request'.  Return the context of the request."
+ON-SUCCESS is called with a `coq-eglot-lsp-answer', or nil if the
+server answered nothing, ON-ERROR with a `coq-eglot-lsp-failure'.  The
+first goal has the sorts of its hypotheses if needed, see
+`coq-eglot-lsp-hyp-sorts-function'.  See `coq-eglot-lsp--async-request'.
+Return the context of the request."
   (let* ((width (coq-eglot-lsp--printing-width))
          (flags (coq-eglot-lsp--printing-flags))
          ;; with the sorts: the answer of the goals and the messages of

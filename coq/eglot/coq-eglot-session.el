@@ -101,6 +101,8 @@ Each element is (VERSION . DATE).")
 (defvar-local coq-eglot-session--diagnostics-version nil
   "The version of the last snapshot of diagnostics accepted, or nil.")
 
+(defvar coq-eglot-session--requests)   ; see "Requests in flight"
+
 (defvar-local coq-eglot-session-sentence-end-function nil
   "Function guessing the end of the sentence at a position.
 Called with a position, it returns the end of the sentence containing
@@ -137,7 +139,14 @@ and the positions before BEG do not move."
       (if (and last (coq-eglot-session--same-sentence-p (car last) beg))
           (setcdr last date)
         (push (cons beg date) coq-eglot-session--points))))
-  (coq-eglot-session--forget-diagnostics beg))
+  (coq-eglot-session--forget-diagnostics beg)
+  ;; the requests about a position at BEG or after: their answers would
+  ;; not be valid, and the position now designates another text
+  (setq coq-eglot-session--requests
+        (seq-remove (lambda (entry)
+                      (and (consp (car entry)) (numberp (cdar entry))
+                           (>= (cdar entry) beg)))
+                    coq-eglot-session--requests)))
 
 (defun coq-eglot-session--edited (pos)
   "I(POS): the date of the last edition at POS or before, 0 if none."
@@ -211,6 +220,10 @@ or nil, see `coq-eglot-session-set-sentence-answer'."
     (overlay-put sentence 'coq-eglot-sentence t)
     (coq-eglot-session-set-sentence-answer sentence answer)
     (push sentence coq-eglot-session--sentences)
+    ;; the goals are kept for the proof position and the sentence
+    ;; before, to move back one sentence at once; the messages for all
+    (let ((older (nth 2 coq-eglot-session--sentences)))
+      (when older (overlay-put older 'coq-eglot-answer nil)))
     sentence))
 
 (defun coq-eglot-session-sentence-start (sentence)
@@ -220,7 +233,8 @@ or nil, see `coq-eglot-session-set-sentence-answer'."
 
 (defun coq-eglot-session-sentence-answer (sentence)
   "The answer of the server with the goals after SENTENCE, or nil.
-SENTENCE is an overlay of the known sentences."
+SENTENCE is an overlay of the known sentences.  Kept only for the last
+two sentences, see `coq-eglot-session-add-sentence'."
   (overlay-get sentence 'coq-eglot-answer))
 
 (defun coq-eglot-session-set-sentence-answer (sentence answer)
@@ -232,7 +246,15 @@ end of the sentence, while the start is unknown."
         (bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
     (when (and bounds (= (cdr bounds) end) (< (car bounds) end))
       (move-overlay sentence (car bounds) end)))
-  (overlay-put sentence 'coq-eglot-answer answer))
+  (overlay-put sentence 'coq-eglot-answer answer)
+  (when answer
+    (overlay-put sentence 'coq-eglot-messages
+                 (coq-eglot-lsp-answer-messages answer))))
+
+(defun coq-eglot-session-sentence-messages (sentence)
+  "The messages of SENTENCE, a list of `coq-eglot-lsp-message'.
+Kept when its goals are not, see `coq-eglot-session-add-sentence'."
+  (overlay-get sentence 'coq-eglot-messages))
 
 (defun coq-eglot-session-sentence-ending-at (end)
   "The overlay of the known processed sentence ending at END, or nil."
@@ -294,6 +316,17 @@ Among the valid diagnostics, nil if none."
           (setq first (cons beg (coq-eglot-lsp-diagnostic-end diag))))))
     first))
 
+;;; Changes of the state
+
+(defvar coq-eglot-session-state-hook nil
+  "Hook run in a script buffer when its session may stop or start waiting.
+A target set or reached, an operation or a request starting or ending:
+see `coq-eglot-session-settled-p'.")
+
+(defun coq-eglot-session--changed ()
+  "Run `coq-eglot-session-state-hook'."
+  (run-hooks 'coq-eglot-session-state-hook))
+
 ;;; Target and work
 
 ;; The target T is where the user asked to go: the sentences up to the
@@ -328,7 +361,8 @@ Called with the position, it returns nil if there is none.")
         (setq coq-eglot-session--target nil))
     (if coq-eglot-session--target
         (set-marker coq-eglot-session--target pos)
-      (setq coq-eglot-session--target (copy-marker pos)))))
+      (setq coq-eglot-session--target (copy-marker pos))))
+  (coq-eglot-session--changed))
 
 (defun coq-eglot-session-target-end ()
   "The end of the part to process: the end of the sentence before the target.
@@ -344,7 +378,8 @@ Guessed, for the display.  Nil if the user asked nothing."
 
 (defun coq-eglot-session-start-work ()
   "Note that an operation starts to move the proof position, return it."
-  (setq coq-eglot-session--work (list 'work)))
+  (prog1 (setq coq-eglot-session--work (list 'work))
+    (coq-eglot-session--changed)))
 
 (defun coq-eglot-session-work-p (work)
   "Non-nil if WORK, an operation, is still the running one."
@@ -357,12 +392,14 @@ Guessed, for the display.  Nil if the user asked nothing."
 (defun coq-eglot-session-finish-work (work)
   "Note that WORK, an operation, is finished, if still the running one."
   (when (coq-eglot-session-work-p work)
-    (setq coq-eglot-session--work nil)))
+    (setq coq-eglot-session--work nil)
+    (coq-eglot-session--changed)))
 
 (defun coq-eglot-session-stop-work ()
   "Forget the target and the running operation: nothing to do any more."
   (coq-eglot-session-set-target nil)
-  (setq coq-eglot-session--work nil))
+  (setq coq-eglot-session--work nil)
+  (coq-eglot-session--changed))
 
 (defun coq-eglot-session-next-action ()
   "The next operation to move the proof position toward the target, or nil.
@@ -386,6 +423,67 @@ character before TARGET."
       (list 'step start))
      (t (list 'check start target)))))
 
+;;; Requests in flight
+
+;; The requests sent and not answered yet, besides the operation that
+;; moves the proof position: the goals at a position, for instance.
+;; One per key: asking again what is already asked waits for the same
+;; answer, see `coq-eglot-session-ask'.  Who asked is not kept, only
+;; what to do with the answer.
+
+(defvar-local coq-eglot-session--requests nil
+  "The requests in flight, a list of (KEY . CALLBACKS).
+KEY says what is asked, like (goals . POS).  CALLBACKS are called with
+the answer, in the order they asked.")
+
+(defun coq-eglot-session-ask (key callback send)
+  "Ask KEY, call CALLBACK with the answer.
+If KEY is not asked yet, call SEND with a function to call with the
+answer, or with nil if the request failed: SEND sends the request.
+Otherwise CALLBACK waits for the same answer."
+  (let ((entry (assoc key coq-eglot-session--requests)))
+    (if entry
+        (setcdr entry (append (cdr entry) (list callback)))
+      (push (list key callback) coq-eglot-session--requests)
+      (coq-eglot-session--changed)
+      (let ((buffer (current-buffer)))
+        (condition-case err
+            (funcall send
+                     (lambda (answer)
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (coq-eglot-session--answered key answer)))))
+          (error (coq-eglot-session--answered key nil)
+                 (signal (car err) (cdr err))))))))
+
+(defun coq-eglot-session--answered (key answer)
+  "KEY was answered with ANSWER: call its callbacks, it is no longer asked."
+  (let ((entry (assoc key coq-eglot-session--requests)))
+    (when entry
+      (setq coq-eglot-session--requests
+            (delq entry coq-eglot-session--requests))
+      (coq-eglot-session--changed)
+      (dolist (callback (cdr entry))
+        (funcall callback answer)))))
+
+(defun coq-eglot-session-asked-p (&optional key)
+  "Non-nil if KEY is asked, or any request if KEY is nil."
+  (if key (and (assoc key coq-eglot-session--requests) t)
+    (and coq-eglot-session--requests t)))
+
+(defun coq-eglot-session-forget-requests ()
+  "Forget the requests in flight: their answers will be ignored.
+After a cancellation, or when the server stops."
+  (setq coq-eglot-session--requests nil)
+  (coq-eglot-session--changed))
+
+(defun coq-eglot-session-settled-p ()
+  "Non-nil if the session is at rest: nothing asked, nothing to do.
+No target, no operation running, no request in flight."
+  (not (or (coq-eglot-session-target)
+           coq-eglot-session--work
+           coq-eglot-session--requests)))
+
 ;;; Start and stop
 
 (defun coq-eglot-session-start (version-function)
@@ -401,6 +499,7 @@ VERSION-FUNCTION gives the version the server knows, see
   (remove-hook 'before-change-functions #'coq-eglot-session--before-change t)
   (coq-eglot-session-forget-sentences (1- (point-min)))
   (coq-eglot-session-stop-work)
+  (coq-eglot-session-forget-requests)
   (setq coq-eglot-session--points nil)
   (setq coq-eglot-session--diagnostics nil
         coq-eglot-session--diagnostics-version nil)

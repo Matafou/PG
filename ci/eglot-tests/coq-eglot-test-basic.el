@@ -59,8 +59,9 @@
     (= (point) (coq-eglot-position))))
 
 (defun wait-for-coq ()
-  "Wait until the running check is finished."
-  (while (coq-eglot-checking-p)
+  "Wait until the current buffer is at rest: no check, no request.
+See `coq-eglot-busy-p'."
+  (while (coq-eglot-busy-p)
     (accept-process-output nil 0.02)))
 
 (defun run (command)
@@ -2194,10 +2195,7 @@ Typing right at the proof position does not move it."
 (defun count-goals-requests (fn)
   "Call FN, return the number of goals requests sent meanwhile."
   (let ((requests 0))
-    (cl-letf* ((ask (symbol-function 'coq-eglot-lsp-goals))
-               (ask-async (symbol-function 'coq-eglot-lsp-goals-async))
-               ((symbol-function 'coq-eglot-lsp-goals)
-                (lambda (pos) (cl-incf requests) (funcall ask pos)))
+    (cl-letf* ((ask-async (symbol-function 'coq-eglot-lsp-goals-async))
                ((symbol-function 'coq-eglot-lsp-goals-async)
                 (lambda (&rest args) (cl-incf requests) (apply ask-async args))))
       (funcall fn))
@@ -2539,9 +2537,11 @@ position before it, instead of going back to the beginning."
       ;; the answer kept for the position is forgotten, the server
       ;; answers without the range of the sentence
       (coq-eglot-session-set-sentence-answer (coq-eglot-session-last-sentence) nil)
-      (cl-letf (((symbol-function 'coq-eglot-lsp-goals)
-                 (lambda (&rest _) (coq-eglot-lsp-make-answer))))
-        (coq-eglot--fail start (point-max) "Error." nil))
+      (cl-letf (((symbol-function 'coq-eglot-lsp-goals-async)
+                 (lambda (_pos on-success _on-error)
+                   (run-at-time 0 nil on-success (coq-eglot-lsp-make-answer)))))
+        (coq-eglot--fail start (point-max) "Error.")
+        (wait-for-coq))
       (should (= (coq-eglot-position) position)))))
 
 (ert-deftest coq-eglot-memprof-versions ()
@@ -3074,6 +3074,7 @@ window, for this query only."
       (should (string-match-p "\\b78\\b" (query #'coq-eglot-run-query
                                                 "Test Printing Width")))
       (coq-eglot--goals-at-position t)
+      (wait-for-coq)
       (should (string-match-p "^  aaaaaaaa \\+ bbbbbbbbb \\* cccccccccc \\+ dddddddddd =$"
                               (buffer-text "*goals*"))))))
 
@@ -3296,10 +3297,13 @@ goal number."
       (goto-marker "hello")
       (search-backward "idtac")
       (call-interactively #'coq-Show)
+      ;; displayed when the answer comes
+      (wait-for-coq)
       (should (equal (buffer-text "*response*") "hello"))
       (should (string-match-p "^ *double n = n \\+ n$" (buffer-text "*goals*")))
       (search-backward "intros n")
       (call-interactively #'coq-Show)
+      (wait-for-coq)
       (should (string-match-p "^ *double n = n \\+ n /\\\\ True$"
                               (buffer-text "*goals*")))
       ;; the proof position does not move
@@ -3680,6 +3684,86 @@ With buffer positions for the sentence and messages with severities."
                  (coq-eglot-lsp--diagnostic
                   (list :range (lsp-range 0 0 0 5) :severity 2
                         :message "Warning."))))))
+
+;; Never waiting for the server
+
+(ert-deftest coq-eglot-no-synchronous-request ()
+  "Moving forward and back, failing, showing the goals: no command waits
+for the server."
+  (with-test-file
+    (cl-letf (((symbol-function 'coq-eglot-lsp-request)
+               (lambda (&rest _) (error "Synchronous request"))))
+      (goto-marker "split")
+      (run #'coq-eglot-goto-point)
+      (should (position-at-marker-p "split"))
+      (run #'coq-eglot-undo-last-command)
+      (goto-marker "definition")
+      (run #'coq-eglot-goto-point)
+      (should (position-at-marker-p "definition"))
+      ;; up to the error
+      (goto-marker "error")
+      (run #'coq-eglot-goto-point)
+      (should (position-at-marker-p "before error"))
+      (run #'coq-eglot-show-goals)
+      (should (string-match-p "1 goal" (buffer-text "*goals*")))
+      (run #'coq-eglot-retract-buffer)
+      (run #'coq-eglot-assert-next-command)
+      (should (position-at-marker-p "definition")))))
+
+(ert-deftest coq-eglot-move-back-at-once ()
+  "Moving back moves the proof position at once, to the last known
+sentence; the server says later where the sentence before is."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (let ((before (coq-eglot-position)))
+      (goto-marker "statement")
+      (coq-eglot-goto-point)
+      ;; at once, before any answer
+      (should (< (coq-eglot-position) before))
+      (wait-for-coq)
+      (should (position-at-marker-p "statement")))))
+
+(ert-deftest coq-eglot-goals-kept-two-sentences ()
+  "The goals are kept for the proof position and the sentence before,
+the messages for all the sentences."
+  (with-test-file
+    (dotimes (_ 4) (run #'coq-eglot-assert-next-command))
+    (let ((sentences (coq-eglot-session-sentences)))
+      (should (= (length sentences) 4))
+      (should (equal (mapcar (lambda (sentence)
+                               (and (coq-eglot-session-sentence-answer sentence)
+                                    t))
+                             sentences)
+                     '(t t nil nil)))
+      ;; the message of the definition, the oldest one
+      (should (equal (mapcar #'coq-eglot-lsp-message-text
+                             (coq-eglot-session-sentence-messages
+                              (car (last sentences))))
+                     '("double is defined"))))))
+
+(ert-deftest coq-eglot-position-hook-on-change ()
+  "The position hook runs when what the overlays display changes, not
+when they are updated again with nothing new."
+  (with-test-file
+    (run #'coq-eglot-assert-next-command)
+    (let ((ran 0))
+      (add-hook 'coq-eglot-position-hook (lambda () (cl-incf ran)) nil t)
+      (coq-eglot--update-overlays)
+      (coq-eglot--update-overlays)
+      (should (= ran 0))
+      (run #'coq-eglot-assert-next-command)
+      (should (> ran 0)))))
+
+(ert-deftest coq-eglot-busy-indicator ()
+  "The mode line shows an ellipsis while the buffer waits for the server."
+  (with-file "eglot_slow.v"
+    (force-new-check)
+    (should-not (string-search "…" (coq-eglot--lighter)))
+    (coq-eglot-process-buffer)
+    (should (string-search "…" (coq-eglot--lighter)))
+    (wait-for-coq)
+    (should-not (string-search "…" (coq-eglot--lighter)))))
 
 ;; The session, with the server
 
