@@ -2104,7 +2104,8 @@ checks of all the buffers of the server stop."
   (coq-eglot--with-script
     (coq-eglot--cancel)
     (coq-eglot--forget-checks (cons (current-buffer) (coq-eglot-lsp-shutdown)))
-    (coq-eglot-lsp-ensure-server)
+    ;; without waiting: the goals are asked once it is connected
+    (coq-eglot-lsp-connect)
     (coq-eglot--goals-at-position-async)
     (message "Coq: server restarted")))
 
@@ -2384,7 +2385,8 @@ A check runs, a request is in flight, or an interruption is not
 answered yet: the opposite of at rest, see
 `coq-eglot-session-settled-p'."
   (or (not (coq-eglot-session-settled-p))
-      coq-eglot--interrupting))
+      coq-eglot--interrupting
+      (coq-eglot-lsp-connecting-p)))
 
 (defun coq-eglot-checking-p ()
   "Non-nil if the server checks a part of the current script buffer.
@@ -2737,7 +2739,10 @@ ellipsis while the buffer waits for the server, see `coq-eglot-busy-p'."
         (format "[%s]" coq-eglot--twin-label))
    ;; waiting for the server
    (and (coq-eglot-busy-p)
-        (propertize "…" 'help-echo "Waiting for the Coq server"))))
+        (propertize "…" 'help-echo
+                    (if (coq-eglot-lsp-connecting-p)
+                        "Starting the Coq server"
+                      "Waiting for the Coq server")))))
 
 (define-minor-mode coq-eglot-mode
   "Interaction with Coq through a language server, like Proof General.

@@ -436,12 +436,6 @@ Return the buffers it managed."
         (ignore-errors (eglot-shutdown server nil 0.3 t))
         buffers))))
 
-(defun coq-eglot-lsp-restart ()
-  "Restart the server of the current buffer, even if it is busy.
-The new server knows nothing: it checks again on demand."
-  (coq-eglot-lsp-shutdown)
-  (coq-eglot-lsp-ensure-server))
-
 ;;; Events
 
 ;; The answers and notifications of the server, normalized: the rest of
@@ -599,21 +593,78 @@ stops waiting."
     (jsonrpc-request (coq-eglot-lsp--server-for-request) method params
                      :timeout nil)))
 
+(defvar-local coq-eglot-lsp--waiting nil
+  "Functions waiting for the server of the buffer to be connected.
+Each one is called with the server once connected, or with nil if the
+connection failed, see `coq-eglot-lsp--when-connected'.  The last one
+first.")
+
+(defvar-local coq-eglot-lsp--waiting-timer nil
+  "Timer watching the connection of the server, see `coq-eglot-lsp--waiting'.")
+
+(defun coq-eglot-lsp-connect ()
+  "Start the Coq server of the current buffer if needed, without waiting.
+Return it if connected, nil if it is still connecting.  Signal an error
+if it cannot be started, like without program: see
+`coq-eglot-lsp-ensure-server'."
+  (or (coq-eglot-lsp-ensure-server t)
+      (and (null (coq-eglot-lsp-connecting-servers))
+           (user-error "No Coq language server for this buffer"))))
+
+(defun coq-eglot-lsp-connecting-p ()
+  "Non-nil if requests of the buffer wait for its server to connect."
+  (and coq-eglot-lsp--waiting t))
+
+(defun coq-eglot-lsp--when-connected (fn)
+  "Call FN with the server of the buffer, once connected.
+Right now if it is connected.  Otherwise start the connection without
+waiting, see `coq-eglot-lsp-connect', and call FN in the buffer when
+connected; with nil if the connection fails, or takes more than
+`eglot-connect-timeout' seconds."
+  (let ((server (coq-eglot-lsp-connect)))
+    (if server
+        (funcall fn server)
+      (push fn coq-eglot-lsp--waiting)
+      (unless coq-eglot-lsp--waiting-timer
+        (setq coq-eglot-lsp--waiting-timer
+              (run-at-time 0.05 nil #'coq-eglot-lsp--watch-connection
+                           (current-buffer) (float-time)))))))
+
+(defun coq-eglot-lsp--watch-connection (buffer start)
+  "Watch the connection of the server of BUFFER, asked at time START.
+Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq coq-eglot-lsp--waiting-timer nil)
+      (let ((server (coq-eglot-lsp-current-server)))
+        (if (and (null server)
+                 (coq-eglot-lsp-connecting-servers)
+                 (< (- (float-time) start) (or eglot-connect-timeout 30)))
+            ;; still connecting
+            (setq coq-eglot-lsp--waiting-timer
+                  (run-at-time 0.05 nil #'coq-eglot-lsp--watch-connection
+                               buffer start))
+          (let ((waiting (reverse coq-eglot-lsp--waiting)))
+            (setq coq-eglot-lsp--waiting nil)
+            (dolist (fn waiting)
+              (with-current-buffer buffer
+                (funcall fn server)))))))))
+
 (defun coq-eglot-lsp--async-request (pos method params on-success on-error)
   "Send request METHOD at POS with PARAMS to the server of the buffer.
-Pending changes of the buffer are sent first.  Return immediately its
-`coq-eglot-lsp-context'.  ON-SUCCESS is called with the answer and the
-context, ON-ERROR with a `coq-eglot-lsp-failure', in the current buffer
-if still live.  PARAMS is a function returning the parameters, called
-after the changes are sent.  ON-SUCCESS and ON-ERROR are called from a
-timer, not from the process filter, so that they can send synchronous
-requests.  Not while waiting for the
-answer to a synchronous request, maybe to another server: when it
-comes, `jsonrpc-request' would leave theirs, and them, unfinished."
-  (let* ((server (coq-eglot-lsp--server-for-request))
-         (buffer (current-buffer))
-         (context (coq-eglot-lsp--make-context method pos)))
-    (setf (coq-eglot-lsp-context-version context) eglot--versioned-identifier)
+Without waiting, even for the server to connect, see
+`coq-eglot-lsp--when-connected'.  Pending changes of the buffer are sent
+first.  Return immediately its `coq-eglot-lsp-context'.  ON-SUCCESS is
+called with the answer and the context, ON-ERROR with a
+`coq-eglot-lsp-failure', in the current buffer if still live: also if
+the server does not connect.  PARAMS is a function returning the
+parameters, called after the changes are sent.  ON-SUCCESS and
+ON-ERROR are called from a timer, not from the process filter, so that
+they can send synchronous requests.  Not while waiting for the answer
+to a synchronous request, maybe to another server: when it comes,
+`jsonrpc-request' would leave theirs, and them, unfinished."
+  (let ((buffer (current-buffer))
+        (context (coq-eglot-lsp--make-context method pos)))
     (cl-labels ((run (fn arg)
                   (cond
                    ((not (buffer-live-p buffer)))
@@ -622,17 +673,27 @@ comes, `jsonrpc-request' would leave theirs, and them, unfinished."
                    (t (with-current-buffer buffer (funcall fn arg)))))
                 (later (fn)
                   (lambda (arg) (run-at-time 0 nil #'run fn arg))))
-      (setf (coq-eglot-lsp-context-id context)
-            ;; Internal, but `jsonrpc-async-request' does not return the id
-            (car (jsonrpc--async-request-1
-                  server method (funcall params)
-                  :success-fn (later (lambda (answer)
-                                       (funcall on-success answer context)))
-                  :error-fn (later (lambda (err)
-                                     (funcall on-error
-                                              (coq-eglot-lsp--failure
-                                               err context))))
-                  :timeout nil)))
+      (coq-eglot-lsp--when-connected
+       (lambda (server)
+         (if (null server)
+             (funcall (later on-error)
+                      (coq-eglot-lsp--make-failure
+                       context nil "The Coq language server did not start" nil))
+           (eglot--signal-textDocument/didChange)
+           (setf (coq-eglot-lsp-context-version context)
+                 eglot--versioned-identifier)
+           (setf (coq-eglot-lsp-context-id context)
+                 ;; Internal, but `jsonrpc-async-request' does not return
+                 ;; the id
+                 (car (jsonrpc--async-request-1
+                       server method (funcall params)
+                       :success-fn (later (lambda (answer)
+                                            (funcall on-success answer context)))
+                       :error-fn (later (lambda (err)
+                                          (funcall on-error
+                                                   (coq-eglot-lsp--failure
+                                                    err context))))
+                       :timeout nil))))))
       context)))
 
 (defun coq-eglot-lsp--pending-ids (server)
@@ -648,7 +709,9 @@ comes, `jsonrpc-request' would leave theirs, and them, unfinished."
 (defun coq-eglot-lsp-cancel-all ()
   "Ask the server of the current buffer to cancel all pending requests.
 Including those sent by Eglot on its own, like hover.  Their answers,
-errors for cancelled requests, still come later."
+errors for cancelled requests, still come later.  Those waiting for the
+server to connect are not sent, and get no answer."
+  (setq coq-eglot-lsp--waiting nil)
   (let ((server (coq-eglot-lsp-current-server)))
     (when server
       (dolist (id (coq-eglot-lsp--pending-ids server))

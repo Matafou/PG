@@ -1475,7 +1475,8 @@ in another project: compile/ has a _CoqProject."
               (let ((current-prefix-arg '(4)))
                 (coq-eglot-twin-pair twin switch))
               (with-current-buffer twin
-                (should (coq-eglot-lsp-current-server))
+                ;; its server connects without waiting
+                (should (wait-until #'coq-eglot-lsp-current-server 10))
                 (should (equal coq-eglot-server-program
                                (coq-eglot-twin--switch-server switch)))
                 (should (string-match-p
@@ -2410,7 +2411,8 @@ Without memprof-limits, cbn cannot be interrupted."
       (coq-eglot-interrupt)
       (should (< (- (float-time) start) 2))
       (should-not coq-eglot--interrupting)
-      (should (coq-eglot-lsp-current-server))
+      ;; the new server connects without waiting
+      (should (wait-until #'coq-eglot-lsp-current-server 10))
       (should-not (eq server (coq-eglot-lsp-current-server)))
       (should (= position (coq-eglot-position))))))
 
@@ -3780,6 +3782,49 @@ executed."
     (coq-eglot-goto-point)
     ;; before any answer
     (should (position-at-marker-p "statement"))))
+
+;; Connecting without waiting
+
+(ert-deftest coq-eglot-connect-without-waiting ()
+  "After a restart, a command does not wait for the server to connect:
+its requests wait, and are sent once connected."
+  (with-test-file
+    (coq-eglot-restart-server)
+    (goto-marker "split")
+    (let ((start (float-time)))
+      (coq-eglot-goto-point)
+      (should (< (- (float-time) start) 0.5)))
+    (should (coq-eglot-busy-p))
+    (wait-for-coq)
+    (should (position-at-marker-p "split"))))
+
+(ert-deftest coq-eglot-connection-failed ()
+  "If the server does not connect in time, the command stops and says so:
+the target is forgotten, the buffer is not busy."
+  (with-file (expand-file-name "eglot_compile_c.v" compile-directory)
+    (unwind-protect
+        (progn
+          (coq-eglot-lsp-shutdown)
+          ;; a server that knows its version, but never answers
+          (with-fake-server "[ \"$1\" = --version ] && echo 0.2.5 || sleep 30"
+            (let ((messages nil))
+              (cl-letf* ((message-fn (symbol-function 'message))
+                         ((symbol-function 'message)
+                          (lambda (format &rest args)
+                            (when format
+                              (push (apply #'format-message format args)
+                                    messages))
+                            (apply message-fn format args))))
+                (goto-char (point-max))
+                (let ((eglot-connect-timeout 1))
+                  (coq-eglot-goto-point)
+                  (should (wait-until (lambda () (not (coq-eglot-busy-p))) 10)))
+                (should-not (coq-eglot-checking-p))
+                (should (seq-find (lambda (text)
+                                    (string-match-p "did not start" text))
+                                  messages))))))
+      (coq-eglot-lsp-kill-connecting-servers)
+      (coq-eglot-lsp-shutdown))))
 
 ;; The session, with the server
 

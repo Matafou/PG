@@ -270,7 +270,8 @@ See `coq-eglot-twin-set-opam-switch'."
       ;; killed, like Eglot does when the connection is canceled
       (coq-eglot-lsp-kill-connecting-servers)
       (setq-local coq-eglot-server-program command)
-      (coq-eglot-lsp-ensure-server))
+      ;; without waiting, the commands wait for it to connect
+      (coq-eglot-lsp-connect))
     (coq-eglot-twin--update-label)))
 
 (defun coq-eglot-twin-set-opam-switch (switch)
