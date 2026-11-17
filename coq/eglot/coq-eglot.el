@@ -56,6 +56,7 @@
 (require 'coq-eglot-compile)
 (require 'pg-terminator)                ; the double hit
 (require 'coq-goals)                    ; folding, number of goals, hypotheses
+(require 'coq-eglot-goals)              ; the other goals, detailed
 (require 'pg-goals-indicators)          ; goals out of view
 
 (defvar coq-eglot-mode)                 ; defined below
@@ -869,6 +870,7 @@ empty if `proof-delete-empty-windows'."
         (goto-char (point-min)))
       ;; before resizing: folded, the other goals take one line
       (when (derived-mode-p 'coq-eglot-goals-mode)
+        (coq-eglot-goals-decorate)
         (coq-goals-fold-other-goals)))
     (when delete-empty
       ;; also the windows that the layout created for empty buffers
@@ -1430,14 +1432,17 @@ Printing Unfocused."
   "Format the goals of GOALS after the first one.
 Like Coq with Set Printing Unfocused: the unfocused goals come after a
 line \"*** Unfocused goals:\".  coq-goals.el folds them, see
-`coq-fold-other-goals'."
-  (let ((others (cdr (append (plist-get goals :goals) nil)))
-        (unfocused (coq-eglot--unfocused-goals goals)))
-    (concat (coq-eglot--format-goal-list others 2)
-            (when unfocused
-              (concat "\n*** Unfocused goals:\n"
-                      (coq-eglot--format-goal-list unfocused
-                                                   (+ 2 (length others))))))))
+`coq-fold-other-goals'.  With their hypotheses and levels if
+`coq-eglot-detailed-goals'."
+  (if coq-eglot-detailed-goals
+      (coq-eglot-goals-format-other goals)
+    (let ((others (cdr (append (plist-get goals :goals) nil)))
+          (unfocused (coq-eglot--unfocused-goals goals)))
+      (concat (coq-eglot--format-goal-list others 2)
+              (when unfocused
+                (concat "\n*** Unfocused goals:\n"
+                        (coq-eglot--format-goal-list unfocused
+                                                     (+ 2 (length others)))))))))
 
 (defun coq-eglot--format-goals-parts (goals &optional no-separator)
   "Format GOALS, as returned by the server, like Coq does.
@@ -1461,9 +1466,13 @@ the conclusion if NO-SEPARATOR."
         (let ((unfocused (coq-eglot--unfocused-goals goals)))
           (cons ""
                 (concat "This subproof is complete, but there are some unfocused goals.\n"
+                        ;; like Coq: "Focus next goal with bullet -."
+                        (coq-eglot-goals-bullet-line goals)
                         (format "\n%d goal%s\n" (length unfocused)
                                 (if (cdr unfocused) "s" ""))
-                        (coq-eglot--format-goal-list unfocused 1)))))
+                        (if coq-eglot-detailed-goals
+                            (coq-eglot-goals-format-unfocused goals)
+                          (coq-eglot--format-goal-list unfocused 1))))))
        ((> (length (plist-get goals :given_up)) 0)
         (cons "" "No more goals, but there are some goals you gave up.\n"))
        ((> (length (plist-get goals :shelf)) 0)
@@ -1475,6 +1484,21 @@ the conclusion if NO-SEPARATOR."
 Return the empty string if GOALS is nil (outside of proofs)."
   (let ((parts (coq-eglot--format-goals-parts goals)))
     (concat (car parts) (cdr parts))))
+
+(defun coq-eglot-toggle-detailed-goals ()
+  "Show or hide the hypotheses and levels of the other goals.
+See `coq-eglot-detailed-goals'.  Without asking the server again."
+  (interactive)
+  (setq coq-eglot-detailed-goals (not coq-eglot-detailed-goals))
+  (coq-eglot--with-script
+    (let ((output (coq-eglot--output)))
+      (coq-eglot--show-goals-1
+       (coq-eglot-lsp-make-answer
+        :goals (coq-eglot--output-goals output)
+        :printing-width (coq-eglot--output-width output)
+        :printing-flags (coq-eglot--output-flags output)))))
+  (message "Coq: other goals %s"
+           (if coq-eglot-detailed-goals "detailed" "like Coq")))
 
 (defun coq-eglot--format-messages (messages)
   "Format MESSAGES of a sentence, a list of `coq-eglot-lsp-message'."
@@ -2914,6 +2938,9 @@ Compact contexts are a presentation option, not a command sent to Rocq.")
      ["Conclusion Apart" coq-eglot-toggle-split-goals
       :style toggle :selected coq-eglot-split-goals
       :help "The conclusion in a window of its own, below the hypotheses"]
+     ["Detailed Other Goals" coq-eglot-toggle-detailed-goals
+      :style toggle :selected coq-eglot-detailed-goals
+      :help "The other goals with their hypotheses, by level"]
      ("3 Windows mode layout"
       ["smart"
        (coq-eglot-set-layout-option 'proof-three-window-mode-policy 'smart)

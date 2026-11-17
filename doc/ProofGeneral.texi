@@ -5840,6 +5840,17 @@ The conclusion of the first goal can be displayed in a window of its
 own, below the hypotheses: menu @code{Coq -> Windows -> Conclusion
 Apart}, or option @code{coq-eglot-split-goals}.
 @item
+@vindex coq-eglot-detailed-goals
+@findex coq-eglot-toggle-goal-hyps
+The goals after the first one can keep their hypotheses: menu
+@code{Coq -> Windows -> Detailed Other Goals}, or option
+@code{coq-eglot-detailed-goals}.  They are folded under the title of
+their goal, @kbd{RET} or a click there unfolds them, and they stay so in
+the next goals.  The unfocused goals are grouped by level, the innermost
+first, and the level of the next goal says which bullet focuses it.
+When a subproof is complete, the goals say it in any case, like Coq
+(``Focus next goal with bullet -.'').
+@item
 The goals and the answers of the queries are printed at the width of
 their windows, see @code{coq-auto-adapt-printing-width}, without
 checking anything again.  @kbd{C-c C-a C-w} asks for a printing width,

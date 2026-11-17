@@ -130,13 +130,17 @@ The goals displayed after are all unfocused.")
       count)))
 
 (defun coq-goals--other-goals-start ()
-  "Start of the goals after the first one in the current buffer, or nil."
-  (save-excursion
-    (goto-char (point-min))
-    (when (re-search-forward (concat "\\(?:" coq-other-goal-regexp "\\)\\|\\(?:"
-                                     coq-unfocused-goals-regexp "\\)")
-                             nil t)
-      (match-beginning 0))))
+  "Start of the goals after the first one in the current buffer, or nil.
+A backend can mark it with the text property `coq-other-goals-start',
+otherwise it is found in the text."
+  (or (text-property-any (point-min) (point-max) 'coq-other-goals-start t)
+      (save-excursion
+        (goto-char (point-min))
+        (when (re-search-forward (concat "\\(?:" coq-other-goal-regexp
+                                         "\\)\\|\\(?:"
+                                         coq-unfocused-goals-regexp "\\)")
+                                 nil t)
+          (match-beginning 0)))))
 
 (defun coq-goals--summary (start)
   "Line giving the number of the goals from START, folded or not."

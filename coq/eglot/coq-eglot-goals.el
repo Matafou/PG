@@ -1,0 +1,270 @@
+;;; coq-eglot-goals.el --- The goals after the first one, detailed  -*- lexical-binding:t -*-
+
+;; This file is part of Proof General.
+
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;;; Commentary:
+;;
+;; With `coq-eglot-detailed-goals', the goals after the first one keep
+;; their hypotheses, folded under their title, and the unfocused goals
+;; are grouped by level, with the bullet that focuses the next one.
+;; The server gives all this: the hypotheses of every goal, the levels
+;; of the focus stack, and the suggestion of Coq for the next bullet.
+;;
+;; The text is built by coq-eglot.el, see `coq-eglot--format-goals'.
+;; The structure is in text properties, no backend reads it in the
+;; text: `coq-eglot-goal-title' on the title of a goal with hypotheses,
+;; its key, and `invisible' with the same key on its hypotheses.  And
+;; `coq-other-goals-start' where the folding of coq-goals.el starts.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'subr-x)
+(require 'coq-goals)                    ; coq-other-goals-face
+
+(declare-function coq-eglot--format-hyps "coq-eglot" (goal))
+(declare-function coq-eglot--indent "coq-eglot" (text indentation))
+
+(defcustom coq-eglot-detailed-goals nil
+  "Non-nil: the goals after the first one with their hypotheses.
+Their hypotheses are folded under their title, RET or mouse-1 there
+unfolds them.  The unfocused goals are grouped by level, the innermost
+first, with the bullet that focuses the next goal.  Nil: only their
+conclusion, like Coq."
+  :type 'boolean
+  :safe #'booleanp
+  :group 'coq-eglot)
+
+(defface coq-eglot-goals-level
+  '((t :inherit shadow))
+  "Face of the lines giving the levels of the unfocused goals."
+  :group 'coq-eglot)
+
+(defvar coq-eglot-goals--unfolded nil
+  "Keys of the goals whose hypotheses are unfolded, see `coq-eglot-goals--key'.")
+
+;;; The next bullet
+
+(defun coq-eglot-goals-bullet-line (goals)
+  "The suggestion of Coq for the next bullet in GOALS, as a line, or \"\".
+Like \"Focus next goal with bullet -.\", which Coq prints after
+\"This subproof is complete\"."
+  (let ((bullet (plist-get goals :bullet)))
+    (if (and (stringp bullet) (not (string-empty-p bullet)))
+        (concat bullet "\n")
+      "")))
+
+(defun coq-eglot-goals--levels (goals)
+  "The unfocused goals of GOALS by level, as a list of (DEPTH . GOALS).
+The innermost level first, at depth 1.  Without the empty levels."
+  (let ((depth 0)
+        levels)
+    (seq-doseq (level (plist-get goals :stack))
+      (setq depth (1+ depth))
+      (let ((goals (seq-mapcat #'identity level 'list)))
+        (when goals
+          (push (cons depth goals) levels))))
+    (nreverse levels)))
+
+(defun coq-eglot-goals--bullet-hint (goals levels)
+  "The next bullet of GOALS for one of its LEVELS, as (DEPTH . TEXT), or nil.
+From the suggestion of Coq, see `coq-eglot-goals-bullet-line'.  It is
+for the innermost level that has goals.  If the current bullet is
+unfinished, the same bullet focuses the goals of the innermost level,
+if it has some."
+  (let ((bullet (plist-get goals :bullet))
+        (first (car levels)))
+    (when (and (stringp bullet) first)
+      (cond
+       ((string-match "\\`Focus next goal with bullet \\(.+\\)\\.\\'" bullet)
+        (cons (car first) (concat "next bullet: " (match-string 1 bullet))))
+       ((and (string-match "\\`The current bullet \\(.+\\) is unfinished\\.\\'"
+                           bullet)
+             (= (car first) 1))
+        (cons 1 (concat "next bullet: " (match-string 1 bullet))))
+       ((string-match-p "\\`Try unfocusing with \"}\"\\.\\'" bullet)
+        (cons (car first) "after }"))))))
+
+;;; Formatting
+
+(defun coq-eglot-goals--key (goal number)
+  "Key of GOAL, numbered NUMBER: a symbol, the same in the next goals.
+From its existential variable, from NUMBER if the server does not give
+it."
+  (let* ((evar (plist-get (plist-get goal :info) :evar))
+         (id (cond ((and (vectorp evar) (= (length evar) 2)) (aref evar 1))
+                   (evar evar)
+                   (t (format "n%d" number))))
+         (key (intern (format "coq-eglot-goal-%s" id))))
+    (put key 'coq-eglot-goal t)
+    key))
+
+(defun coq-eglot-goals--hyps-text (goal)
+  "The hypotheses of GOAL, without the properties of the first goal's.
+Folding or highlighting a hypothesis of the first goal, see
+`coq-hyps-decorate', works by names: it must not apply to the other
+goals."
+  (let ((text (copy-sequence (coq-eglot--format-hyps goal))))
+    (remove-list-of-text-properties 0 (length text)
+                                    '(coq-hyp coq-hyp-body) text)
+    text))
+
+(defun coq-eglot-goals--hyps-count (goal)
+  "Number of hypotheses of GOAL, a hypothesis may have several names."
+  (seq-reduce (lambda (count hyp) (+ count (length (plist-get hyp :names))))
+              (plist-get goal :hyps) 0))
+
+(defun coq-eglot-goals--format-goal (goal number)
+  "Format GOAL, numbered NUMBER, its hypotheses folded under its title."
+  (let ((title (format "goal %d is:" number))
+        (hyps (coq-eglot-goals--hyps-text goal)))
+    (concat "\n"
+            (if (string-empty-p hyps)
+                title
+              (let ((key (coq-eglot-goals--key goal number)))
+                (concat (propertize title
+                                    'coq-eglot-goal-title key
+                                    'coq-eglot-goal-hyps
+                                    (coq-eglot-goals--hyps-count goal))
+                        "\n"
+                        (propertize
+                         (concat (string-remove-suffix "\n" hyps)
+                                 "\n  ============================")
+                         'invisible key))))
+            "\n " (coq-eglot--indent (plist-get goal :ty) " ") "\n")))
+
+(defun coq-eglot-goals--format-list (goals first)
+  "Format GOALS, numbered from FIRST, see `coq-eglot-goals--format-goal'."
+  (let ((number (1- first)))
+    (mapconcat (lambda (goal)
+                 (coq-eglot-goals--format-goal goal (cl-incf number)))
+               goals "")))
+
+(defun coq-eglot-goals--format-levels (goals first)
+  "Format the unfocused goals of GOALS by level, numbered from FIRST.
+Each level after a line giving its depth, and the next bullet for one of
+them, see `coq-eglot-goals--bullet-hint'."
+  (let* ((levels (coq-eglot-goals--levels goals))
+         (hint (coq-eglot-goals--bullet-hint goals levels))
+         (number first))
+    (mapconcat
+     (lambda (level)
+       (let ((line (concat (format "── level %d" (car level))
+                           (and (eql (car hint) (car level))
+                                (concat ", " (cdr hint))))))
+         (prog1
+             (concat "\n"
+                     (propertize line 'face 'coq-eglot-goals-level
+                                 'font-lock-face 'coq-eglot-goals-level)
+                     (coq-eglot-goals--format-list (cdr level) number))
+           (setq number (+ number (length (cdr level)))))))
+     levels "")))
+
+(defun coq-eglot-goals--mark-start (text)
+  "TEXT, where the folding of the other goals starts after its newlines.
+See `coq-goals--other-goals-start'."
+  (let ((start (string-match "[^\n]" text)))
+    (when start
+      (put-text-property start (1+ start) 'coq-other-goals-start t text))
+    text))
+
+(defun coq-eglot-goals-format-other (goals)
+  "Format the goals of GOALS after the first one, detailed.
+The other focused goals, then the unfocused ones by level after a line
+\"*** Unfocused goals:\", like Coq with Set Printing Unfocused."
+  (let ((others (cdr (append (plist-get goals :goals) nil))))
+    (coq-eglot-goals--mark-start
+     (concat (coq-eglot-goals--format-list others 2)
+             (when (coq-eglot-goals--levels goals)
+               (concat "\n*** Unfocused goals:\n"
+                       (coq-eglot-goals--format-levels
+                        goals (+ 2 (length others)))))))))
+
+(defun coq-eglot-goals-format-unfocused (goals)
+  "Format the unfocused goals of GOALS by level, detailed, numbered from 1.
+When no goal is focused."
+  (coq-eglot-goals--mark-start (coq-eglot-goals--format-levels goals 1)))
+
+;;; Folding the hypotheses of a goal
+
+(defvar coq-eglot-goals-title-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'coq-eglot-toggle-goal-hyps)
+    (define-key map (kbd "RET") #'coq-eglot-toggle-goal-hyps)
+    map)
+  "Keymap of the titles of the goals with hypotheses.")
+
+(defun coq-eglot-goals-decorate ()
+  "Fold the hypotheses of the goals of the current buffer, but the unfolded.
+See `coq-eglot-goals--unfolded'.  Each title gets a button giving their
+number."
+  (remove-overlays (point-min) (point-max) 'coq-eglot-goal-button t)
+  (when (listp buffer-invisibility-spec)
+    (setq buffer-invisibility-spec
+          (seq-remove (lambda (elt)
+                        (let ((atom (if (consp elt) (car elt) elt)))
+                          (and (symbolp atom) (get atom 'coq-eglot-goal))))
+                      buffer-invisibility-spec)))
+  (let ((pos (point-min))
+        keys)
+    (while (setq pos (text-property-not-all pos (point-max)
+                                            'coq-eglot-goal-title nil))
+      (let* ((end (next-single-property-change pos 'coq-eglot-goal-title
+                                               nil (point-max)))
+             (key (get-text-property pos 'coq-eglot-goal-title))
+             (count (get-text-property pos 'coq-eglot-goal-hyps))
+             (folded (not (memq key coq-eglot-goals--unfolded)))
+             (ov (make-overlay pos end)))
+        (push key keys)
+        (when folded
+          (add-to-invisibility-spec key))
+        (overlay-put ov 'coq-eglot-goal-button t)
+        (overlay-put ov 'evaporate t)
+        ;; above the folding of the other goals, whose keymap it hides
+        (overlay-put ov 'priority 10)
+        (overlay-put ov 'keymap coq-eglot-goals-title-map)
+        (overlay-put ov 'mouse-face 'highlight)
+        (overlay-put ov 'help-echo "mouse-1, RET: show or hide the hypotheses")
+        (overlay-put ov 'after-string
+                     (propertize (if folded
+                                     (format "  ▸ %d hypothes%s" count
+                                             (if (= count 1) "is" "es"))
+                                   "  ▾")
+                                 'face 'coq-other-goals-face))
+        (setq pos end)))
+    ;; the buffer of the other goals: forget the goals that are gone
+    (when keys
+      (setq coq-eglot-goals--unfolded
+            (seq-filter (lambda (key) (memq key keys))
+                        coq-eglot-goals--unfolded)))))
+
+(defun coq-eglot-goals--title-at (event)
+  "Buffer and key of the goal title at EVENT, or at point if not a mouse event."
+  (if (mouse-event-p event)
+      (let ((posn (event-start event)))
+        (with-current-buffer (window-buffer (posn-window posn))
+          (cons (current-buffer)
+                (and (posn-point posn)
+                     (get-text-property (posn-point posn)
+                                        'coq-eglot-goal-title)))))
+    (cons (current-buffer) (get-text-property (point) 'coq-eglot-goal-title))))
+
+(defun coq-eglot-toggle-goal-hyps (&optional event)
+  "Show or hide the hypotheses of the goal whose title is at EVENT or point.
+See `coq-eglot-detailed-goals'."
+  (interactive (list last-nonmenu-event))
+  (pcase-let ((`(,buffer . ,key) (coq-eglot-goals--title-at event)))
+    (unless key
+      (user-error "Coq: no goal title here"))
+    (setq coq-eglot-goals--unfolded
+          (if (memq key coq-eglot-goals--unfolded)
+              (delq key coq-eglot-goals--unfolded)
+            (cons key coq-eglot-goals--unfolded)))
+    (with-current-buffer buffer
+      (coq-eglot-goals-decorate))))
+
+(provide 'coq-eglot-goals)
+
+;;; coq-eglot-goals.el ends here

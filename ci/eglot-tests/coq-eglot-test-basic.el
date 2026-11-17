@@ -5073,6 +5073,133 @@ Not with the jsonrpc of Emacs 29, which pretty-prints them as Lisp."
                                 (buffer-text
                                  coq-eglot-lsp-event-json-buffer-name)))))))
 
+;;; The other goals, detailed
+
+(defun test-goal (ty &optional evar hyps)
+  "A goal of the server, of conclusion TY, existential variable EVAR.
+HYPS is a list of (NAME . TYPE)."
+  (list :info (list :evar (vector "Ser_Evar" (or evar 1)) :name nil)
+        :hyps (vconcat (mapcar (lambda (hyp)
+                                 (list :names (vector (car hyp)) :def nil
+                                       :ty (cdr hyp)))
+                               hyps))
+        :ty ty))
+
+(ert-deftest coq-eglot-goals-bullet-hint ()
+  "The next bullet, from the suggestion of Coq, for the innermost level
+with goals."
+  (let* ((stack (vector (vector [] []) (vector [] (vector (test-goal "A")))))
+         (hint (lambda (bullet)
+                 (let ((goals (list :goals [] :stack stack :bullet bullet)))
+                   (coq-eglot-goals--bullet-hint
+                    goals (coq-eglot-goals--levels goals))))))
+    (should (equal (coq-eglot-goals--levels (list :stack stack))
+                   (list (list 2 (test-goal "A")))))
+    (should (equal (funcall hint "Focus next goal with bullet +.")
+                   '(2 . "next bullet: +")))
+    (should (equal (funcall hint "Try unfocusing with \"}\".")
+                   '(2 . "after }")))
+    ;; the current bullet focuses the goals of the innermost level only
+    (should-not (funcall hint "The current bullet - is unfinished."))
+    (should-not (funcall hint nil))
+    (setq stack (vector (vector [] (vector (test-goal "A")))))
+    (should (equal (funcall hint "The current bullet - is unfinished.")
+                   '(1 . "next bullet: -")))
+    (should (equal (coq-eglot-goals-bullet-line
+                    (list :bullet "Focus next goal with bullet -."))
+                   "Focus next goal with bullet -.\n"))
+    (should (equal (coq-eglot-goals-bullet-line (list :bullet nil)) ""))))
+
+(defun goal-button ()
+  "After string of the button of the goal title at point."
+  (let ((ov (seq-find (lambda (ov) (overlay-get ov 'coq-eglot-goal-button))
+                      (overlays-at (point)))))
+    (and ov (substring-no-properties (overlay-get ov 'after-string)))))
+
+(ert-deftest coq-eglot-detailed-goals ()
+  "The other goals with their hypotheses, folded under their title, and
+the unfocused goals by level, with the next bullet."
+  (with-test-file
+    (unwind-protect
+        (progn
+          (setq coq-fold-other-goals nil)
+          ;; like Coq: only the conclusions, and the next bullet
+          (goto-marker "subproof")
+          (search-backward "-")
+          (run #'coq-eglot-goto-point)
+          (should (string-match-p
+                   (concat "\\`This subproof is complete, but there are some "
+                           "unfocused goals.\nFocus next goal with bullet -.\n\n"
+                           "1 goal\n\ngoal 1 is:\n True\\'")
+                   (buffer-text "*goals*")))
+          (goto-marker "split")
+          (run #'coq-eglot-goto-point)
+          (should (string-match-p "\n\ngoal 2 is:\n True\\'"
+                                  (buffer-text "*goals*")))
+          ;; detailed, without asking the server again
+          (coq-eglot-toggle-detailed-goals)
+          (should coq-eglot-detailed-goals)
+          (with-current-buffer "*goals*"
+            (should (string-match-p
+                     "\n\ngoal 2 is:\n  n : nat\n  =+\n True\\'"
+                     (buffer-text "*goals*")))
+            (goto-char (point-min))
+            (search-forward "goal 2 is:")
+            (goto-char (match-beginning 0))
+            (should (= (point) (coq-goals--other-goals-start)))
+            (should (equal (goal-button) "  ▸ 1 hypothesis"))
+            (let ((hyp (save-excursion (search-forward "n : nat"))))
+              (should (invisible-p hyp))
+              ;; above the keymap of the other goals
+              (should (eq (key-binding (kbd "RET"))
+                          #'coq-eglot-toggle-goal-hyps))
+              (call-interactively (key-binding (kbd "RET")))
+              (should-not (invisible-p hyp))
+              (should (equal (goal-button) "  ▾"))
+              ;; a click folds them again
+              (let ((window (get-buffer-window "*goals*")))
+                (when window
+                  (coq-eglot-toggle-goal-hyps
+                   (list 'mouse-1 (list window (point) '(0 . 0) 0)))
+                  (should (invisible-p hyp))
+                  (call-interactively (key-binding (kbd "RET")))))))
+          ;; unfolded in the next goals
+          (run #'coq-eglot-goto-point)
+          (with-current-buffer "*goals*"
+            (goto-char (point-min))
+            (should-not (invisible-p (search-forward "goal 2 is:\n  n"))))
+          ;; in a bullet, the other goal is unfocused, at level 1
+          (goto-marker "hello")
+          (run #'coq-eglot-goto-point)
+          (should (string-match-p
+                   (concat "\\*\\*\\* Unfocused goals:\n\n"
+                           "── level 1, next bullet: -\ngoal 2 is:\n  n : nat\n")
+                   (buffer-text "*goals*")))
+          ;; no goal focused: the folding starts at the level
+          (goto-marker "subproof")
+          (search-backward "-")
+          (run #'coq-eglot-goto-point)
+          (with-current-buffer "*goals*"
+            (should (string-match-p
+                     (concat "\\`This subproof is complete, but there are some "
+                             "unfocused goals.\nFocus next goal with bullet -.\n\n"
+                             "1 goal\n\n── level 1, next bullet: -\ngoal 1 is:\n")
+                     (buffer-text "*goals*")))
+            (goto-char (point-min))
+            (search-forward "── level")
+            (should (= (match-beginning 0) (coq-goals--other-goals-start)))
+            (coq-toggle-other-goals)
+            (should (equal (substring-no-properties
+                            (overlay-get (other-goals-overlay) 'display))
+                           "▸ 1 unfocused goal")))
+          (coq-eglot-toggle-detailed-goals)
+          (should-not coq-eglot-detailed-goals)
+          (should (string-match-p "\n\ngoal 1 is:\n True\\'"
+                                  (buffer-text "*goals*"))))
+      (setq coq-eglot-detailed-goals nil)
+      (setq coq-fold-other-goals t)
+      (setq coq-eglot-goals--unfolded nil))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here
