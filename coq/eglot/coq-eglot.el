@@ -48,6 +48,7 @@
 (require 'coq-mode)
 (require 'coq-syntax)                   ; also loads the faces of PG
 (require 'coq-indent)
+(require 'button)
 (require 'color)
 (require 'cl-lib)
 (require 'coq-eglot-lsp)
@@ -374,6 +375,10 @@ An answer asked for one of them is not used after another one, see
 
 (defun coq-eglot--new-intent ()
   "Note that the user asked to move the proof position, return the intent."
+  ;; A presentation enrichment of the previously displayed goals is now
+  ;; obsolete.  It is not session work, but it should not delay the new
+  ;; semantic request in coq-lsp's queue.
+  (coq-eglot--cancel-hyp-sorts)
   (cl-incf coq-eglot--intent))
 
 (defun coq-eglot--answer-valid-p (answer)
@@ -1130,10 +1135,18 @@ display of the goals.  A timer, not to change the buffers during the
 redisplay, and to wait for the end of a resizing.  For the current
 output, see `coq-eglot--output'."
   (let ((output (coq-eglot--output)))
-    (when (timerp (coq-eglot--output-width-timer output))
-      (cancel-timer (coq-eglot--output-width-timer output)))
+    (coq-eglot--cancel-width-refresh output)
     (setf (coq-eglot--output-width-timer output)
           (run-at-time 0.1 nil #'coq-eglot--refresh-width output))))
+
+(defun coq-eglot--cancel-width-refresh (&optional output)
+  "Cancel the automatic goals-width refresh of OUTPUT.
+OUTPUT is the current one by default."
+  (let* ((output (or output (coq-eglot--output)))
+         (timer (coq-eglot--output-width-timer output)))
+    (when (timerp timer)
+      (cancel-timer timer))
+    (setf (coq-eglot--output-width-timer output) nil)))
 
 (defun coq-eglot--refresh-width (&optional output)
   "Print the goals again if their width or printing flags changed.
@@ -1164,7 +1177,7 @@ at the current width.  For OUTPUT, the current one by default."
                (when (and (eq (coq-eglot-session-last-sentence) last)
                           (coq-eglot--active-p))
                  (coq-eglot-session-set-sentence-answer last answer)
-                 (coq-eglot--show-goals answer)))
+                 (coq-eglot--show-answer answer t)))
              #'ignore)))))))
 
 (defun coq-eglot--trim-lines (text)
@@ -1231,36 +1244,51 @@ names the property `coq-hyp-body', to highlight and fold it, see
 
 (defcustom coq-eglot-compact-contexts t
   "Non-nil: in the goals, the hypotheses whose type is in Type share lines.
-Like Coq with Set Printing Compact Contexts, see `coq-eglot--simple-hyp-p'.
-The commands Set and Unset Printing Compact Contexts (menu OPTIONS)
-override it until the server stops; a Set sentence in the script does
-not.  It costs a second request with each goals, sent with them."
+See `coq-eglot--simple-hyp-p'.  Displaying a goal then costs a separate,
+bounded request for the sorts of the hypotheses that may share a line.
+Intermediate goals that are not displayed never cause this request."
   :type 'boolean
   :safe #'booleanp
   :group 'coq-eglot)
 
 (defun coq-eglot--compact-contexts-p ()
-  "Non-nil if the hypotheses of the goals share their lines.
-The last command Set or Unset Printing Compact Contexts, see
-`coq-eglot-set-flag', otherwise `coq-eglot-compact-contexts'.  This is
-`coq-eglot-lsp-hyp-sorts-function': the goals need the sorts of the
-hypotheses."
-  (let ((flag (seq-find (lambda (flag)
-                          (string-match-p "\\`\\(?:Un\\)?[Ss]et Printing Compact Contexts\\'"
-                                          flag))
-                        coq-eglot--printing-flags)))
-    (if flag
-        (string-prefix-p "Set" flag)
-      coq-eglot-compact-contexts)))
+  "Non-nil if the hypotheses of the goals share their lines."
+  ;; One hypothesis per line makes the output comparison of twins stable.
+  ;; It also makes the auxiliary sorts request unnecessary there.
+  (and coq-eglot-compact-contexts
+       (not (buffer-live-p coq-eglot--twin))
+       (not (coq-eglot--twin-layout-p))))
 
-(setq coq-eglot-lsp-hyp-sorts-function #'coq-eglot--compact-contexts-p)
+(defun coq-eglot-toggle-compact-contexts ()
+  "Toggle compact presentation of hypotheses in the goals buffer."
+  (interactive)
+  (setq coq-eglot-compact-contexts (not coq-eglot-compact-contexts))
+  (coq-eglot--with-script
+    ;; Reuse the answer kept with the current sentence.  Enabling may ask
+    ;; only for its presentation sorts; disabling needs no server request.
+    (coq-eglot--goals-at-position nil t))
+  (message "Coq: compact contexts %s"
+           (if coq-eglot-compact-contexts "enabled" "disabled")))
+
+(defun coq-eglot--hyp-sort-names (answer)
+  "Names of the hypotheses of ANSWER whose sorts may affect formatting."
+  (let ((goal (coq-eglot--first-goal
+               (coq-eglot-lsp-answer-goals answer))))
+    (when goal
+      (seq-mapcat
+       (lambda (hyp)
+         (and (not (plist-get hyp :def))
+              (not (string-search "\n" (coq-eglot--format-hyp hyp)))
+              (append (plist-get hyp :names) nil)))
+       (append (plist-get goal :hyps) nil)))))
+
+(setq coq-eglot-lsp-hyp-sort-names-function #'coq-eglot--hyp-sort-names)
 
 (defun coq-eglot--simple-hyp-p (hyp text sorts)
   "Non-nil if HYP, formatted as TEXT, can share its line with others.
-Like Coq with Set Printing Compact Contexts: an assumption, not a
-definition, whose type is in Type, neither in Prop nor in SProp, see
-SORTS, the alist of `coq-eglot-lsp--parse-hyp-sorts'.  And TEXT is on
-one line."
+An assumption, not a definition, whose type is in Type, neither in Prop
+nor in SProp, see SORTS, the alist of
+`coq-eglot-lsp--parse-hyp-sorts'.  And TEXT is on one line."
   (and (not (plist-get hyp :def))
        (not (string-search "\n" text))
        (seq-every-p (lambda (name)
@@ -1270,10 +1298,11 @@ one line."
 
 (defun coq-eglot--format-hyps (goal)
   "Format the hypotheses of GOAL, one per line.
-Several on one line if GOAL has the sorts of its hypotheses, with Set
-Printing Compact Contexts, see `coq-eglot--simple-hyp-p': like Coq,
-three spaces between them, as many as fit in the width."
-  (let ((sorts (plist-get goal :hyp-sorts))
+With `coq-eglot-compact-contexts', put compatible hypotheses on the
+same line, three spaces apart, as many as fit in the width.  GOAL must
+have their sorts, see `coq-eglot--simple-hyp-p'."
+  (let ((sorts (and (coq-eglot--compact-contexts-p)
+                    (plist-get goal :hyp-sorts)))
         (width (coq-eglot--hyps-width))
         (lines nil)
         (line nil))                     ; the current line of simple hyps
@@ -1291,6 +1320,69 @@ three spaces between them, as many as fit in the width."
           (setq line text)))))
     (when line (push line lines))
     (mapconcat (lambda (text) (concat text "\n")) (nreverse lines) "")))
+
+(defun coq-eglot--first-goal (goals)
+  "The first focused goal of GOALS, or nil."
+  (let ((focused (and goals (plist-get goals :goals))))
+    (and (> (length focused) 0) (aref focused 0))))
+
+(defun coq-eglot--late-hyp-sorts-useful-p (goals)
+  "Non-nil if the late hypothesis sorts of GOALS would compact its context."
+  (let* ((goal (coq-eglot--first-goal goals))
+         (sorts (and goal (plist-get goal :hyp-sorts-late))))
+    (and sorts
+         (coq-eglot--compact-contexts-p)
+         (let ((enriched (copy-sequence goal)))
+           (plist-put enriched :hyp-sorts sorts)
+           (not (equal (coq-eglot--format-hyps goal)
+                       (coq-eglot--format-hyps enriched)))))))
+
+(defun coq-eglot-compact-late-context ()
+  "Compact the displayed context with hypothesis sorts received late."
+  (interactive)
+  (coq-eglot--with-script
+    (let* ((output (coq-eglot--output))
+           (goals (coq-eglot--output-goals output))
+           (goal (coq-eglot--first-goal goals))
+           (sorts (and goal (plist-get goal :hyp-sorts-late))))
+      (unless (and sorts (coq-eglot--compact-contexts-p))
+        (user-error "Coq: no late context compaction is available"))
+      (plist-put goal :hyp-sorts sorts)
+      (plist-put goal :hyp-sorts-late nil)
+      (coq-eglot--show-goals-1
+       (coq-eglot-lsp-make-answer
+        :goals goals
+        :printing-width (coq-eglot--output-width output)
+        :printing-flags (coq-eglot--output-flags output))))))
+
+(defun coq-eglot--offer-late-context-compaction ()
+  "Add an explicit compaction action when late sorts would change the goals."
+  (let* ((output (coq-eglot--output))
+         (goals (coq-eglot--output-goals output))
+         (buffer (and (coq-eglot--late-hyp-sorts-useful-p goals)
+                      (get-buffer (coq-eglot--goals-name)))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (save-excursion
+          (goto-char (point-min))
+          (unless (text-property-search-forward
+                   'coq-eglot-late-context-compaction t t)
+            (let ((inhibit-read-only t))
+              ;; Keep the action visible near the goal count.  At the end
+              ;; of a long context it could be outside the goals window.
+              (goto-char (point-min))
+              (if (search-forward "\n\n" nil t)
+                  (goto-char (match-end 0))
+                (goto-char (point-max))
+                (unless (bolp) (insert "\n")))
+              (insert-text-button
+               "Compact context"
+               'coq-eglot-late-context-compaction t
+               'follow-link t
+               'help-echo "Use the hypothesis sorts that arrived after the goal"
+               'action (lambda (_button)
+                         (coq-eglot-compact-late-context)))
+              (insert "\n\n"))))))))
 
 (defun coq-eglot--format-conclusion (goal &optional no-separator)
   "Format the conclusion of GOAL, below the separator unless NO-SEPARATOR."
@@ -1426,6 +1518,7 @@ output keeps the state of the buffer it displays."
                                     #'coq-eglot-goals-mode (cdr parts))
         (coq-eglot--set-separator (coq-eglot--conclusion-name))))
     (coq-hyps-decorate new)
+    (coq-eglot--offer-late-context-compaction)
     (coq-eglot--scroll-goals)
     ;; the windows may have been created or resized meanwhile
     (coq-eglot--schedule-width-refresh)
@@ -1521,14 +1614,149 @@ active, see `coq-eglot--displays-p'."
                                 #'coq-eglot-response-mode text)
     (run-hooks 'coq-eglot-output-hook)))
 
-(defun coq-eglot--show-answer (answer &optional goals-only)
-  "Display the goals and the messages of ANSWER of the server.
-Only the goals if GOALS-ONLY."
+(defvar-local coq-eglot--hyp-sorts-answer nil
+  "Answer whose displayed goals are waiting for hypothesis sorts.")
+
+(defvar-local coq-eglot--hyp-sorts-context nil
+  "Context of the auxiliary hypothesis-sorts request, or nil.")
+
+(defvar-local coq-eglot--hyp-sorts-wait-timer nil
+  "Timer displaying goals without hypothesis sorts after the short wait.")
+
+(defvar-local coq-eglot--hyp-sorts-deadline-timer nil
+  "Timer cancelling an auxiliary hypothesis-sorts request.")
+
+(defvar-local coq-eglot--hyp-sorts-displayed nil
+  "Non-nil if `coq-eglot--hyp-sorts-answer' is already displayed.")
+
+(defun coq-eglot-presentation-ready-p ()
+  "Non-nil when the current goals have had their initial display.
+This is independent of `coq-eglot-busy-p': a semantic goals answer may
+already be complete while presentation waits briefly for hypothesis
+sorts.  A late enrichment still in flight does not make this nil."
+  (or (null coq-eglot--hyp-sorts-answer)
+      coq-eglot--hyp-sorts-displayed))
+
+(defun coq-eglot--cancel-hyp-sorts-timers ()
+  "Cancel the timers of the current hypothesis-sorts enrichment."
+  (when (timerp coq-eglot--hyp-sorts-wait-timer)
+    (cancel-timer coq-eglot--hyp-sorts-wait-timer))
+  (when (timerp coq-eglot--hyp-sorts-deadline-timer)
+    (cancel-timer coq-eglot--hyp-sorts-deadline-timer))
+  (setq coq-eglot--hyp-sorts-wait-timer nil
+        coq-eglot--hyp-sorts-deadline-timer nil))
+
+(defun coq-eglot--cancel-hyp-sorts ()
+  "Cancel and forget the presentation enrichment currently in flight."
+  (coq-eglot--cancel-hyp-sorts-timers)
+  (when coq-eglot--hyp-sorts-context
+    (coq-eglot-lsp-cancel-request coq-eglot--hyp-sorts-context))
+  (setq coq-eglot--hyp-sorts-answer nil
+        coq-eglot--hyp-sorts-context nil
+        coq-eglot--hyp-sorts-displayed nil))
+
+(defun coq-eglot--show-answer-now (answer &optional goals-only)
+  "Display ANSWER immediately, without asking for presentation enrichment."
   (coq-eglot--show-goals answer)
   (unless goals-only
     (coq-eglot--show-response
      (coq-eglot--format-messages
       (and answer (coq-eglot-lsp-answer-messages answer))))))
+
+(defun coq-eglot--hyp-sorts-display (answer goals-only)
+  "Display ANSWER if it is still the one waiting for hypothesis sorts."
+  (when (eq answer coq-eglot--hyp-sorts-answer)
+    (setq coq-eglot--hyp-sorts-wait-timer nil
+          coq-eglot--hyp-sorts-displayed t)
+    (coq-eglot--show-answer-now answer goals-only)))
+
+(defun coq-eglot--hyp-sorts-finished (answer goals-only sorts)
+  "Use SORTS for ANSWER, if its presentation enrichment is still current."
+  (when (eq answer coq-eglot--hyp-sorts-answer)
+    (setq coq-eglot--hyp-sorts-context nil)
+    (coq-eglot--cancel-hyp-sorts-timers)
+    (if coq-eglot--hyp-sorts-displayed
+        (progn
+          (coq-eglot-lsp-add-hyp-sorts answer sorts t)
+          ;; Do not move a displayed goal after the deadline.  Offer the
+          ;; enrichment only if this exact answer is still on screen.
+          (when (eq (coq-eglot-lsp-answer-goals answer)
+                    (coq-eglot--output-goals (coq-eglot--output)))
+            (coq-eglot--offer-late-context-compaction)))
+      (coq-eglot-lsp-add-hyp-sorts answer sorts)
+      (coq-eglot--show-answer-now answer goals-only))
+    (setq coq-eglot--hyp-sorts-answer nil
+          coq-eglot--hyp-sorts-displayed nil)))
+
+(defun coq-eglot--hyp-sorts-failed (answer goals-only _failure)
+  "Display ANSWER without sorts if its auxiliary request failed."
+  (when (eq answer coq-eglot--hyp-sorts-answer)
+    (setq coq-eglot--hyp-sorts-context nil)
+    (coq-eglot--cancel-hyp-sorts-timers)
+    (unless coq-eglot--hyp-sorts-displayed
+      (coq-eglot--show-answer-now answer goals-only))
+    (setq coq-eglot--hyp-sorts-answer nil
+          coq-eglot--hyp-sorts-displayed nil)))
+
+(defun coq-eglot--hyp-sorts-deadline (answer goals-only)
+  "Cancel the sorts request of ANSWER when its presentation deadline expires."
+  (when (eq answer coq-eglot--hyp-sorts-answer)
+    (setq coq-eglot--hyp-sorts-deadline-timer nil)
+    (when coq-eglot--hyp-sorts-context
+      (coq-eglot-lsp-cancel-request coq-eglot--hyp-sorts-context))
+    (setq coq-eglot--hyp-sorts-context nil)
+    (unless coq-eglot--hyp-sorts-displayed
+      (coq-eglot--show-answer-now answer goals-only))
+    ;; Ignore a success racing with cancellation.
+    (setq coq-eglot--hyp-sorts-answer nil
+          coq-eglot--hyp-sorts-displayed nil)))
+
+(defun coq-eglot--show-answer-enriched (answer goals-only)
+  "Display ANSWER, asking separately for hypothesis sorts when useful."
+  (coq-eglot--cancel-hyp-sorts)
+  (let* ((goal (and answer
+                    (coq-eglot--first-goal
+                     (coq-eglot-lsp-answer-goals answer))))
+         (already (and goal (plist-get goal :hyp-sorts))))
+    (if (or (not (coq-eglot--displays-p))
+            (not answer)
+            already
+            (not (coq-eglot--compact-contexts-p)))
+        (coq-eglot--show-answer-now answer goals-only)
+      (setq coq-eglot--hyp-sorts-answer answer
+            coq-eglot--hyp-sorts-displayed nil)
+      (let ((context
+             (coq-eglot-lsp-hyp-sorts-async
+              answer
+              (lambda (sorts)
+                (coq-eglot--hyp-sorts-finished answer goals-only sorts))
+              (lambda (failure)
+                (coq-eglot--hyp-sorts-failed answer goals-only failure)))))
+        (if (null context)
+            (progn
+              (setq coq-eglot--hyp-sorts-answer nil)
+              (coq-eglot--show-answer-now answer goals-only))
+          (setq coq-eglot--hyp-sorts-context context
+                coq-eglot--hyp-sorts-wait-timer
+                (run-at-time coq-eglot-lsp-hyp-sorts-wait nil
+                             #'coq-eglot--hyp-sorts-display
+                             answer goals-only)
+                coq-eglot--hyp-sorts-deadline-timer
+                (run-at-time coq-eglot-lsp-hyp-sorts-deadline nil
+                             #'coq-eglot--hyp-sorts-deadline
+                             answer goals-only)))))))
+
+(defun coq-eglot--show-answer (answer &optional goals-only)
+  "Display the goals and the messages of ANSWER of the server.
+Only the goals if GOALS-ONLY."
+  ;; Messages are part of the semantic answer and need no enrichment.
+  (unless goals-only
+    (coq-eglot--show-response
+     (coq-eglot--format-messages
+      (and answer (coq-eglot-lsp-answer-messages answer)))))
+  ;; If goals are delayed, display the messages again after them: in the
+  ;; two-window layout they share a window and messages have precedence.
+  (coq-eglot--show-answer-enriched answer goals-only))
 
 (defun coq-eglot--show-error (text)
   "Display error TEXT in the response buffer."
@@ -1586,8 +1814,11 @@ Asynchronously, see `coq-eglot--plan'."
 (defun coq-eglot--plan ()
   "Start the next operation toward the target, if any and none runs."
   (pcase (coq-eglot-session-next-action)
-    (`(step ,start) (coq-eglot--step start))
-    (`(check ,start ,target) (coq-eglot--advance start target)))
+    (`(step ,start)
+     (unless (coq-eglot--known-error start) (coq-eglot--step start)))
+    (`(check ,start ,target)
+     (unless (coq-eglot--known-error start)
+       (coq-eglot--advance start target))))
   (coq-eglot--update-overlays))
 
 (defun coq-eglot--continue (before)
@@ -1599,8 +1830,17 @@ progress of the server."
       (coq-eglot--plan)
     (coq-eglot--stop)))
 
-(defun coq-eglot--start-work ()
-  "Note that an operation starts to move the proof position, return it."
+(defvar-local coq-eglot--work-context nil
+  "Context of the request currently moving the proof position, or nil.")
+
+(defvar-local coq-eglot--work-start nil
+  "Start of the text covered by the operation moving the proof position.
+Unlike the proof position, it does not move with progress notifications.")
+
+(defun coq-eglot--start-work (start)
+  "Note that an operation starts at START, return its session work object."
+  (setq coq-eglot--work-context nil
+        coq-eglot--work-start start)
   (prog1 (coq-eglot-session-start-work)
     (coq-eglot--update-overlays)))
 
@@ -1610,13 +1850,18 @@ ON-SUCCESS is called with the answer.  The answer is ignored if WORK
 was cancelled meanwhile: an answer or an error may still come for a
 cancelled request."
   (condition-case err
-      (funcall request-fn pos
-               (lambda (answer)
-                 (when (coq-eglot-session-work-p work)
-                   (funcall on-success answer)))
-               (lambda (failure)
-                 (when (coq-eglot-session-work-p work)
-                   (coq-eglot--failed-request failure))))
+      (let ((context
+             (funcall request-fn pos
+                      (lambda (answer)
+                        (when (coq-eglot-session-work-p work)
+                          (setq coq-eglot--work-context nil)
+                          (funcall on-success answer)))
+                      (lambda (failure)
+                        (when (coq-eglot-session-work-p work)
+                          (setq coq-eglot--work-context nil)
+                          (coq-eglot--failed-request failure))))))
+        (when (coq-eglot-session-work-p work)
+          (setq coq-eglot--work-context context)))
     ;; not sent, like without server: nothing runs
     (error (when (coq-eglot-session-work-p work)
              (coq-eglot--stop))
@@ -1624,6 +1869,8 @@ cancelled request."
 
 (defun coq-eglot--stop ()
   "Forget the target and the running operation: nothing is checked."
+  (setq coq-eglot--work-context nil
+        coq-eglot--work-start nil)
   (coq-eglot-session-stop-work)
   (coq-eglot--update-overlays))
 
@@ -1660,10 +1907,58 @@ the sentence."
     (and (< start (point-max)) start)))
 
 (defun coq-eglot--observe (event)
-  "Observe EVENT of the server: the progress moves the proof position.
+  "Observe EVENT of the server: progress or an error moves the interface.
 A function of `coq-eglot-lsp-event-functions', after the session."
-  (when (coq-eglot-lsp-progress-p event)
-    (coq-eglot--progress event)))
+  (cond ((coq-eglot-lsp-progress-p event) (coq-eglot--progress event))
+        ((coq-eglot-lsp-diagnostics-p event) (coq-eglot--diagnostics))
+        ((and (coq-eglot-lsp-answer-p event)
+              (coq-eglot--answer-valid-p event)
+              (eq (coq-eglot-lsp-answer-goals event)
+                  (coq-eglot--output-goals (coq-eglot--output))))
+         ;; A second publication of the same answer may carry hypothesis
+         ;; sorts that missed the initial display deadline.
+         (coq-eglot--offer-late-context-compaction))))
+
+(defun coq-eglot--stop-at-error (diag start &optional cancel)
+  "Stop at DIAG, the first error of an operation starting at START.
+With CANCEL, cancel the request of the running operation first."
+  (let ((sentence (coq-eglot-lsp-diagnostic-sentence diag)))
+    (when cancel
+      (coq-eglot-lsp-cancel-request coq-eglot--work-context))
+    (coq-eglot--stop)
+    (if sentence
+        (progn
+          (when (< start (car sentence))
+            (coq-eglot--trace-check start (car sentence) nil))
+          (coq-eglot--fail (car sentence) (cdr sentence)
+                           (coq-eglot-lsp-diagnostic-message diag)))
+      ;; Document-level errors, such as an invalid filename, have no
+      ;; sentence.  Keep the anchor and at least report their range.
+      (coq-eglot--show-error (coq-eglot-lsp-diagnostic-message diag))
+      (coq-eglot--highlight-error
+       (coq-eglot-lsp-diagnostic-start diag)
+       (coq-eglot-lsp-diagnostic-end diag)))))
+
+(defun coq-eglot--known-error (start)
+  "Stop at a valid error already known between START and the target.
+Return non-nil if no operation should be sent."
+  (let ((diag (coq-eglot-session-error start (coq-eglot-check-target))))
+    (when diag
+      (coq-eglot--stop-at-error diag start)
+      t)))
+
+(defun coq-eglot--diagnostics ()
+  "Stop the running check immediately at its first recorded error.
+The session observer ran first and recorded the latest valid diagnostic
+snapshot.  Errors have their sentence range because the server is run
+with `send_diags_extra_data'."
+  (when (coq-eglot-session-working-p)
+    (let* ((start coq-eglot--work-start)
+           (diag (coq-eglot-session-error start (coq-eglot-check-target))))
+      (when diag
+        ;; The request can otherwise keep checking toward a distant target,
+        ;; or never answer when that target is beyond the error.
+        (coq-eglot--stop-at-error diag start t)))))
 
 (defun coq-eglot--progress (progress)
   "The server checked the sentences up to the start of PROGRESS.
@@ -1721,38 +2016,22 @@ it is not left running without anything to wait for."
 
 (defun coq-eglot--step (start)
   "Process the sentence starting at START, after the proof position.
-Compile first the libraries it requires, if any.  One request: the
-goals after the sentence, which the server checks first."
-  (let ((work (coq-eglot--start-work))
+Compile first the libraries it requires, if any.  First ask the server
+to check the sentence without goals, then ask its goals: the long,
+resumable verification and the short final presentation request are
+therefore distinct, like for a distant target."
+  (let ((work (coq-eglot--start-work start))
         (before (coq-eglot-position)))
     (coq-eglot--compile-then
      work start (1+ start)
      (lambda (failed)
        (if (not failed)
-           ;; inside the sentence: at the start of the buffer, the
-           ;; server finds no sentence
-           (coq-eglot--send work #'coq-eglot-lsp-goals-async (1+ start)
-                            (lambda (answer)
-                              (coq-eglot--step-done work answer before)))
+           ;; Inside the sentence: at the start of the buffer the server
+           ;; finds no sentence.  `coq-eglot--advance-done' asks the final
+           ;; goals after this lightweight check answers.
+           (coq-eglot--check work before start (1+ start) nil)
          (coq-eglot--stop)
          (coq-eglot--compilation-failed failed))))))
-
-(defun coq-eglot--step-done (work answer before)
-  "Handle ANSWER of the server for WORK, the sentence after the position.
-WORK started at proof position BEFORE."
-  (coq-eglot-session-finish-work work)
-  (let ((bounds (and answer (coq-eglot-lsp-answer-sentence answer))))
-    (cond
-     ((null bounds) (coq-eglot--stop))
-     ((coq-eglot-lsp-answer-error answer)
-      (coq-eglot--stop)
-      (coq-eglot--fail (car bounds) (cdr bounds)
-                       (coq-eglot-lsp-answer-error answer) nil))
-     (t
-      (coq-eglot--trace-check (car bounds) (cdr bounds) answer)
-      (coq-eglot--set-position (cdr bounds) answer)
-      (coq-eglot--show-answer answer)
-      (coq-eglot--continue before)))))
 
 (defun coq-eglot--advance (start target)
   "Process the sentences from START up to the one before TARGET.
@@ -1761,7 +2040,7 @@ Asynchronously: the libraries required there are compiled, then the
 server is asked to check up to it, without goals.  If a compilation
 fails, the server checks up to the Require sentence."
   (let ((last (1- (coq-eglot--skip-backward target)))
-        (work (coq-eglot--start-work))
+        (work (coq-eglot--start-work start))
         (before (coq-eglot-position)))
     (coq-eglot--compile-then
      work start target
@@ -1792,7 +2071,7 @@ Ask the goals after the last sentence, without waiting: its range, and
 an error the diagnostics did not report.  FAILED is the start of a
 Require sentence after LAST whose compilation failed, reported if there
 was no error before."
-  (coq-eglot--send work #'coq-eglot-lsp-goals-async last
+  (coq-eglot--send work #'coq-eglot-lsp-final-goals-async last
                    (lambda (answer)
                      (coq-eglot--advance-answered work before start last
                                                   failed answer))))
@@ -1819,7 +2098,7 @@ See `coq-eglot--advance-done'.  Stop at the first error."
      (error
       ;; the sentence that failed and its error message, not its goals
       (coq-eglot--send
-       work #'coq-eglot-lsp-goals-async (car error)
+       work #'coq-eglot-lsp-final-goals-async (car error)
        (lambda (answer)
          (coq-eglot-session-finish-work work)
          (coq-eglot--stop)
@@ -2042,6 +2321,7 @@ forward, after the part being checked, see `coq-eglot--queue'."
 (defun coq-eglot--cancel ()
   "Cancel the running check and all pending requests, display nothing.
 Kill the compilation of the required libraries, if running."
+  (coq-eglot--cancel-hyp-sorts)
   (coq-eglot-compile-cancel)
   (coq-eglot--stop)
   (coq-eglot-session-forget-requests)
@@ -2102,6 +2382,7 @@ come.  Their proof positions stay."
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (when coq-eglot-mode
+          (coq-eglot--cancel-hyp-sorts)
           (coq-eglot-compile-cancel)
           (coq-eglot--stop)
           (coq-eglot-session-forget-requests)
@@ -2342,6 +2623,9 @@ ignored.  The query is a request of the session, see
 `coq-eglot-busy-p'."
   (when (<= (coq-eglot-position) (point-min))
     (user-error "Coq: process at least one sentence before a query"))
+  ;; Do not let an old automatic goals refresh replace the explicit answer
+  ;; in the shared output window just after it is displayed.
+  (coq-eglot--cancel-width-refresh)
   (unless (string-match-p "\\.[ \t\n]*\\'" command)
     (setq command (concat command ".")))
   (let ((script (current-buffer))
@@ -2391,15 +2675,17 @@ is bound to `coq-terminator-insert'."
 
 (defun coq-eglot--hover-eldoc-function (callback &rest args)
   "Like `eglot-hover-eldoc-function' with CALLBACK and ARGS.
-But only in the processed part: elsewhere the server has nothing to
-say, and a pending hover would make it check up to point."
-  (when (< (point) (coq-eglot-position))
+But only in the processed part, and not during a short critical
+request: elsewhere the server has nothing useful to say, and a pending
+hover would make it check up to point or interrupt final formatting."
+  (when (and (< (point) (coq-eglot-position))
+             (not (coq-eglot-lsp-exclusive-p)))
     (apply #'eglot-hover-eldoc-function callback args)))
 
 (defun coq-eglot--setup-eldoc ()
   "Replace the hover function of Eglot by `coq-eglot--hover-eldoc-function'.
 Run when Eglot starts or stops managing the buffer."
-  (when (bound-and-true-p eglot--managed-mode)
+  (when (eglot-managed-p)
     (setq-local eldoc-documentation-functions
                 (cl-substitute #'coq-eglot--hover-eldoc-function
                                #'eglot-hover-eldoc-function
@@ -2588,6 +2874,22 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
              (t item)))
           menu))
 
+(defconst coq-eglot--options-menu
+  (cons
+   (car coq-options-menu)
+   (mapcan
+    (lambda (item)
+      (pcase (and (vectorp item) (aref item 1))
+        ('coq-set-printing-compact-contexts
+         (list ["Compact Contexts" coq-eglot-toggle-compact-contexts
+                :style toggle :selected coq-eglot-compact-contexts
+                :help "Put compatible hypotheses on the same line"]))
+        ('coq-unset-printing-compact-contexts nil)
+        (_ (list item))))
+    (cdr coq-options-menu)))
+  "Printing options menu of the Eglot backend.
+Compact contexts are a presentation option, not a command sent to Rocq.")
+
 (defvar coq-eglot--menu-spec
   `("Coq"
     ["Next Step" coq-eglot-assert-next-command]
@@ -2688,7 +2990,7 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
      ["About with Printing All..." coq-About-with-all]
      ["Check with Printing All..." coq-Check-show-all]
      ["Print with Printing All..." coq-Print-with-all])
-    ,coq-options-menu
+    ,coq-eglot--options-menu
     ,(append coq-insert-menu
              '(["Named Goal Selectors" coq-insert-named-goal-selectors]))
     "---"
@@ -2732,6 +3034,7 @@ They do what they do, then warn, see `coq-eglot--no-effect-entries'."
     coq-eglot-show-goals
     coq-eglot-layout-windows
     coq-eglot-display-some-buffers
+    coq-eglot-toggle-compact-contexts
     coq-eglot-goto-end-of-locked
     coq-eglot-query
     coq-toggle-highlight-hyp-at-point)

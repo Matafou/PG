@@ -47,7 +47,6 @@
     (function eglot--TextDocumentIdentifier)
     (function eglot-uri-to-path eglot--uri-to-path)
     (variable eglot--servers-by-project)
-    (variable eglot--managed-mode)
     (variable eglot--versioned-identifier))
   "Internal functions and variables of Eglot and jsonrpc that we use.
 See the comment above for what to check when Eglot changes.")
@@ -277,12 +276,10 @@ The server is shared by the files of a project, with the load path of
 the file that started it, see `coq-eglot-lsp--contact'.  Warn too if
 `coq-use-project-file' is nil but the server reads a project file.  Run
 when Eglot starts managing the buffer."
-  (let ((server (and (bound-and-true-p eglot--managed-mode)
+  (let ((server (and (eglot-managed-p)
                      (eglot-current-server))))
     (when (cl-typep server 'coq-eglot-lsp-server)
-      (let ((args (append (coq-eglot-lsp--root-load-path-args
-                           (project-root (eglot--project server)))
-                          (ignore-errors (coq-eglot-lsp-load-path-args)))))
+      (let ((args (ignore-errors (coq-eglot-lsp-load-path-args))))
         (unless (equal args (coq-eglot-lsp--server-load-path-args server))
           (display-warning
            'coq-eglot
@@ -300,29 +297,15 @@ command starts it with the load path of %s."
            (format "coq-use-project-file is nil, but the language server \
 reads the project file of %s anyway." root)))))))
 
-(defun coq-eglot-lsp--root-load-path-args (root)
-  "Option -R of ROOT, the root of the server, if it has no project file.
-Like coqtop, which binds its current directory to the empty logical
-path, so that a file can require the files next to it: coq-lsp binds
-nothing without a project file.  -R, not -Q: coq-lsp puts all the -R
-before all the -Q, and the last binding of a directory wins, so a -Q
-of ROOT would hide the -R of its subdirectories in the load path of
-the buffer."
-  (unless (seq-some (lambda (name) (file-exists-p (expand-file-name name root)))
-                    '("_CoqProject" "_RocqProject"))
-    (list "-R" (coq-eglot-lsp--logical-binding (expand-file-name root) ""))))
-
-(defun coq-eglot-lsp--contact (&optional _interactive project)
+(defun coq-eglot-lsp--contact (&optional _interactive _project)
   "Eglot contact for Coq: our server class and its command line.
 With the load path of the current buffer, see
 `coq-eglot-lsp-load-path-args': coq-lsp adds it to the one of the
-project file it finds in its root directory, if any.  Without a project
-file, the root directory of PROJECT is bound to the empty logical path,
-see `coq-eglot-lsp--root-load-path-args'.  The Eglot of Emacs 29 gives
-no PROJECT: the one of the current buffer, like Eglot."
+project file it finds in its root directory, if any.  The project
+argument is unused here: Eglot starts the server in its root, where
+coq-lsp finds the project file.  Without one, no recursive load path is
+guessed: an implicit -R of the root may scan an arbitrarily large tree."
   (let* ((command (coq-eglot-lsp-server-command))
-         (root (project-root (or project (eglot--current-project))))
-         (root-args (coq-eglot-lsp--root-load-path-args root))
          (buffer-args
           (condition-case err
               (coq-eglot-lsp-load-path-args)
@@ -330,12 +313,8 @@ no PROJECT: the one of the current buffer, like Eglot."
             (error (user-error "Invalid `coq-load-path': %s"
                                (error-message-string err))))))
     (coq-eglot-lsp--check-server-version (car command))
-    (when root-args
-      (message "Coq: no project file found in %s, assuming -R . \"\""
-               (abbreviate-file-name root)))
     (cons 'coq-eglot-lsp-server
           (append command
-                  root-args
                   buffer-args
                   (when coq-eglot-server-idle-delay
                     (list (format "--idle-delay=%s"
@@ -509,8 +488,10 @@ buffers it managed, and those that waited for it."
   "What a request was about, kept from its sending.
 METHOD is its LSP method, a keyword.  POSITION is the buffer position it
 was sent at.  VERSION is the version of the document sent with it.  ID
-is its jsonrpc id, for `$/cancelRequest'."
-  method position version id)
+is its jsonrpc id, for `$/cancelRequest'.  ROLE is `interactive',
+`critical' or `preemptible', for the small client-side scheduler.
+CANCELLED is non-nil when a request was abandoned before being sent."
+  method position version id role cancelled)
 
 (cl-defstruct (coq-eglot-lsp-message
                (:constructor coq-eglot-lsp--make-message (severity text)))
@@ -529,7 +510,7 @@ is the version of the document the answer is about.  SENTENCE is
 \(START . END), the buffer positions of the sentence, or nil if the
 server did not say.  GOALS is the goal configuration of coq-lsp, the
 data displayed (the first goal may have the sorts of its hypotheses
-with the key :hyp-sorts, see `coq-eglot-lsp-hyp-sorts-function'), or
+with the key :hyp-sorts, see `coq-eglot-lsp-hyp-sorts-async'), or
 nil outside of a proof.  MESSAGES is a list of `coq-eglot-lsp-message'.
 ERROR is the text of the error of the sentence, or nil.  PRINTING-WIDTH
 and PRINTING-FLAGS are those the goals were printed with, see
@@ -626,9 +607,26 @@ See `coq-eglot-lsp-failure'."
      context code (or (plist-get err :message) (format "%S" err))
      (and (memql code '(-32800 -32001)) t))))
 
+(defun coq-eglot-lsp--document-version ()
+  "The Eglot version of the current buffer's document."
+  eglot--versioned-identifier)
+
+(defun coq-eglot-lsp--flush-document ()
+  "Send pending changes and return the document version sent."
+  (eglot--signal-textDocument/didChange)
+  (coq-eglot-lsp--document-version))
+
+(defun coq-eglot-lsp--jsonrpc-request-with-id
+    (server method params &rest args)
+  "Send an asynchronous request and return its JSON-RPC identifier.
+SERVER, METHOD, PARAMS and ARGS are as for `jsonrpc-async-request'.
+The public function deliberately returns nil, so this is the only
+place where the backend calls `jsonrpc--async-request-1'."
+  (car (apply #'jsonrpc--async-request-1 server method params args)))
+
 (defun coq-eglot-lsp-version ()
   "The version of the current buffer last sent to the server."
-  eglot--versioned-identifier)
+  (coq-eglot-lsp--document-version))
 
 (defun coq-eglot-lsp-connect ()
   "Start the Coq server of the current buffer if needed, without waiting.
@@ -688,6 +686,76 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
                 (with-demoted-errors "Coq: %S"
                   (funcall fn server))))))))))
 
+(defvar coq-eglot-lsp--request-role 'interactive
+  "Role dynamically assigned to the next request.
+`interactive' requests are sent FIFO, `critical' requests are short
+critical sections during which interactive requests wait, and
+`preemptible' requests are long document checks that interactive
+requests may interrupt and that coq-lsp resumes.")
+
+(defvar-local coq-eglot-lsp--critical-context nil
+  "Context of the short critical section currently in flight.")
+
+(defvar-local coq-eglot-lsp--interactive-context nil
+  "Context of the interactive request currently in flight.")
+
+(defvar-local coq-eglot-lsp--critical-queue nil
+  "FIFO of critical requests waiting for an interactive request to finish.")
+
+(defvar-local coq-eglot-lsp--interactive-queue nil
+  "FIFO of interactive requests waiting to be sent.
+Each entry is (CONTEXT . SEND-FUNCTION).")
+
+(defun coq-eglot-lsp-critical-p ()
+  "Non-nil while a short request should not be interrupted by a read query."
+  (and coq-eglot-lsp--critical-context t))
+
+(defun coq-eglot-lsp-exclusive-p ()
+  "Non-nil while automatic reads must not interrupt the current request.
+This includes a critical section and an explicit interactive request."
+  (and (or coq-eglot-lsp--critical-context
+           coq-eglot-lsp--interactive-context)
+       t))
+
+(defun coq-eglot-lsp--dispatch-scheduled ()
+  "Start the next critical or interactive request.
+Finish an interactive request already in flight before opening a
+critical section.  Once requested, a critical section starts before
+new interactive reads."
+  (while (and (not coq-eglot-lsp--critical-context)
+              (not coq-eglot-lsp--interactive-context)
+              (or coq-eglot-lsp--critical-queue
+                  coq-eglot-lsp--interactive-queue))
+    (let* ((critical (and coq-eglot-lsp--critical-queue t))
+           (entry (if critical
+                      (pop coq-eglot-lsp--critical-queue)
+                    (pop coq-eglot-lsp--interactive-queue)))
+           (context (car entry)))
+      (unless (coq-eglot-lsp-context-cancelled context)
+        (if critical
+            (setq coq-eglot-lsp--critical-context context)
+          (setq coq-eglot-lsp--interactive-context context))
+        (funcall (cdr entry))))))
+
+(defun coq-eglot-lsp--request-finished (context)
+  "Update the scheduler after the request of CONTEXT answered."
+  (when (eq context coq-eglot-lsp--critical-context)
+    (setq coq-eglot-lsp--critical-context nil))
+  (when (eq context coq-eglot-lsp--interactive-context)
+    (setq coq-eglot-lsp--interactive-context nil))
+  (coq-eglot-lsp--dispatch-scheduled))
+
+(defun coq-eglot-lsp--reset-scheduler ()
+  "Forget all scheduler state of the current buffer."
+  (dolist (entry coq-eglot-lsp--interactive-queue)
+    (setf (coq-eglot-lsp-context-cancelled (car entry)) t))
+  (dolist (entry coq-eglot-lsp--critical-queue)
+    (setf (coq-eglot-lsp-context-cancelled (car entry)) t))
+  (setq coq-eglot-lsp--critical-context nil
+        coq-eglot-lsp--interactive-context nil
+        coq-eglot-lsp--critical-queue nil
+        coq-eglot-lsp--interactive-queue nil))
+
 (defun coq-eglot-lsp--async-request (pos method params on-success on-error)
   "Send request METHOD at POS with PARAMS to the server of the buffer.
 Without waiting, even for the server to connect, see
@@ -702,43 +770,68 @@ may send other requests.  No request of the backend waits for its
 answer: while waiting in `jsonrpc-request', the answers of the others
 would come, and callbacks sending other requests would run, nested."
   (let ((buffer (current-buffer))
-        (context (coq-eglot-lsp--make-context method pos)))
+        (context (coq-eglot-lsp--make-context method pos))
+        (role coq-eglot-lsp--request-role))
+    (setf (coq-eglot-lsp-context-role context) role)
     (cl-labels ((run (fn arg)
                   (when (buffer-live-p buffer)
                     (with-current-buffer buffer (funcall fn arg))))
                 (later (fn)
-                  (lambda (arg) (run-at-time 0 nil #'run fn arg))))
-      (coq-eglot-lsp--when-connected
-       (lambda (server)
-         (if (null server)
-             (funcall (later on-error)
-                      (coq-eglot-lsp--make-failure
-                       context nil "The Coq language server did not start" nil))
-           ;; maybe called later, from a timer, see
-           ;; `coq-eglot-lsp--when-connected': an error reaches no
-           ;; caller, it must be an answer
-           (condition-case err
-               (progn
-                 (eglot--signal-textDocument/didChange)
-                 (setf (coq-eglot-lsp-context-version context)
-                       eglot--versioned-identifier)
-                 (setf (coq-eglot-lsp-context-id context)
-                       ;; Internal, but `jsonrpc-async-request' does not
-                       ;; return the id
-                       (car (jsonrpc--async-request-1
-                             server method (funcall params)
-                             :success-fn (later (lambda (answer)
-                                                  (funcall on-success
-                                                           answer context)))
-                             :error-fn (later (lambda (err)
-                                                (funcall on-error
-                                                         (coq-eglot-lsp--failure
-                                                          err context))))
-                             :timeout nil))))
-             (error
-              (funcall (later on-error)
-                       (coq-eglot-lsp--make-failure
-                        context nil (error-message-string err) nil)))))))
+                  (lambda (arg) (run-at-time 0 nil #'run fn arg)))
+                (succeed (answer)
+                  (unwind-protect
+                      (funcall on-success answer context)
+                    (coq-eglot-lsp--request-finished context)))
+                (fail (failure)
+                  (unwind-protect
+                      (funcall on-error failure)
+                    (coq-eglot-lsp--request-finished context)))
+                (send ()
+                  (coq-eglot-lsp--when-connected
+                   (lambda (server)
+                     (unless (coq-eglot-lsp-context-cancelled context)
+                       (if (null server)
+                           (funcall (later #'fail)
+                                    (coq-eglot-lsp--make-failure
+                                     context nil
+                                     "The Coq language server did not start"
+                                     nil))
+                         ;; Maybe called later, from a timer, see
+                         ;; `coq-eglot-lsp--when-connected': an error reaches
+                         ;; no caller, it must be turned into an answer.
+                         (condition-case err
+                             (progn
+                               (setf (coq-eglot-lsp-context-version context)
+                                     (coq-eglot-lsp--flush-document))
+                               (setf (coq-eglot-lsp-context-id context)
+                                     (coq-eglot-lsp--jsonrpc-request-with-id
+                                      server method (funcall params)
+                                      :success-fn (later #'succeed)
+                                      :error-fn
+                                      (later
+                                       (lambda (err)
+                                         (fail
+                                          (coq-eglot-lsp--failure
+                                           err context))))
+                                      :timeout nil)))
+                           (error
+                            (funcall
+                             (later #'fail)
+                             (coq-eglot-lsp--make-failure
+                              context nil (error-message-string err)
+                              nil))))))))))
+      (pcase role
+        ('interactive
+         (setq coq-eglot-lsp--interactive-queue
+               (append coq-eglot-lsp--interactive-queue
+                       (list (cons context #'send))))
+         (coq-eglot-lsp--dispatch-scheduled))
+        ('critical
+         (setq coq-eglot-lsp--critical-queue
+               (append coq-eglot-lsp--critical-queue
+                       (list (cons context #'send))))
+         (coq-eglot-lsp--dispatch-scheduled))
+        (_ (funcall #'send)))
       context)))
 
 (defun coq-eglot-lsp--pending-ids (server)
@@ -757,17 +850,30 @@ Including those sent by Eglot on its own, like hover.  Their answers,
 errors for cancelled requests, still come later.  Those waiting for the
 server to connect are not sent, and get no answer."
   (coq-eglot-lsp--forget-waiting)
+  (coq-eglot-lsp--reset-scheduler)
   (let ((server (coq-eglot-lsp-current-server)))
     (when server
       (dolist (id (coq-eglot-lsp--pending-ids server))
         (jsonrpc-notify server :$/cancelRequest (list :id id))))))
+
+(defun coq-eglot-lsp-cancel-request (context)
+  "Ask the server to cancel the request of CONTEXT, if it was sent.
+Its answer, an error for a cancelled request, may still come later."
+  (when context
+    (setf (coq-eglot-lsp-context-cancelled context) t))
+  (let ((server (coq-eglot-lsp-current-server))
+        (id (and context (coq-eglot-lsp-context-id context))))
+    (when (and server id)
+      (jsonrpc-notify server :$/cancelRequest (list :id id))))
+  ;; Only after sending the cancellation may a queued request be emitted.
+  (when context (coq-eglot-lsp--request-finished context)))
 
 (defun coq-eglot-lsp-send-changes ()
   "Send now the pending changes of the current buffer to the server.
 Eglot sends them only after a short idle time otherwise.  Must not be
 called from `after-change-functions'."
   (when (coq-eglot-lsp-current-server)
-    (eglot--signal-textDocument/didChange)))
+    (coq-eglot-lsp--flush-document)))
 
 (defun coq-eglot-lsp--servers ()
   "All the running Coq servers."
@@ -813,14 +919,27 @@ See `coq-eglot-lsp-printing-flags-function'."
   (and coq-eglot-lsp-printing-flags-function
        (funcall coq-eglot-lsp-printing-flags-function)))
 
-(defvar coq-eglot-lsp-hyp-sorts-function nil
-  "Function telling whether the goals need the sorts of the hypotheses.
-Called without argument in the script buffer before each goals request.
-If it returns non-nil, a second request asks the sort of the type of
-each hypothesis of the first goal, see `coq-eglot-lsp--hyp-sorts-command':
-the first goal of the answer has them with the key :hyp-sorts.  Both
-requests are sent together: most of the cost of a request is its
-latency, the sorts add almost nothing to the time of the goals.")
+(defvar coq-eglot-lsp-hyp-sort-names-function nil
+  "Function returning the hypotheses whose sorts a goals answer needs.
+Called with a `coq-eglot-lsp-answer'.  It returns their names as a list
+of strings.  If nil, all hypotheses are asked, for compatibility.  The
+interface uses this to avoid computing sorts that cannot affect its
+formatting.")
+
+(defcustom coq-eglot-lsp-hyp-sorts-wait 0.05
+  "Seconds the interface may wait before displaying goals without sorts.
+This delay affects presentation only: the goals answer has already been
+delivered and the sentence has already been processed."
+  :type 'number
+  :group 'coq-eglot)
+
+(defcustom coq-eglot-lsp-hyp-sorts-deadline 0.3
+  "Seconds before cancelling a hypothesis-sorts request.
+Before this timeout, a result that missed the initial display may still
+be offered to the user.  After it, the auxiliary request is cancelled
+so that context compaction cannot keep Rocq busy indefinitely."
+  :type 'number
+  :group 'coq-eglot)
 
 (defconst coq-eglot-lsp--hyp-sorts-command
   "1: try (match reverse goal with H : ?T |- _ => \
@@ -829,11 +948,29 @@ let s := type of T in idtac \"COQ-EGLOT-SORT\" H s; fail end)."
 Of the first goal, one message \"COQ-EGLOT-SORT name sort\" each.  The
 failure after each message makes `match' try the next hypothesis.")
 
-(defun coq-eglot-lsp--hyp-sorts-p ()
-  "Non-nil if the goals need the sorts of the hypotheses.
-See `coq-eglot-lsp-hyp-sorts-function'."
-  (and coq-eglot-lsp-hyp-sorts-function
-       (funcall coq-eglot-lsp-hyp-sorts-function)))
+(defun coq-eglot-lsp--hyp-sorts-command (names)
+  "Coq command printing the sorts of the hypotheses NAMES.
+With NAMES nil, return nil.  If no selector function is installed,
+return the command that visits all hypotheses."
+  (cond
+   ((null coq-eglot-lsp-hyp-sort-names-function)
+    coq-eglot-lsp--hyp-sorts-command)
+   ((null names) nil)
+   (t
+    (format
+     "1: %s."
+     (mapconcat
+      (lambda (name)
+        ;; NAME comes from Rocq as a local identifier.  Printing it as a
+        ;; string makes parsing independent of `idtac's term printer.
+        (format "try (let T := type of %s in let s := type of T in \
+idtac \"COQ-EGLOT-SORT %s\" s)" name name))
+      names "; ")))))
+
+(defun coq-eglot-lsp--hyp-sort-names (answer)
+  "Names of the hypotheses whose sorts are needed in ANSWER."
+  (and coq-eglot-lsp-hyp-sort-names-function
+       (funcall coq-eglot-lsp-hyp-sort-names-function answer)))
 
 (defun coq-eglot-lsp--parse-hyp-sorts (messages)
   "The sorts in MESSAGES, of `coq-eglot-lsp--hyp-sorts-command'.
@@ -847,13 +984,25 @@ without universes."
               sorts)))
     (nreverse sorts)))
 
-(defun coq-eglot-lsp--with-hyp-sorts (answer messages)
+(defun coq-eglot-lsp--with-hyp-sorts (answer messages &optional late)
   "ANSWER of a goals request, its first goal with the sorts in MESSAGES.
-See `coq-eglot-lsp--parse-hyp-sorts'.  ANSWER unchanged without goals."
+See `coq-eglot-lsp--parse-hyp-sorts'.  With LATE, keep them under
+`:hyp-sorts-late': the interface may offer them, but must not change an
+already displayed goal by itself.  ANSWER is unchanged without goals."
   (let ((goals (plist-get (plist-get answer :goals) :goals)))
     (when (> (length goals) 0)
-      (plist-put (aref goals 0) :hyp-sorts
+      (plist-put (aref goals 0) (if late :hyp-sorts-late :hyp-sorts)
                  (coq-eglot-lsp--parse-hyp-sorts messages))))
+  answer)
+
+(defun coq-eglot-lsp-add-hyp-sorts (answer sorts &optional late)
+  "Add SORTS to the first goal of ANSWER and return ANSWER.
+SORTS is an alist from hypothesis names to their sorts.  With LATE, use
+`:hyp-sorts-late', so displaying the answer is not changed implicitly."
+  (let ((goals (and answer (plist-get (coq-eglot-lsp-answer-goals answer)
+                                      :goals))))
+    (when (> (length goals) 0)
+      (plist-put (aref goals 0) (if late :hyp-sorts-late :hyp-sorts) sorts)))
   answer)
 
 (defun coq-eglot-lsp--goals-params (pos &optional width flags)
@@ -872,79 +1021,83 @@ nothing else."
                                              (concat command "."))
                                            commands " "))))))
 
-(defun coq-eglot-lsp--with-hyp-sorts-answer (answer messages)
-  "ANSWER, a `coq-eglot-lsp-answer', with the sorts in MESSAGES.
-See `coq-eglot-lsp--with-hyp-sorts'."
-  (when answer
-    (coq-eglot-lsp--with-hyp-sorts
-     (list :goals (coq-eglot-lsp-answer-goals answer)) messages))
-  answer)
-
 (defun coq-eglot-lsp-goals-options ()
   "What the next goals request depends on, besides the position.
-A list: the printing width, the printing flags, and whether the sorts
-of the hypotheses are asked.  For the key of a request."
+A list: the printing width and the printing flags.  For the key of a
+request.  Hypothesis sorts are a separate presentation request and do
+not affect this key."
   (list (coq-eglot-lsp--printing-width)
-        (coq-eglot-lsp--printing-flags)
-        (and (coq-eglot-lsp--hyp-sorts-p) t)))
+        (coq-eglot-lsp--printing-flags)))
 
 (defun coq-eglot-lsp-goals-async (pos on-success on-error)
   "Ask asynchronously the goals after the sentence at POS.
 ON-SUCCESS is called with a `coq-eglot-lsp-answer', or nil if the
-server answered nothing, ON-ERROR with a `coq-eglot-lsp-failure'.  The
-first goal has the sorts of its hypotheses if needed, see
-`coq-eglot-lsp-hyp-sorts-function'.  See `coq-eglot-lsp--async-request'.
-Return the context of the request."
-  (let* ((width (coq-eglot-lsp--printing-width))
-         (flags (coq-eglot-lsp--printing-flags))
-         ;; with the sorts: the answer of the goals and the messages of
-         ;; the sorts, `none' until they arrive
-         (answer 'none)
-         (messages (if (coq-eglot-lsp--hyp-sorts-p) 'none nil))
-         (done (lambda ()
-                 (unless (or (eq answer 'none) (eq messages 'none))
-                   (funcall on-success
-                            (coq-eglot-lsp--with-hyp-sorts-answer
-                             answer messages))))))
-    (when (eq messages 'none)
-      (coq-eglot-lsp-query-async
-       pos coq-eglot-lsp--hyp-sorts-command
-       (lambda (result) (setq messages result) (funcall done))
-       ;; outside of a proof for instance: no sorts
-       (lambda (_failure) (setq messages nil) (funcall done))))
+server answered nothing, ON-ERROR with a `coq-eglot-lsp-failure'.
+Hypothesis sorts are deliberately not asked here: they are a separate
+presentation enrichment, see `coq-eglot-lsp-hyp-sorts-async'.  See
+`coq-eglot-lsp--async-request'.  Return the context of the request."
+  (let ((width (coq-eglot-lsp--printing-width))
+        (flags (coq-eglot-lsp--printing-flags)))
     (coq-eglot-lsp--async-request
      pos :proof/goals
      (lambda () (coq-eglot-lsp--goals-params pos width flags))
      (lambda (result context)
-       (setq answer (coq-eglot-lsp--answer result context width flags))
-       ;; whoever asked, the observers learn from it
-       (when answer (coq-eglot-lsp--publish answer))
-       (funcall done))
+       (let ((answer (coq-eglot-lsp--answer result context width flags)))
+         ;; Whoever asked, the observers learn the sentence range now.
+         (when answer (coq-eglot-lsp--publish answer))
+         (funcall on-success answer)))
      on-error)))
+
+(defun coq-eglot-lsp-final-goals-async (pos on-success on-error)
+  "Ask the final goals at POS as a short critical section.
+Unlike a general goals query, interactive read requests wait for this
+one to answer instead of interrupting its synchronous formatting phase."
+  (let ((coq-eglot-lsp--request-role 'critical))
+    (coq-eglot-lsp-goals-async pos on-success on-error)))
+
+(defun coq-eglot-lsp-hyp-sorts-async (answer on-success on-error)
+  "Ask asynchronously for the hypothesis sorts needed by ANSWER.
+Call ON-SUCCESS with their alist, ON-ERROR with a
+`coq-eglot-lsp-failure'.  Return the request context, or nil when no
+hypothesis can benefit from the enrichment.  This request is for
+presentation only and never changes ANSWER by itself."
+  (let* ((context (and answer (coq-eglot-lsp-answer-context answer)))
+         (pos (and context (coq-eglot-lsp-context-position context)))
+         (names (and answer (coq-eglot-lsp--hyp-sort-names answer)))
+         (command (and pos (coq-eglot-lsp--hyp-sorts-command names))))
+    (when command
+      (let ((coq-eglot-lsp--request-role 'critical))
+        (coq-eglot-lsp-query-async
+         pos command
+         (lambda (messages)
+           (funcall on-success (coq-eglot-lsp--parse-hyp-sorts messages)))
+         on-error)))))
 
 (defun coq-eglot-lsp-ping (on-answer)
   "Send a cheap request, call ON-ANSWER without argument when it is answered.
 Its answer tells that the server is ready again after an interruption."
-  (coq-eglot-lsp--async-request
-   (point-min) :proof/goals
-   (lambda () (coq-eglot-lsp--goals-params (point-min)))
-   (lambda (_answer _context) (funcall on-answer))
-   (lambda (_failure) (funcall on-answer))))
+  (let ((coq-eglot-lsp--request-role 'preemptible))
+    (coq-eglot-lsp--async-request
+     (point-min) :proof/goals
+     (lambda () (coq-eglot-lsp--goals-params (point-min)))
+     (lambda (_answer _context) (funcall on-answer))
+     (lambda (_failure) (funcall on-answer)))))
 
 (defun coq-eglot-lsp-check-async (pos on-success on-error)
   "Ask asynchronously the server to check up to the sentence at POS.
 No goals are computed.  ON-SUCCESS is called with a
 `coq-eglot-lsp-checked', ON-ERROR with a `coq-eglot-lsp-failure'.  See
 `coq-eglot-lsp--async-request'.  Return the context of the request."
-  (coq-eglot-lsp--async-request
-   pos :petanque/get_state_at_pos
-   (lambda ()
-     (list :uri (plist-get (eglot--TextDocumentIdentifier) :uri)
-           :position (coq-eglot-lsp-position pos)
-           :opts (list :memo t :hash :json-false)))
-   (lambda (_answer context)
-     (funcall on-success (coq-eglot-lsp--make-checked context)))
-   on-error))
+  (let ((coq-eglot-lsp--request-role 'preemptible))
+    (coq-eglot-lsp--async-request
+     pos :petanque/get_state_at_pos
+     (lambda ()
+       (list :uri (plist-get (eglot--TextDocumentIdentifier) :uri)
+             :position (coq-eglot-lsp-position pos)
+             :opts (list :memo t :hash :json-false)))
+     (lambda (_answer context)
+       (funcall on-success (coq-eglot-lsp--make-checked context)))
+     on-error)))
 
 (defun coq-eglot-lsp-query-async (pos command on-success on-error)
   "Run Coq COMMAND asynchronously in the state at POS.
@@ -1083,7 +1236,7 @@ With its DIAGNOSTICS for VERSION, or the current version if not given."
    uri
    (lambda ()
      (coq-eglot-lsp--make-diagnostics
-      (or version eglot--versioned-identifier)
+      (or version (coq-eglot-lsp--document-version))
       (mapcar #'coq-eglot-lsp--diagnostic diagnostics)))))
 
 ;;; The events buffer

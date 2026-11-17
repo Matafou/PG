@@ -59,9 +59,10 @@
     (= (point) (coq-eglot-position))))
 
 (defun wait-for-coq ()
-  "Wait until the current buffer is at rest: no check, no request.
-See `coq-eglot-busy-p'."
-  (while (coq-eglot-busy-p)
+  "Wait until the current buffer is at rest and its goals are displayed.
+Presentation may finish just after `coq-eglot-busy-p' becomes nil."
+  (while (or (coq-eglot-busy-p)
+             (not (coq-eglot-presentation-ready-p)))
     (accept-process-output nil 0.02)))
 
 (defun run (command)
@@ -216,6 +217,33 @@ the error location with `proof-warning-face', and point moves there."
     (should-not coq-eglot--error-overlays)
     ;; Flymake is not used by default
     (should-not (bound-and-true-p flymake-mode))))
+
+(ert-deftest coq-eglot-eager-error-before-slow-tail ()
+  "An eager error stops a distant check, and is reused after retracting."
+  (with-file "eglot_error_slow.v"
+    (let ((shown nil)
+          (start (float-time)))
+      (add-hook 'coq-eglot-error-hook (lambda () (setq shown t)) nil t)
+      (coq-eglot-process-buffer)
+      ;; Waiting for the request at the end would execute the slow tail.
+      (should (wait-until (lambda () shown) 2))
+      (should (< (- (float-time) start) 2))
+      (should (position-at-marker-p "before slow error")))
+    ;; On a server without strong interruption, the computation may still be
+    ;; finishing before it can answer the request for the goals at the error.
+    (wait-for-coq)
+    (run #'coq-eglot-retract-buffer)
+    ;; No edition: the diagnostic is still valid, so the planner must use it
+    ;; before sending another distant check.
+    (let ((requests 0)
+          (ask (symbol-function 'coq-eglot-lsp-check-async)))
+      (cl-letf (((symbol-function 'coq-eglot-lsp-check-async)
+                 (lambda (&rest args)
+                   (cl-incf requests)
+                   (apply ask args))))
+        (run #'coq-eglot-process-buffer))
+      (should (= requests 0))
+      (should (position-at-marker-p "before slow error")))))
 
 (ert-deftest coq-eglot-hover-only-processed ()
   "Eldoc asks the server only in the processed part."
@@ -2830,35 +2858,22 @@ libraries loaded by the previous tests."
                    (file-name-directory
                     (executable-find (car (coq-eglot-lsp-server-command))))))))
 
-(ert-deftest coq-eglot-compile-no-project-file ()
-  "Without project file, a file requires the files next to it, like
-with coqtop: the server binds its root to the empty logical path."
+(ert-deftest coq-eglot-no-implicit-root-load-path ()
+  "Without project file, the server does not recursively bind its root."
   (skip-unless-server)
   (let* ((dir (file-name-as-directory (make-temp-file "coq-eglot-" t)))
-         (coq-compile-before-require t)
-         (buffer nil)
-         (warnings nil))
+         (buffer nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'display-warning)
-                   (lambda (_type message &rest _) (push message warnings))))
-          (with-temp-file (expand-file-name "b.v" dir)
-            (insert "Definition one := 1.\n"))
+        (progn
           (with-temp-file (expand-file-name "x.v" dir)
-            (insert "Require b.\nDefinition two := b.one + 1.\n"))
+            (insert "Definition one := 1.\n"))
           (setq buffer (find-file-noselect (expand-file-name "x.v" dir)))
           (with-current-buffer buffer
-            (should (member (concat (directory-file-name dir) ",")
-                            (cdr (coq-eglot-lsp--contact nil
-                                                         (project-current)))))
-            (run #'coq-eglot-process-buffer)
-            (should (file-exists-p (expand-file-name "b.vo" dir)))
-            (should (equal (buffer-text "*response*") "two is defined"))
-            ;; no warning about the load path
-            (should-not warnings)))
+            (should-not (member (concat (directory-file-name dir) ",")
+                                (cdr (coq-eglot-lsp--contact
+                                      nil (project-current)))))))
       (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (coq-eglot-lsp-shutdown)
-          (set-buffer-modified-p nil))
+        (with-current-buffer buffer (set-buffer-modified-p nil))
         (kill-buffer buffer))
       (delete-directory dir t))))
 
@@ -2903,11 +2918,8 @@ like the compilation."
           (coq-eglot-exit))
       (clean-load-path-library))))
 
-(ert-deftest coq-eglot-load-path-root ()
-  "Without project file, the root of the server is bound before the load
-path of the buffer, which wins for the subdirectories of the root.  The
-root is the one of the project of the buffer even if Eglot gives no
-project, like the one of Emacs 29."
+(ert-deftest coq-eglot-load-path-no-guessed-root ()
+  "Only the explicit load path of the buffer is passed to the server."
   (let ((enable-local-variables :all)
         ;; not the directory of the buffer
         (project-dir (file-name-directory
@@ -2915,16 +2927,12 @@ project, like the one of Emacs 29."
     (with-file (expand-file-name "eglot_load_path.v" load-path-directory)
       (cl-letf (((symbol-function 'eglot--current-project)
                  (lambda () (cons 'transient project-dir))))
-        (let* ((args (cdr (coq-eglot-lsp--contact nil)))
-               (root (member (directory-file-name project-dir)
-                             (mapcar (lambda (arg) (string-remove-suffix "," arg))
-                                     args)))
-               (lib (member (concat load-path-directory "lib,LoadPathLib")
-                            args)))
-          (should root)
-          (should lib)
-          (should (equal (nth (- (length args) (length root) 1) args) "-R"))
-          (should (> (length root) (length lib))))))))
+        (let ((args (cdr (coq-eglot-lsp--contact nil))))
+          (should-not
+           (member (directory-file-name project-dir)
+                   (mapcar (lambda (arg) (string-remove-suffix "," arg)) args)))
+          (should (member (concat load-path-directory "lib,LoadPathLib")
+                          args)))))))
 
 (ert-deftest coq-eglot-use-project-file-nil ()
   "Without `coq-use-project-file', the server of a file runs in its
@@ -3361,13 +3369,19 @@ warning on its entries without effect."
                     (cdr (assoc "Queries" (cdr coq-eglot--menu-spec))))))
 
 (ert-deftest coq-eglot-options-menu ()
-  "The menu of the printing options is the one of Proof General, its
-commands are defined in the Eglot backend, and its flags are those of
-the next goals and queries."
-  (should (member coq-options-menu (cdr coq-eglot--menu-spec)))
-  (should (equal (car coq-options-menu) "OPTIONS"))
-  (dolist (item (cdr coq-options-menu))
+  "The printing menu has an Eglot presentation toggle and Rocq flags."
+  (should (member coq-eglot--options-menu (cdr coq-eglot--menu-spec)))
+  (should (equal (car coq-eglot--options-menu) "OPTIONS"))
+  (dolist (item (cdr coq-eglot--options-menu))
     (should (commandp (aref item 1))))
+  (let ((compact (menu-entry coq-eglot--options-menu "Compact Contexts")))
+    (should compact)
+    (should (eq (aref compact 1) 'coq-eglot-toggle-compact-contexts))
+    (should (eq (plist-get (append compact nil) :style) 'toggle)))
+  (should-not (menu-entry coq-eglot--options-menu
+                          "Set Printing Compact Contexts"))
+  (should-not (menu-entry coq-eglot--options-menu
+                          "Unset Printing Compact Contexts"))
   (with-test-file
     (let ((coq-eglot--printing-flags nil))
       (coq-set-printing-coercions)
@@ -3399,21 +3413,29 @@ do what they do, and warn."
                                (buffer-string)))))))
 
 (ert-deftest coq-eglot-compact-contexts ()
-  "With Set Printing Compact Contexts, like in Coq, the hypotheses whose
-type is in Type share their lines, three spaces apart: not those in Prop
-or SProp, nor the definitions.  Each one keeps its folding button."
+  "The display option puts compatible hypotheses on the same line."
   (with-test-file
-    (let ((coq-eglot--printing-flags nil)
-          (coq-eglot-compact-contexts nil))
+    (let ((coq-eglot-compact-contexts nil))
       (goto-marker "compact")
       (run #'coq-eglot-goto-point)
       (should (string-search "  A : Type\n  a : A\n"
                              (with-current-buffer "*goals*" (buffer-string))))
-      (coq-set-printing-compact-contexts)
-      (wait-until (lambda ()
-                    (with-current-buffer "*goals*"
-                      (string-search "A : Type   a : A" (buffer-string))))
-                  10)
+      (coq-eglot-toggle-compact-contexts)
+      (should
+       (wait-until
+        (lambda ()
+          (with-current-buffer "*goals*"
+            (or (string-search "A : Type   a : A" (buffer-string))
+                (progn
+                  (goto-char (point-min))
+                  (text-property-search-forward
+                   'coq-eglot-late-context-compaction t t)))))
+        10))
+      ;; On a loaded server the 50 ms display wait may expire.  The late
+      ;; result is then offered without moving the goal by itself.
+      (unless (with-current-buffer "*goals*"
+                (string-search "A : Type   a : A" (buffer-string)))
+        (coq-eglot-compact-late-context))
       (with-current-buffer "*goals*"
         (let ((text (buffer-substring-no-properties (point-min) (point-max))))
           (should (string-search "\n  n, m : nat   P : nat -> Prop\n" text))
@@ -3424,28 +3446,232 @@ or SProp, nor the definitions.  Each one keeps its folding button."
                                  text))))
       (should (member "a" (coq-hyps-names)))
       (should (= (length (coq-hyps-regions)) 9))
-      (coq-unset-printing-compact-contexts)
-      (wait-until (lambda ()
-                    (with-current-buffer "*goals*"
-                      (string-search "A : Type\n  a : A" (buffer-string))))
-                  10)
-      ;; the option, overridden by the commands until the server stops
-      (setq coq-eglot--printing-flags nil)
-      (setq coq-eglot-compact-contexts t)
-      (run #'coq-eglot-retract-buffer)
-      (goto-marker "compact")
-      (run #'coq-eglot-goto-point)
-      (should (wait-until (lambda ()
-                            (with-current-buffer "*goals*"
-                              (string-search "A : Type   a : A"
-                                             (buffer-string))))
-                          10))
-      (coq-unset-printing-compact-contexts)
+      (coq-eglot-toggle-compact-contexts)
       (should (wait-until (lambda ()
                             (with-current-buffer "*goals*"
                               (string-search "A : Type\n  a : A"
                                              (buffer-string))))
                           10)))))
+
+(ert-deftest coq-eglot-goals-do-not-wait-for-hyp-sorts ()
+  "The semantic goals answer is delivered without an auxiliary request."
+  (let (goals-success received published queried)
+    (cl-letf (((symbol-function 'coq-eglot-lsp-query-async)
+               (lambda (&rest _) (setq queried t)))
+              ((symbol-function 'coq-eglot-lsp--async-request)
+               (lambda (_pos _method _params success _error)
+                 (setq goals-success success)
+                 'goals-context))
+              ((symbol-function 'coq-eglot-lsp--answer)
+               (lambda (&rest _)
+                 (coq-eglot-lsp-make-answer
+                  :goals (list :goals (vector (list :hyps [] :ty "True"))))))
+              ((symbol-function 'coq-eglot-lsp--publish)
+               (lambda (answer) (push answer published))))
+      (should (eq (coq-eglot-lsp-goals-async
+                   1 (lambda (answer) (setq received answer)) #'ignore)
+                  'goals-context))
+      (funcall goals-success nil nil)
+      (should received)
+      (should-not queried)
+      (should (= (length published) 1)))))
+
+(ert-deftest coq-eglot-hyp-sorts-within-display-wait ()
+  "Sorts received during the display wait compact the initial goals."
+  (with-temp-buffer
+    (let ((coq-eglot-compact-contexts t)
+          (coq-eglot-lsp-hyp-sorts-wait 10)
+          (coq-eglot-lsp-hyp-sorts-deadline 20)
+          (answer (coq-eglot-lsp-make-answer
+                   :context (coq-eglot-lsp--make-context :proof/goals 1)
+                   :goals (list :goals
+                                (vector (list :hyps [] :ty "True")))))
+          sorts-success shown)
+      (cl-letf (((symbol-function 'coq-eglot--displays-p) (lambda () t))
+                ((symbol-function 'coq-eglot-lsp-hyp-sorts-async)
+                 (lambda (_answer success _error)
+                   (setq sorts-success success)
+                   'sorts-context))
+                ((symbol-function 'coq-eglot--show-answer-now)
+                 (lambda (value &optional _goals-only) (setq shown value))))
+        (unwind-protect
+            (progn
+              (coq-eglot--show-answer-enriched answer t)
+              (should-not shown)
+              (funcall sorts-success '(("x" . "Type")))
+              (should (eq shown answer))
+              (should (equal
+                       (plist-get
+                        (aref (plist-get (coq-eglot-lsp-answer-goals answer)
+                                        :goals)
+                              0)
+                        :hyp-sorts)
+                       '(("x" . "Type")))))
+          (coq-eglot--cancel-hyp-sorts))))))
+
+(ert-deftest coq-eglot-hyp-sorts-after-display ()
+  "Late sorts are offered without moving an already displayed goal."
+  (with-temp-buffer
+    (let* ((coq-eglot-compact-contexts t)
+           (coq-eglot-lsp-hyp-sorts-wait 10)
+           (coq-eglot-lsp-hyp-sorts-deadline 20)
+           (goals (list :goals (vector (list :hyps [] :ty "True"))))
+           (output (coq-eglot--make-output))
+           (answer (coq-eglot-lsp-make-answer
+                    :context (coq-eglot-lsp--make-context :proof/goals 1)
+                    :goals goals))
+           sorts-success shown offered)
+      (setf (coq-eglot--output-goals output) goals)
+      (setq coq-eglot--buffer-output output)
+      (cl-letf (((symbol-function 'coq-eglot--displays-p) (lambda () t))
+                ((symbol-function 'coq-eglot-lsp-hyp-sorts-async)
+                 (lambda (_answer success _error)
+                   (setq sorts-success success)
+                   'sorts-context))
+                ((symbol-function 'coq-eglot--show-answer-now)
+                 (lambda (value &optional _goals-only) (setq shown value)))
+                ((symbol-function 'coq-eglot--offer-late-context-compaction)
+                 (lambda () (setq offered t))))
+        (unwind-protect
+            (progn
+              (coq-eglot--show-answer-enriched answer t)
+              (coq-eglot--hyp-sorts-display answer t)
+              (should (eq shown answer))
+              (funcall sorts-success '(("x" . "Type")))
+              (let ((goal (aref (plist-get goals :goals) 0)))
+                (should-not (plist-get goal :hyp-sorts))
+                (should (equal (plist-get goal :hyp-sorts-late)
+                               '(("x" . "Type")))))
+              (should offered))
+          (coq-eglot--cancel-hyp-sorts))))))
+
+(ert-deftest coq-eglot-hyp-sorts-timeout-cancels-enrichment ()
+  "The auxiliary deadline cancels sorts and ignores a racing success."
+  (with-temp-buffer
+    (let* ((coq-eglot-compact-contexts t)
+           (coq-eglot-lsp-hyp-sorts-wait 10)
+           (coq-eglot-lsp-hyp-sorts-deadline 20)
+           (answer (coq-eglot-lsp-make-answer
+                    :context (coq-eglot-lsp--make-context :proof/goals 1)
+                    :goals (list :goals
+                                 (vector (list :hyps [] :ty "True")))))
+           sorts-success shown cancelled)
+      (cl-letf (((symbol-function 'coq-eglot--displays-p) (lambda () t))
+                ((symbol-function 'coq-eglot-lsp-hyp-sorts-async)
+                 (lambda (_answer success _error)
+                   (setq sorts-success success)
+                   'sorts-context))
+                ((symbol-function 'coq-eglot-lsp-cancel-request)
+                 (lambda (context) (setq cancelled context)))
+                ((symbol-function 'coq-eglot--show-answer-now)
+                 (lambda (value &optional _goals-only) (setq shown value))))
+        (unwind-protect
+            (progn
+              (coq-eglot--show-answer-enriched answer t)
+              (coq-eglot--hyp-sorts-deadline answer t)
+              (should (eq cancelled 'sorts-context))
+              (should (eq shown answer))
+              (funcall sorts-success '(("x" . "Type")))
+              (let ((goal (aref
+                           (plist-get (coq-eglot-lsp-answer-goals answer)
+                                      :goals)
+                           0)))
+                (should-not (plist-get goal :hyp-sorts))
+                (should-not (plist-get goal :hyp-sorts-late))))
+          (coq-eglot--cancel-hyp-sorts))))))
+
+(ert-deftest coq-eglot-lsp-critical-section-waits-for-user-request ()
+  "A critical section neither interrupts an active read nor lets a new one in."
+  (with-temp-buffer
+    (let* ((user (coq-eglot-lsp--make-context :petanque/run_at_point 1))
+           (critical (coq-eglot-lsp--make-context :proof/goals 1))
+           (later (coq-eglot-lsp--make-context :petanque/run_at_point 1))
+           sent)
+      (setq coq-eglot-lsp--interactive-context user
+            coq-eglot-lsp--critical-queue
+            (list (cons critical (lambda () (push 'critical sent))))
+            coq-eglot-lsp--interactive-queue
+            (list (cons later (lambda () (push 'later sent)))))
+      ;; The critical section waits for the explicit user request.
+      (coq-eglot-lsp--dispatch-scheduled)
+      (should-not sent)
+      (coq-eglot-lsp--request-finished user)
+      (should (equal sent '(critical)))
+      (should (eq coq-eglot-lsp--critical-context critical))
+      (should-not coq-eglot-lsp--interactive-context)
+      ;; The later read waits until the critical section is over.
+      (coq-eglot-lsp--request-finished critical)
+      (should (equal sent '(later critical)))
+      (should (eq coq-eglot-lsp--interactive-context later)))))
+
+(ert-deftest coq-eglot-lsp-critical-request-roles ()
+  "Final goals and sorts are critical; document checking is preemptible."
+  (let (goals-role sorts-role check-role)
+    (cl-letf (((symbol-function 'coq-eglot-lsp-goals-async)
+               (lambda (&rest _) (setq goals-role coq-eglot-lsp--request-role)))
+              ((symbol-function 'coq-eglot-lsp-query-async)
+               (lambda (&rest _) (setq sorts-role coq-eglot-lsp--request-role)))
+              ((symbol-function 'coq-eglot-lsp--async-request)
+               (lambda (&rest _) (setq check-role coq-eglot-lsp--request-role))))
+      (coq-eglot-lsp-final-goals-async 1 #'ignore #'ignore)
+      (let ((coq-eglot-lsp-hyp-sort-names-function nil))
+        (coq-eglot-lsp-hyp-sorts-async
+         (coq-eglot-lsp-make-answer
+          :context (coq-eglot-lsp--make-context :proof/goals 1))
+         #'ignore #'ignore))
+      (coq-eglot-lsp-check-async 1 #'ignore #'ignore))
+    (should (eq goals-role 'critical))
+    (should (eq sorts-role 'critical))
+    (should (eq check-role 'preemptible))))
+
+(ert-deftest coq-eglot-twins-do-not-compact-contexts ()
+  "Twins neither compact contexts nor ask for their hypothesis sorts."
+  (let ((twin (generate-new-buffer " *coq-eglot-twin-test*")))
+    (unwind-protect
+        (with-temp-buffer
+          (setq coq-eglot-compact-contexts t
+                coq-eglot--twin twin)
+          (should-not (coq-eglot--compact-contexts-p))
+          (should-not (coq-eglot--compact-contexts-p)))
+      (kill-buffer twin))))
+
+(ert-deftest coq-eglot-late-hyp-sorts-only-offered-when-useful ()
+  "A late-sort action is offered only if it would change the formatting."
+  (let ((coq-eglot-compact-contexts t)
+        (coq-eglot--printing-flags nil)
+        (goal (list :hyps (vector (list :names '("x") :ty "nat")
+                                  (list :names '("y") :ty "nat"))
+                    :ty "True")))
+    (cl-letf (((symbol-function 'coq-eglot--hyps-width) (lambda () 80))
+              ((symbol-function 'coq-eglot--twin-layout-p) (lambda () nil)))
+      (let ((goals (list :goals (vector goal))))
+        (should-not (coq-eglot--late-hyp-sorts-useful-p goals))
+        (plist-put goal :hyp-sorts-late
+                   '(("x" . "Prop") ("y" . "Prop")))
+        (should-not (coq-eglot--late-hyp-sorts-useful-p goals))
+        (plist-put goal :hyp-sorts-late
+                   '(("x" . "Type") ("y" . "Type")))
+        (should (coq-eglot--late-hyp-sorts-useful-p goals))))))
+
+(ert-deftest coq-eglot-hyp-sort-names-only-formatting-candidates ()
+  "Only one-line assumptions need sorts for compact context formatting."
+  (let* ((goal (list
+                :hyps (vector
+                       (list :names '("x" "y") :ty "nat")
+                       (list :names '("d") :def "0" :ty "nat")
+                       (list :names '("long") :ty "nat\n  * nat"))
+                :ty "True"))
+         (answer (coq-eglot-lsp-make-answer
+                  :goals (list :goals (vector goal)))))
+    (should (equal (coq-eglot--hyp-sort-names answer) '("x" "y")))
+    (let* ((coq-eglot-lsp-hyp-sort-names-function
+            #'coq-eglot--hyp-sort-names)
+           (command (coq-eglot-lsp--hyp-sorts-command
+                     (coq-eglot--hyp-sort-names answer))))
+      (should (string-search "COQ-EGLOT-SORT x" command))
+      (should (string-search "COQ-EGLOT-SORT y" command))
+      (should-not (string-search "COQ-EGLOT-SORT d" command))
+      (should-not (string-search "COQ-EGLOT-SORT long" command)))))
 
 (ert-deftest coq-eglot-show-at-point ()
   "C-c C-a C-s shows the goals and messages after the sentence at point,
@@ -3692,6 +3918,17 @@ alternatives of each.  Needs no server."
                           (boundp symbol)))
                       (cdr entry)))))
 
+(ert-deftest coq-eglot-lsp-internals-are-contained ()
+  "Only coq-eglot-lsp.el refers to private Eglot and jsonrpc symbols."
+  (let ((directory (file-name-directory (locate-library "coq-eglot-lsp"))))
+    (dolist (file (directory-files directory t "\\`coq-eglot.*\\.el\\'"))
+      (unless (string= (file-name-nondirectory file) "coq-eglot-lsp.el")
+        (with-temp-buffer
+          (insert-file-contents file)
+          (should-not
+           (re-search-forward
+            (rx symbol-start (or "eglot--" "jsonrpc--")) nil t)))))))
+
 (defmacro with-fake-server (output &rest body)
   "Run BODY with the server `fake-server', printing OUTPUT with --version."
   (declare (indent 1) (debug t))
@@ -3763,12 +4000,23 @@ the load path of the buffer."
 
 (ert-deftest coq-eglot-load-path-comma ()
   "A comma in a directory is a user error: coq-lsp splits -R DIR,LP there."
-  (should-error (coq-eglot-lsp--root-load-path-args "/tmp/a,b/")
-                :type 'user-error)
   (let ((coq-load-path '((rec "lib,x" "Lib"))))
     (should-error (coq-eglot-lsp-load-path-args) :type 'user-error))
   (should (equal (coq-eglot-lsp--logical-binding "/tmp/ab/" "Lib")
                  "/tmp/ab,Lib")))
+
+(ert-deftest coq-eglot-lsp-cancel-one-request ()
+  "A request context cancels only its JSON-RPC request."
+  (let ((context (coq-eglot-lsp--make-context :proof/goals 1))
+        notified)
+    (setf (coq-eglot-lsp-context-id context) 42)
+    (cl-letf (((symbol-function 'coq-eglot-lsp-current-server)
+               (lambda () 'server))
+              ((symbol-function 'jsonrpc-notify)
+               (lambda (server method params)
+                 (setq notified (list server method params)))))
+      (coq-eglot-lsp-cancel-request context)
+      (should (equal notified '(server :$/cancelRequest (:id 42)))))))
 
 (ert-deftest coq-eglot-compile-hooks-cheap ()
   "The hooks of the outdated libraries schedule nothing if no buffer
@@ -4054,7 +4302,7 @@ the other requests waiting are sent all the same."
   "Without `eglot-connect-timeout', the requests wait for the server as
 long as it connects, as Eglot does; with it, they fail after it."
   (with-temp-buffer
-    (let ((connected nil) (sent nil) (failures nil))
+    (let ((connected nil) (sent nil) (failures nil) request-success)
       (cl-letf (((symbol-function 'coq-eglot-lsp-connect)
                  (lambda () (and connected 'server)))
                 ((symbol-function 'coq-eglot-lsp-current-server)
@@ -4064,8 +4312,9 @@ long as it connects, as Eglot does; with it, they fail after it."
                 ((symbol-function 'eglot--signal-textDocument/didChange)
                  #'ignore)
                 ((symbol-function 'jsonrpc--async-request-1)
-                 (lambda (_server method _params &rest _args)
+                 (lambda (_server method _params &rest args)
                    (push method sent)
+                   (setq request-success (plist-get args :success-fn))
                    (list 1))))
         (let ((request (lambda (method)
                          (coq-eglot-lsp--async-request
@@ -4082,7 +4331,14 @@ long as it connects, as Eglot does; with it, they fail after it."
             (setq connected t)
             (coq-eglot-lsp--watch-connection (current-buffer) start)
             (should (equal sent '(:first)))
-            (should-not (coq-eglot-lsp-connecting-p)))
+            (should-not (coq-eglot-lsp-connecting-p))
+            ;; The scheduler sends the next interactive request only after
+            ;; the first one has answered.  The fake transport must model
+            ;; that answer before the second connection scenario.
+            (funcall request-success 'answer)
+            (should (wait-until
+                     (lambda () (not coq-eglot-lsp--interactive-context))
+                     2)))
           ;; with a timeout
           (setq connected nil)
           (funcall request :second)
@@ -4334,6 +4590,101 @@ The first error between two positions, warnings do not count."
                   1 (list (diagnostic 20 22)))))
     (should-not (coq-eglot-session-error-range 1 100))))
 
+(ert-deftest coq-eglot-diagnostic-stops-running-check ()
+  "The first error is found from the fixed start, behind current progress."
+  (with-session "A. B. C."
+    (setq coq-eglot-session-sentence-end-function
+          (lambda (_pos) (point-max)))
+    (let* ((work (coq-eglot-session-start-work))
+           (context (coq-eglot-lsp--make-context
+                     :petanque/get_state_at_pos 8))
+           cancelled failed traced)
+      (coq-eglot-session-set-target (point-max))
+      (setq coq-eglot--work-context context
+            coq-eglot--work-start 1)
+      (let ((event
+             (coq-eglot-lsp--make-diagnostics
+              1 (list (coq-eglot-lsp--make-diagnostic
+                       5 5 'error "bad B" '(4 . 6))))))
+        (cl-letf (((symbol-function 'coq-eglot-lsp-cancel-request)
+                   (lambda (request) (setq cancelled request)))
+                  ((symbol-function 'coq-eglot--update-overlays) #'ignore)
+                  ((symbol-function 'coq-eglot--trace-check)
+                   (lambda (start end answer)
+                     (setq traced (list start end answer))))
+                  ((symbol-function 'coq-eglot-position) (lambda () 7))
+                  ((symbol-function 'coq-eglot--fail)
+                   (lambda (start end text &optional _answer)
+                     (setq failed (list start end text)))))
+          ;; The real hook has this order: the session, then the interface.
+          (coq-eglot-session-observe event)
+          (coq-eglot--observe event))
+        (should (eq cancelled context))
+        (should (equal traced '(1 4 nil)))
+        (should (equal failed '(4 6 "bad B")))
+        (should-not (coq-eglot-session-work-p work))
+        (should-not (coq-eglot-session-target))
+        (should-not coq-eglot--work-context)
+        (should-not coq-eglot--work-start)))))
+
+(ert-deftest coq-eglot-known-error-sends-no-operation ()
+  "The planner stops at a valid recorded error without asking the server."
+  (with-session "A. B. C."
+    (setq coq-eglot-session-sentence-start-function
+          (lambda (pos) (and (< pos (point-max)) pos)))
+    (setq coq-eglot-session-sentence-end-function
+          (lambda (_pos) (point-max)))
+    (coq-eglot-session-receive-diagnostics
+     (coq-eglot-lsp--make-diagnostics
+      1 (list (coq-eglot-lsp--make-diagnostic
+               5 5 'error "known bad B" '(4 . 6)))))
+    (coq-eglot-session-set-target (point-max))
+    (let (sent failed)
+      (cl-letf (((symbol-function 'coq-eglot--step)
+                 (lambda (&rest _) (setq sent t)))
+                ((symbol-function 'coq-eglot--advance)
+                 (lambda (&rest _) (setq sent t)))
+                ((symbol-function 'coq-eglot--update-overlays) #'ignore)
+                ((symbol-function 'coq-eglot--trace-check) #'ignore)
+                ((symbol-function 'coq-eglot--fail)
+                 (lambda (start end text &optional _answer)
+                   (setq failed (list start end text)))))
+        (coq-eglot--plan))
+      (should-not sent)
+      (should (equal failed '(4 6 "known bad B")))
+      (should-not (coq-eglot-session-target)))))
+
+(ert-deftest coq-eglot-document-error-stops-running-check ()
+  "An error without a sentence range also stops a pending target request."
+  (with-session "A. B. C."
+    (setq coq-eglot-session-sentence-end-function
+          (lambda (_pos) (point-max)))
+    (let* ((work (coq-eglot-session-start-work))
+           (context (coq-eglot-lsp--make-context
+                     :petanque/get_state_at_pos 8))
+           cancelled shown highlighted)
+      (coq-eglot-session-set-target (point-max))
+      (setq coq-eglot--work-context context
+            coq-eglot--work-start 1)
+      (let ((event
+             (coq-eglot-lsp--make-diagnostics
+              1 (list (coq-eglot-lsp--make-diagnostic
+                       1 3 'error "bad document" nil)))))
+        (cl-letf (((symbol-function 'coq-eglot-lsp-cancel-request)
+                   (lambda (request) (setq cancelled request)))
+                  ((symbol-function 'coq-eglot--update-overlays) #'ignore)
+                  ((symbol-function 'coq-eglot--show-error)
+                   (lambda (text) (setq shown text)))
+                  ((symbol-function 'coq-eglot--highlight-error)
+                   (lambda (start end) (setq highlighted (cons start end)))))
+          (coq-eglot-session-observe event)
+          (coq-eglot--observe event))
+        (should (eq cancelled context))
+        (should (equal shown "bad document"))
+        (should (equal highlighted '(1 . 3)))
+        (should-not (coq-eglot-session-work-p work))
+        (should-not (coq-eglot-session-target))))))
+
 (defmacro with-planner (text &rest body)
   "Run BODY with a session on TEXT, sentences ending with a dot."
   (declare (indent 1) (debug t))
@@ -4350,6 +4701,21 @@ The first error between two positions, warnings do not count."
                (goto-char pos)
                (if (search-forward "." nil t) (point) (point-max)))))
      ,@body))
+
+(ert-deftest coq-eglot-step-separates-check-from-final-goals ()
+  "A one-sentence step starts with the same resumable check as a distant one."
+  (with-planner "A."
+    (let (checked)
+      (cl-letf (((symbol-function 'coq-eglot-position) (lambda () 1))
+                ((symbol-function 'coq-eglot--update-overlays) #'ignore)
+                ((symbol-function 'coq-eglot--compile-then)
+                 (lambda (_work _start _end continue) (funcall continue nil)))
+                ((symbol-function 'coq-eglot--check)
+                 (lambda (work before start last failed)
+                   (setq checked (list work before start last failed)))))
+        (coq-eglot--step 1))
+      (should (coq-eglot-session-work-p (car checked)))
+      (should (equal (cdr checked) '(1 1 2 nil))))))
 
 (ert-deftest coq-eglot-session-planner ()
   "The planner starts one operation at a time toward the target: one
