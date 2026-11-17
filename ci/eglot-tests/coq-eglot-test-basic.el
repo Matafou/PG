@@ -5111,10 +5111,15 @@ with goals."
     (should (equal (coq-eglot-goals-bullet-line (list :bullet nil)) ""))))
 
 (defun goal-button ()
-  "After string of the button of the goal title at point."
-  (let ((ov (seq-find (lambda (ov) (overlay-get ov 'coq-eglot-goal-button))
-                      (overlays-at (point)))))
-    (and ov (substring-no-properties (overlay-get ov 'after-string)))))
+  "The overlay of the button after the goal title at point."
+  (seq-find (lambda (ov) (overlay-get ov 'coq-eglot-goal-button))
+            (overlays-at (line-end-position))))
+
+(defun goal-button-text ()
+  "Text of the button after the goal title at point."
+  (let ((ov (goal-button)))
+    (and ov (string-remove-suffix
+             "\n" (substring-no-properties (overlay-get ov 'display))))))
 
 (ert-deftest coq-eglot-detailed-goals ()
   "The other goals with their hypotheses, folded under their title, and
@@ -5147,7 +5152,7 @@ the unfocused goals by level, with the next bullet."
             (search-forward "goal 2 is:")
             (goto-char (match-beginning 0))
             (should (= (point) (coq-goals--other-goals-start)))
-            (should (equal (goal-button) "  ▸ 1 hypothesis"))
+            (should (equal (goal-button-text) "  ▸ 1 hypothesis"))
             (let ((hyp (save-excursion (search-forward "n : nat"))))
               (should (invisible-p hyp))
               ;; above the keymap of the other goals
@@ -5155,14 +5160,24 @@ the unfocused goals by level, with the next bullet."
                           #'coq-eglot-toggle-goal-hyps))
               (call-interactively (key-binding (kbd "RET")))
               (should-not (invisible-p hyp))
-              (should (equal (goal-button) "  ▾"))
+              (should (equal (goal-button-text) "  ▾"))
               ;; a click folds them again
               (let ((window (get-buffer-window "*goals*")))
                 (when window
                   (coq-eglot-toggle-goal-hyps
                    (list 'mouse-1 (list window (point) '(0 . 0) 0)))
                   (should (invisible-p hyp))
-                  (call-interactively (key-binding (kbd "RET")))))))
+                  ;; a click on the button too, not on the other goals
+                  (let ((end (line-end-position)))
+                    (should (eq (overlay-start (goal-button)) end))
+                    (should (eq (key-binding [mouse-1] nil nil end)
+                                #'coq-eglot-toggle-goal-hyps))
+                    ;; elsewhere, the folding of all the other goals
+                    (should (eq (key-binding [mouse-1] nil nil (+ end 3))
+                                #'coq-toggle-other-goals))
+                    (coq-eglot-toggle-goal-hyps
+                     (list 'mouse-1 (list window end '(0 . 0) 0))))
+                  (should-not (invisible-p hyp))))))
           ;; unfolded in the next goals
           (run #'coq-eglot-goto-point)
           (with-current-buffer "*goals*"

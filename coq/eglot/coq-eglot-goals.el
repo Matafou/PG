@@ -196,11 +196,27 @@ When no goal is focused."
     map)
   "Keymap of the titles of the goals with hypotheses.")
 
+(defun coq-eglot-goals--overlay (start end key &rest properties)
+  "Make an overlay from START to END toggling the hypotheses of goal KEY.
+With PROPERTIES.  Above the folding of the other goals, whose keymap
+it hides."
+  (let ((ov (make-overlay start end)))
+    (overlay-put ov 'coq-eglot-goal-overlay t)
+    (overlay-put ov 'coq-eglot-goal-title key)
+    (overlay-put ov 'evaporate t)
+    (overlay-put ov 'priority 10)
+    (overlay-put ov 'keymap coq-eglot-goals-title-map)
+    (overlay-put ov 'mouse-face 'highlight)
+    (overlay-put ov 'help-echo "mouse-1, RET: show or hide the hypotheses")
+    (while properties
+      (overlay-put ov (pop properties) (pop properties)))
+    ov))
+
 (defun coq-eglot-goals-decorate ()
   "Fold the hypotheses of the goals of the current buffer, but the unfolded.
-See `coq-eglot-goals--unfolded'.  Each title gets a button giving their
-number."
-  (remove-overlays (point-min) (point-max) 'coq-eglot-goal-button t)
+See `coq-eglot-goals--unfolded'.  The title of each goal and the button
+after it, giving the number of its hypotheses, show or hide them."
+  (remove-overlays (point-min) (point-max) 'coq-eglot-goal-overlay t)
   (when (listp buffer-invisibility-spec)
     (setq buffer-invisibility-spec
           (seq-remove (lambda (elt)
@@ -215,24 +231,24 @@ number."
                                                nil (point-max)))
              (key (get-text-property pos 'coq-eglot-goal-title))
              (count (get-text-property pos 'coq-eglot-goal-hyps))
-             (folded (not (memq key coq-eglot-goals--unfolded)))
-             (ov (make-overlay pos end)))
+             (folded (not (memq key coq-eglot-goals--unfolded))))
         (push key keys)
         (when folded
           (add-to-invisibility-spec key))
-        (overlay-put ov 'coq-eglot-goal-button t)
-        (overlay-put ov 'evaporate t)
-        ;; above the folding of the other goals, whose keymap it hides
-        (overlay-put ov 'priority 10)
-        (overlay-put ov 'keymap coq-eglot-goals-title-map)
-        (overlay-put ov 'mouse-face 'highlight)
-        (overlay-put ov 'help-echo "mouse-1, RET: show or hide the hypotheses")
-        (overlay-put ov 'after-string
-                     (propertize (if folded
-                                     (format "  ▸ %d hypothes%s" count
-                                             (if (= count 1) "is" "es"))
-                                   "  ▾")
-                                 'face 'coq-other-goals-face))
+        (coq-eglot-goals--overlay pos end key)
+        ;; the button displays the newline after the title: a click on it
+        ;; is at a position of the buffer, where the keymap applies
+        (when (eq (char-after end) ?\n)
+          (coq-eglot-goals--overlay
+           end (1+ end) key
+           'coq-eglot-goal-button t
+           'display (concat "  "
+                            (propertize (if folded
+                                            (format "▸ %d hypothes%s" count
+                                                    (if (= count 1) "is" "es"))
+                                          "▾")
+                                        'face 'coq-other-goals-face)
+                            "\n")))
         (setq pos end)))
     ;; the buffer of the other goals: forget the goals that are gone
     (when keys
@@ -241,15 +257,16 @@ number."
                         coq-eglot-goals--unfolded)))))
 
 (defun coq-eglot-goals--title-at (event)
-  "Buffer and key of the goal title at EVENT, or at point if not a mouse event."
+  "Buffer and key of the goal title at EVENT, or at point if not a mouse event.
+On the title or on its button, see `coq-eglot-goals-decorate'."
   (if (mouse-event-p event)
       (let ((posn (event-start event)))
         (with-current-buffer (window-buffer (posn-window posn))
           (cons (current-buffer)
                 (and (posn-point posn)
-                     (get-text-property (posn-point posn)
+                     (get-char-property (posn-point posn)
                                         'coq-eglot-goal-title)))))
-    (cons (current-buffer) (get-text-property (point) 'coq-eglot-goal-title))))
+    (cons (current-buffer) (get-char-property (point) 'coq-eglot-goal-title))))
 
 (defun coq-eglot-toggle-goal-hyps (&optional event)
   "Show or hide the hypotheses of the goal whose title is at EVENT or point.
