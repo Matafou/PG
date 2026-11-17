@@ -4546,6 +4546,58 @@ message but in its sentence, is not kept."
       (should-not coq-eglot-session--diagnostics)
       (should-not (coq-eglot-sentences-range-ending-at end)))))
 
+;;; The events buffer
+
+(defun event-json (line)
+  "Text shown by `coq-eglot-lsp-show-event-json' on LINE."
+  (with-temp-buffer
+    (insert line)
+    (goto-char (point-min))
+    (let ((display-buffer-overriding-action '(display-buffer-no-window
+                                              (allow-no-window . t))))
+      (coq-eglot-lsp-show-event-json))
+    (buffer-text coq-eglot-lsp-event-json-buffer-name)))
+
+(ert-deftest coq-eglot-show-event-json ()
+  "The JSON message of a line of the events buffer, indented."
+  (let ((text (event-json
+               (concat "[jsonrpc] e[12:00:00.000] <-- proof/goals[3] "
+                       "{\"id\":3,\"result\":{\"goals\":null,"
+                       "\"messages\":[]}}"))))
+    (should (string-prefix-p "{" text))
+    (should (string-match-p "\n *\"goals\": null" text))
+    (should (string-match-p "\n *\"messages\": \\[\\]" text)))
+  (with-current-buffer coq-eglot-lsp-event-json-buffer-name
+    (should (derived-mode-p 'js-json-mode)))
+  (should-error (event-json "[jsonrpc] i[12:00:00.000] Running language server")
+                :type 'user-error)
+  ;; cut by the size limit of the events buffer
+  (should-error (event-json "[jsonrpc] e[12:00:00.000] <-- x {\"id\":3,\"res")
+                :type 'user-error))
+
+(ert-deftest coq-eglot-events-keys ()
+  "The events buffer of the server shows its messages as JSON.
+Not with the jsonrpc of Emacs 29, which pretty-prints them as Lisp."
+  (with-test-file
+    (run #'coq-eglot-assert-next-command)
+    (should (wait-until #'coq-eglot-lsp-current-server 10))
+    (let ((server (coq-eglot-lsp-current-server)))
+      (with-current-buffer (jsonrpc-events-buffer server)
+        (unless (coq-eglot-lsp--events-json-p server)
+          (should-not (current-local-map))
+          (ert-skip "The events buffer has no JSON"))
+        (should (eq (lookup-key (current-local-map) "j")
+                    #'coq-eglot-lsp-show-event-json))
+        ;; the answer to initialize, on one line
+        (goto-char (point-min))
+        (should (re-search-forward "<-- initialize\\[[0-9]+\\] {" nil t))
+        (let ((display-buffer-overriding-action '(display-buffer-no-window
+                                                  (allow-no-window . t))))
+          (coq-eglot-lsp-show-event-json))
+        (should (string-match-p "\n *\"capabilities\": {"
+                                (buffer-text
+                                 coq-eglot-lsp-event-json-buffer-name)))))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here

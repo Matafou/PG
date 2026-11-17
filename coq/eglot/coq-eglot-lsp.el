@@ -1086,6 +1086,72 @@ With its DIAGNOSTICS for VERSION, or the current version if not given."
       (or version eglot--versioned-identifier)
       (mapcar #'coq-eglot-lsp--diagnostic diagnostics)))))
 
+;;; The events buffer
+
+(defconst coq-eglot-lsp-event-json-buffer-name "*coq-eglot JSON*"
+  "Name of the buffer where `coq-eglot-lsp-show-event-json' shows a message.")
+
+(declare-function json-pretty-print-buffer "json" (&optional minimize))
+
+(defun coq-eglot-lsp-show-event-json ()
+  "Show the JSON message of the current line, indented.
+In the events buffer of Eglot (`eglot-events-buffer'), each message is
+on one line after a preamble, with the format full of
+`eglot-events-buffer-config', the default.  It is shown in the buffer
+`coq-eglot-lsp-event-json-buffer-name', point stays on the line.  In
+the events buffers of the Coq servers, \\<coq-eglot-lsp-events-map>\
+\\[coq-eglot-lsp-show-event-json] runs this command."
+  (interactive)
+  (require 'json)
+  (let ((line (buffer-substring-no-properties (line-beginning-position)
+                                              (line-end-position))))
+    ;; the preamble has brackets, never braces: a message is an object
+    (unless (string-match "{" line)
+      (user-error "Coq: no JSON message on this line"))
+    (let ((json (substring line (match-beginning 0))))
+      ;; `json-pretty-print-buffer' keeps a truncated message as is
+      (condition-case err
+          (json-parse-string json)
+        (json-error
+         (user-error "Coq: not a complete JSON message on this line (%s)"
+                     (error-message-string err))))
+      (with-current-buffer (get-buffer-create
+                            coq-eglot-lsp-event-json-buffer-name)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert json)
+          (json-pretty-print-buffer)
+          (goto-char (point-min))
+          (unless (derived-mode-p 'js-json-mode)
+            (js-json-mode)))
+        (display-buffer (current-buffer))))))
+
+(defvar coq-eglot-lsp-events-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map "j" #'coq-eglot-lsp-show-event-json)
+    map)
+  "Keymap of the events buffers of the Coq servers.
+They have no major mode: this is their local map.")
+
+(defun coq-eglot-lsp--events-json-p (server)
+  "Non-nil if the events buffer of SERVER has the messages as JSON.
+On one line each, with the format full of `eglot-events-buffer-config'.
+Older versions of jsonrpc, like the one of Emacs 29, have no format:
+they pretty-print the messages as Lisp."
+  (and (slot-exists-p server '-events-buffer-config)
+       (eq (plist-get (slot-value server '-events-buffer-config) :format)
+           'full)))
+
+(defun coq-eglot-lsp--events-keys (server)
+  "Use `coq-eglot-lsp-events-map' in the events buffer of SERVER.
+If it is a Coq server whose events buffer has the messages as JSON."
+  (when (and (cl-typep server 'coq-eglot-lsp-server)
+             (coq-eglot-lsp--events-json-p server))
+    (with-current-buffer (jsonrpc-events-buffer server)
+      (use-local-map coq-eglot-lsp-events-map))))
+
+(add-hook 'eglot-connect-hook #'coq-eglot-lsp--events-keys)
+
 (provide 'coq-eglot-lsp)
 
 ;;; coq-eglot-lsp.el ends here

@@ -5856,6 +5856,14 @@ a Coq file, which helps to report a bug.  Its size is bounded by
 @code{coq-eglot-trace-max-size}.  @code{coq-eglot-show-trace} (menu
 @code{Coq -> Show Trace}) displays it.
 @item
+@findex coq-eglot-lsp-show-event-json
+In the events buffer of a Coq server (@code{eglot-events-buffer}), where
+each message of the protocol is on one line, @kbd{j}
+(@code{coq-eglot-lsp-show-event-json}) shows the JSON message of the
+current line, indented, in the buffer @code{*coq-eglot JSON*}.  Not
+with older versions of jsonrpc, like the one of Emacs 29, which show the
+messages indented already, as Lisp.
+@item
 The display options of Proof General are honored (menu @code{Coq ->
 Windows}): @code{proof-auto-raise-buffers},
 @code{proof-multiple-frames-enable}, @code{proof-delete-empty-windows},
