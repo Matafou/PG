@@ -5215,6 +5215,35 @@ the unfocused goals by level, with the next bullet."
       (setq coq-fold-other-goals t)
       (setq coq-eglot-goals--unfolded nil))))
 
+(ert-deftest coq-eglot-window-need-other-goals ()
+  "The goals after the first one count for one line in the height the
+goals window needs: they are displayed only if the response leaves room."
+  (with-test-file
+    (with-layout t 'hybrid
+      (unwind-protect
+          (progn
+            (setq coq-fold-other-goals nil)
+            (setq coq-eglot-detailed-goals t)
+            (goto-marker "split")
+            (run #'coq-eglot-goto-point)
+            (let ((goals (get-buffer-window "*goals*")))
+              (should goals)
+              (with-current-buffer "*goals*"
+                (let ((start (coq-goals--other-goals-start))
+                      (mode-line (- (window-total-height goals)
+                                    (window-body-height goals))))
+                  (should start)
+                  (should (= (coq-eglot--window-need goals)
+                             (+ mode-line 1
+                                (count-screen-lines (point-min) start nil
+                                                    goals))))
+                  (should (< (coq-eglot--window-need goals)
+                             (+ mode-line
+                                (count-screen-lines (point-min) (point-max)
+                                                    nil goals))))))))
+        (setq coq-eglot-detailed-goals nil)
+        (setq coq-fold-other-goals t)))))
+
 (provide 'coq-eglot-test-basic)
 
 ;;; coq-eglot-test-basic.el ends here

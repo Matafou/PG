@@ -5850,6 +5850,8 @@ the next goals.  The unfocused goals are grouped by level, the innermost
 first, and the level of the next goal says which bullet focuses it.
 When a subproof is complete, the goals say it in any case, like Coq
 (``Focus next goal with bullet -.'').
+In the heights of the windows, the goals after the first one count for
+one line, detailed or not: they are visible if the messages leave room.
 @item
 The goals and the answers of the queries are printed at the width of
 their windows, see @code{coq-auto-adapt-printing-width}, without

@@ -908,10 +908,17 @@ heights in the same order, or nil if TOTAL is too small."
         heights))))
 
 (defun coq-eglot--window-need (window)
-  "Height WINDOW needs to display its whole buffer, mode line included."
+  "Height WINDOW needs to display its buffer, mode line included.
+The goals after the first one count for one line, the first of them or
+their summary when folded: they are displayed only if the other windows
+leave room."
   (+ (- (window-total-height window) (window-body-height window))
      (with-current-buffer (window-buffer window)
-       (count-screen-lines (point-min) (point-max) nil window))))
+       (let ((others (and (derived-mode-p 'coq-eglot-goals-mode)
+                          (coq-goals--other-goals-start))))
+         (if others
+             (1+ (count-screen-lines (point-min) others nil window))
+           (count-screen-lines (point-min) (point-max) nil window))))))
 
 (defun coq-eglot--resize-windows ()
   "Adjust the heights of the windows.
