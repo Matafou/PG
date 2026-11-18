@@ -372,10 +372,11 @@ Then adjust the heights of the windows, see
 `coq-optimise-resp-windows-enable'.  Do nothing if called from a script
 buffer that is not active, see `coq-eglot--displays-p'."
   (when (coq-eglot--displays-p)
-    (coq-eglot--set-buffer-text-1 name mode text)))
+    (coq-eglot--render-buffer-text name mode text)))
 
-(defun coq-eglot--set-buffer-text-1 (name mode text)
+(defun coq-eglot--render-buffer-text (name mode text)
   "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
+From any script buffer, see `coq-eglot--set-buffer-text'.
 When the goals and the messages share a window (see
 `proof-three-window-enable'), no messages do not hide the goals.  Like
 in Proof General, the buffer is displayed only if

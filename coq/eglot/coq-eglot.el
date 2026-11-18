@@ -644,10 +644,11 @@ The width of their windows, or the flags of `coq-eglot-set-flag'.  Not
 during a check: the goals of each sentence are asked when it is checked,
 at the current width.  For OUTPUT, the current one by default."
   (coq-eglot--with-output (or output (coq-eglot--output))
-    (coq-eglot--refresh-width-1)))
+    (coq-eglot--reprint-goals)))
 
-(defun coq-eglot--refresh-width-1 ()
-  "Like `coq-eglot--refresh-width' for the current output."
+(defun coq-eglot--reprint-goals ()
+  "Ask the goals again if their width or printing flags changed.
+For the current output, see `coq-eglot--refresh-width'."
   (setf (coq-eglot--output-width-timer (coq-eglot--output)) nil)
   (let* ((output (coq-eglot--output))
          (script (coq-eglot--active-buffer))
@@ -744,7 +745,7 @@ Intermediate goals that are not displayed never cause this request."
         (user-error "Coq: no late context compaction is available"))
       (plist-put goal :hyp-sorts sorts)
       (plist-put goal :hyp-sorts-late nil)
-      (coq-eglot--show-goals-1
+      (coq-eglot--render-goals
        (coq-eglot-lsp-make-answer
         :goals goals
         :printing-width (coq-eglot--output-width output)
@@ -796,7 +797,7 @@ See `coq-eglot-detailed-goals'.  Without asking the server again."
   (setq coq-eglot-detailed-goals (not coq-eglot-detailed-goals))
   (coq-eglot--with-script
     (let ((output (coq-eglot--output)))
-      (coq-eglot--show-goals-1
+      (coq-eglot--render-goals
        (coq-eglot-lsp-make-answer
         :goals (coq-eglot--output-goals output)
         :printing-width (coq-eglot--output-width output)
@@ -818,10 +819,11 @@ See `coq-eglot-split-goals'.  Run `coq-eglot-output-hook'.  Do nothing
 in a script buffer that is not active, see `coq-eglot--displays-p': the
 output keeps the state of the buffer it displays."
   (when (coq-eglot--displays-p)
-    (coq-eglot--show-goals-1 answer)))
+    (coq-eglot--render-goals answer)))
 
-(defun coq-eglot--show-goals-1 (answer)
-  "Display the goals of ANSWER of the server, see `coq-eglot--show-goals'."
+(defun coq-eglot--render-goals (answer)
+  "Display the goals of ANSWER of the server, from any script buffer.
+See `coq-eglot--show-goals', which does it from the active one only."
   (let* ((output (coq-eglot--output))
          (goals (and answer (coq-eglot-lsp-answer-goals answer)))
          (new (not (equal goals (coq-eglot--output-goals output)))))
