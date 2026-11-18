@@ -5901,7 +5901,8 @@ again at once.  They are forgotten when the server stops.  The menu
 Set Printing Compact Contexts, the hypotheses whose type is in
 @code{Type} (neither in @code{Prop} nor in @code{SProp}, and not the
 definitions) share their lines, as many as fit, unless
-@code{coq-eglot-compact-contexts} is nil; the commands Set and Unset
+@code{coq-eglot-compact-contexts} is nil (menu @code{Coq -> OPTIONS ->
+Compact Contexts}, also in @code{Coq -> Windows}); the commands Set and Unset
 Printing Compact Contexts override this option until the server stops,
 a Set sentence of the script does not.  The server is asked the sorts
 of the types of the hypotheses with each goals.  The menu entries and

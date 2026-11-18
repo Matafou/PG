@@ -240,6 +240,14 @@ otherwise."
                                        (cdr (assoc "Windows"
                                                    (cdr coq-eglot--menu-spec))))))))
         (should (equal items '("smart" "hybrid" "horizontal" "vertical"))))
+      ;; a presentation of the goals, like in the OPTIONS menu
+      (let ((compact (assoc "Compact Contexts"
+                            (mapcar (lambda (item)
+                                      (and (vectorp item) (append item nil)))
+                                    (cdr (assoc "Windows"
+                                                (cdr coq-eglot--menu-spec)))))))
+        (should (eq (nth 1 compact) 'coq-eglot-toggle-compact-contexts))
+        (should (eq (plist-get (nthcdr 2 compact) :style) 'toggle)))
       (unwind-protect
           (progn
             (coq-eglot-set-layout-option 'proof-three-window-mode-policy

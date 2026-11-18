@@ -188,6 +188,10 @@ Compact contexts are a presentation option, not a command sent to Rocq.")
      ["Detailed Other Goals" coq-eglot-toggle-detailed-goals
       :style toggle :selected coq-eglot-detailed-goals
       :help "The other goals with their hypotheses, by level"]
+     ;; also in the OPTIONS menu, see `coq-eglot--options-menu'
+     ["Compact Contexts" coq-eglot-toggle-compact-contexts
+      :style toggle :selected coq-eglot-compact-contexts
+      :help "Put compatible hypotheses on the same line"]
      ("3 Windows mode layout"
       ["smart"
        (coq-eglot-set-layout-option 'proof-three-window-mode-policy 'smart)
