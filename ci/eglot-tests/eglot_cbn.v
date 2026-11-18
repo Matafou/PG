@@ -1,5 +1,5 @@
 (*
- * Coq sources for coq-eglot-test-basic.el, with a sentence that the
+ * Coq sources for the tests of the Eglot backend, with a sentence that the
  * default interruption of coq-lsp cannot interrupt: cbn computes for
  * several seconds without checking for interruptions.
  *)

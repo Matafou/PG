@@ -5,7 +5,9 @@
 # Tests of the Eglot backend for Coq. They need Emacs >= 29 and
 # coq-lsp, set COQ_LSP to use a given server.
 
-COQ_EGLOT_TESTS:=$(wildcard coq-eglot-test-*.el)
+# coq-eglot-test-common.el: the settings and utilities of the others
+COQ_EGLOT_TESTS:=$(filter-out coq-eglot-test-common.el,\
+		   $(wildcard coq-eglot-test-*.el))
 
 COQ_EGLOT_SUCCESS:=$(COQ_EGLOT_TESTS:.el=.success)
 

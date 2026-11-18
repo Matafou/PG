@@ -1,5 +1,5 @@
 (*
- * Coq sources for coq-eglot-test-basic.el: goals longer than the
+ * Coq sources for the tests of the Eglot backend: goals longer than the
  * width of their window.
  *)
 

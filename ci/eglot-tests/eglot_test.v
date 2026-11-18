@@ -1,5 +1,5 @@
 (*
- * Coq sources for coq-eglot-test-basic.el
+ * Coq sources for the tests of the Eglot backend
  *
  * Tests move the proof position to marker comments and check the
  * goals and response buffers.

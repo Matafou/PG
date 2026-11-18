@@ -1,5 +1,5 @@
 (*
- * Coq sources for coq-eglot-test-basic.el, a second script buffer
+ * Coq sources for the tests of the Eglot backend, a second script buffer
  *
  * Tests the scripting of several buffers at once.
  *)

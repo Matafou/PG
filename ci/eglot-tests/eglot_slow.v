@@ -1,5 +1,5 @@
 (*
- * Coq sources for coq-eglot-test-basic.el, with slow sentences
+ * Coq sources for the tests of the Eglot backend, with slow sentences
  *
  * Tests the progress of the proof position during a check, and the
  * interruption of a check.  The computations return small terms:
