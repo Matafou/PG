@@ -1147,31 +1147,6 @@ at the current width.  For OUTPUT, the current one by default."
                  (coq-eglot--show-answer answer t)))
              #'ignore)))))))
 
-(defun coq-eglot--trim-lines (text)
-  "TEXT without blanks at the end of its lines.
-Coq leaves a space before some line breaks: in a line as wide as the
-window, it would wrap."
-  (replace-regexp-in-string "[ \t]+$" "" text))
-
-(defun coq-eglot--indent (text indentation)
-  "TEXT with INDENTATION, a string, at the beginning of its lines but the first.
-Without blanks at the end of its lines, see `coq-eglot--trim-lines'."
-  (string-replace "\n" (concat "\n" indentation)
-                  (coq-eglot--trim-lines text)))
-
-(defun coq-eglot--fill-names (names width)
-  "Join NAMES with commas, in lines of at most WIDTH characters.
-The lines after the first one are indented by 2, like Coq does.  Room
-is left for the comma or the colon after them."
-  (let ((lines nil) (line nil))
-    (dolist (name names)
-      (let ((candidate (if line (concat line ", " name) name)))
-        (if (or (null line) (<= (+ 2 (length candidate)) width))
-            (setq line candidate)
-          (push (concat line ",") lines)
-          (setq line name))))
-    (mapconcat #'identity (nreverse (cons line lines)) "\n  ")))
-
 (defun coq-eglot--hyps-width ()
   "Width of the lines of the hypotheses.
 They must fit in the window, or in Coq's default width."
@@ -1180,34 +1155,6 @@ They must fit in the window, or in Coq's default width."
          coq-eglot--hyp-indentation
          coq-eglot--printing-width-margin)
     78))
-
-(defun coq-eglot--format-hyp (hyp)
-  "Format hypothesis HYP of a goal.
-Like Coq does: if it does not fit on one line, its names are on several
-lines, and its type goes below them, indented.  The text has the
-property `coq-hyp', the list of its names, and the part after the
-names the property `coq-hyp-body', to highlight and fold it, see
-`coq-hyps-decorate'."
-  (let* ((names (append (plist-get hyp :names) nil))
-         (width (coq-eglot--hyps-width))
-         (names-text (coq-eglot--fill-names names (- width 2)))
-         (last-line (car (last (split-string names-text "\n"))))
-         (def (and (plist-get hyp :def)
-                   (coq-eglot--trim-lines (plist-get hyp :def))))
-         (ty (coq-eglot--trim-lines (plist-get hyp :ty)))
-         (one-line (concat (if def (concat " := " def) "") " : " ty))
-         (body
-          ;; the server printed TY alone, without the names
-          (if (and (not (string-search "\n" one-line))
-                   (<= (+ 2 (length last-line) (length one-line)) width))
-              one-line
-            (concat (if def
-                        (concat " :=\n    " (coq-eglot--indent def "    ")
-                                "\n    : " (coq-eglot--indent ty "      "))
-                      (concat " :\n    " (coq-eglot--indent ty "    ")))))))
-    (propertize
-     (concat "  " names-text (propertize body 'coq-hyp-body t))
-     'coq-hyp names)))
 
 (defcustom coq-eglot-compact-contexts t
   "Non-nil: in the goals, the hypotheses whose type is in Type share lines.
@@ -1250,48 +1197,6 @@ Intermediate goals that are not displayed never cause this request."
        (append (plist-get goal :hyps) nil)))))
 
 (setq coq-eglot-lsp-hyp-sort-names-function #'coq-eglot--hyp-sort-names)
-
-(defun coq-eglot--simple-hyp-p (hyp text sorts)
-  "Non-nil if HYP, formatted as TEXT, can share its line with others.
-An assumption, not a definition, whose type is in Type, neither in Prop
-nor in SProp, see SORTS, the alist of
-`coq-eglot-lsp--parse-hyp-sorts'.  And TEXT is on one line."
-  (and (not (plist-get hyp :def))
-       (not (string-search "\n" text))
-       (seq-every-p (lambda (name)
-                      (let ((sort (cdr (assoc name sorts))))
-                        (and sort (not (member sort '("Prop" "SProp"))))))
-                    (plist-get hyp :names))))
-
-(defun coq-eglot--format-hyps (goal)
-  "Format the hypotheses of GOAL, one per line.
-With `coq-eglot-compact-contexts', put compatible hypotheses on the
-same line, three spaces apart, as many as fit in the width.  GOAL must
-have their sorts, see `coq-eglot--simple-hyp-p'."
-  (let ((sorts (and (coq-eglot--compact-contexts-p)
-                    (plist-get goal :hyp-sorts)))
-        (width (coq-eglot--hyps-width))
-        (lines nil)
-        (line nil))                     ; the current line of simple hyps
-    (dolist (hyp (append (plist-get goal :hyps) nil))
-      (let ((text (coq-eglot--format-hyp hyp)))
-        (cond
-         ((not (and sorts (coq-eglot--simple-hyp-p hyp text sorts)))
-          (when line (push line lines) (setq line nil))
-          (push text lines))
-         ;; each hyp keeps its indentation of 2, for its folding button
-         ((and line (<= (+ (length line) 1 (length text)) width))
-          (setq line (concat line " " text)))
-         (t
-          (when line (push line lines))
-          (setq line text)))))
-    (when line (push line lines))
-    (mapconcat (lambda (text) (concat text "\n")) (nreverse lines) "")))
-
-(defun coq-eglot--first-goal (goals)
-  "The first focused goal of GOALS, or nil."
-  (let ((focused (and goals (plist-get goals :goals))))
-    (and (> (length focused) 0) (aref focused 0))))
 
 (defun coq-eglot--late-hyp-sorts-useful-p (goals)
   "Non-nil if the late hypothesis sorts of GOALS would compact its context."
@@ -1351,29 +1256,6 @@ have their sorts, see `coq-eglot--simple-hyp-p'."
                          (coq-eglot-compact-late-context)))
               (insert "\n\n"))))))))
 
-(defun coq-eglot--format-conclusion (goal &optional no-separator)
-  "Format the conclusion of GOAL, below the separator unless NO-SEPARATOR."
-  (concat (if no-separator "" "  ============================\n")
-          "  " (coq-eglot--indent (plist-get goal :ty) "  ") "\n"))
-
-(defun coq-eglot--unfocused-p (goals)
-  "Non-nil if GOALS has unfocused goals."
-  (seq-some (lambda (level)
-              (seq-some (lambda (side) (> (length side) 0)) level))
-            (plist-get goals :stack)))
-
-(defun coq-eglot--unfocused-count (goals)
-  "Number of unfocused goals of GOALS."
-  (seq-reduce (lambda (count level)
-                (seq-reduce (lambda (count side) (+ count (length side)))
-                            level count))
-              (plist-get goals :stack) 0))
-
-(defun coq-eglot--unfocused-goals (goals)
-  "The unfocused goals of GOALS, the innermost level first."
-  (seq-mapcat (lambda (level) (seq-mapcat #'identity level 'list))
-              (plist-get goals :stack) 'list))
-
 (defun coq-eglot--goals-count ()
   "Numbers of the goals displayed, as (FOCUSED . UNFOCUSED), or nil.
 Nil outside of proofs.  This is `coq-goals-count-function' for the
@@ -1383,72 +1265,6 @@ Printing Unfocused."
     (when goals
       (cons (length (plist-get goals :goals))
             (coq-eglot--unfocused-count goals)))))
-
-(defun coq-eglot--format-goal-list (goals first)
-  "Format GOALS, numbered from FIRST, like Coq does for the other goals."
-  (let ((i (1- first)))
-    (mapconcat (lambda (goal)
-                 (setq i (1+ i))
-                 (format "\ngoal %d is:\n %s\n" i
-                         (coq-eglot--indent (plist-get goal :ty) " ")))
-               goals "")))
-
-(defun coq-eglot--format-other-goals (goals)
-  "Format the goals of GOALS after the first one.
-Like Coq with Set Printing Unfocused: the unfocused goals come after a
-line \"*** Unfocused goals:\".  coq-goals.el folds them, see
-`coq-fold-other-goals'.  With their hypotheses and levels if
-`coq-eglot-detailed-goals'."
-  (if coq-eglot-detailed-goals
-      (coq-eglot-goals-format-other goals)
-    (let ((others (cdr (append (plist-get goals :goals) nil)))
-          (unfocused (coq-eglot--unfocused-goals goals)))
-      (concat (coq-eglot--format-goal-list others 2)
-              (when unfocused
-                (concat "\n*** Unfocused goals:\n"
-                        (coq-eglot--format-goal-list unfocused
-                                                     (+ 2 (length others)))))))))
-
-(defun coq-eglot--format-goals-parts (goals &optional no-separator)
-  "Format GOALS, as returned by the server, like Coq does.
-Return (HYPOTHESES . REST): the number of goals and the hypotheses of
-the first one, then its conclusion and the other goals.  Both are empty
-if GOALS is nil (outside of proofs).  Without the separator line before
-the conclusion if NO-SEPARATOR."
-  (if (null goals)
-      (cons "" "")
-    (let* ((focused (plist-get goals :goals))
-           (n (length focused)))
-      (cond
-       ((> n 0)
-        (cons
-         (concat (format "%d goal%s\n\n" n (if (= n 1) "" "s"))
-                 (coq-eglot--format-hyps (aref focused 0)))
-         (concat
-          (coq-eglot--format-conclusion (aref focused 0) no-separator)
-          (coq-eglot--format-other-goals goals))))
-       ((coq-eglot--unfocused-p goals)
-        (let ((unfocused (coq-eglot--unfocused-goals goals)))
-          (cons ""
-                (concat "This subproof is complete, but there are some unfocused goals.\n"
-                        ;; like Coq: "Focus next goal with bullet -."
-                        (coq-eglot-goals-bullet-line goals)
-                        (format "\n%d goal%s\n" (length unfocused)
-                                (if (cdr unfocused) "s" ""))
-                        (if coq-eglot-detailed-goals
-                            (coq-eglot-goals-format-unfocused goals)
-                          (coq-eglot--format-goal-list unfocused 1))))))
-       ((> (length (plist-get goals :given_up)) 0)
-        (cons "" "No more goals, but there are some goals you gave up.\n"))
-       ((> (length (plist-get goals :shelf)) 0)
-        (cons "" "All the remaining goals are on the shelf.\n"))
-       (t (cons "" "No more goals.\n"))))))
-
-(defun coq-eglot--format-goals (goals)
-  "Format GOALS, as returned by the server, like Coq does.
-Return the empty string if GOALS is nil (outside of proofs)."
-  (let ((parts (coq-eglot--format-goals-parts goals)))
-    (concat (car parts) (cdr parts))))
 
 (defun coq-eglot-toggle-detailed-goals ()
   "Show or hide the hypotheses and levels of the other goals.
