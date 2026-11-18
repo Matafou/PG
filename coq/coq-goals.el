@@ -94,7 +94,7 @@ See `coq-fold-other-goals'."
 See `coq-goals-mode-line'."
   :group 'proof-faces)
 
-(defconst coq-other-goal-regexp "^\\(?:sub\\)?goal [0-9]+ "
+(defconst coq-other-goal-regexp "^\\(?:sub\\)?goal [0-9]+[ :]"
   "Regexp matching the beginning of a goal after the first one.")
 
 (defconst coq-goals-separator-regexp "^[ \t]*=\\{4,\\}[ \t]*$"

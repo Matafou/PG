@@ -27,12 +27,12 @@
 (declare-function coq-eglot--format-hyps "coq-eglot" (goal))
 (declare-function coq-eglot--indent "coq-eglot" (text indentation))
 
-(defcustom coq-eglot-detailed-goals nil
+(defcustom coq-eglot-detailed-goals t
   "Non-nil: the goals after the first one with their hypotheses.
 Their hypotheses are folded under their title, RET or mouse-1 there
-unfolds them.  The unfocused goals are grouped by level, the innermost
-first, with the bullet that focuses the next goal.  Nil: only their
-conclusion, like Coq."
+unfolds them: folded, they take no room.  The unfocused goals are
+grouped by level, the innermost first, with the bullet that focuses the
+next goal.  Nil: only their conclusion, like Coq."
   :type 'boolean
   :safe #'booleanp
   :group 'coq-eglot)
@@ -118,12 +118,14 @@ goals."
 
 (defun coq-eglot-goals--format-goal (goal number)
   "Format GOAL, numbered NUMBER, its hypotheses folded under its title."
-  (let ((title (format "goal %d is:" number))
+  (let ((title (format "goal %d:" number))
         (hyps (coq-eglot-goals--hyps-text goal)))
     (concat "\n"
             (if (string-empty-p hyps)
-                title
+                (concat title "\n")
               (let ((key (coq-eglot-goals--key goal number)))
+                ;; the newline after the separator is folded too: the
+                ;; button displays the one after the title
                 (concat (propertize title
                                     'coq-eglot-goal-title key
                                     'coq-eglot-goal-hyps
@@ -131,9 +133,9 @@ goals."
                         "\n"
                         (propertize
                          (concat (string-remove-suffix "\n" hyps)
-                                 "\n  ============================")
+                                 "\n  ============================\n")
                          'invisible key))))
-            "\n " (coq-eglot--indent (plist-get goal :ty) " ") "\n")))
+            " " (coq-eglot--indent (plist-get goal :ty) " ") "\n")))
 
 (defun coq-eglot-goals--format-list (goals first)
   "Format GOALS, numbered from FIRST, see `coq-eglot-goals--format-goal'."

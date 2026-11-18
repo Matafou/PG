@@ -631,6 +631,8 @@ buffers, on the active script buffer, like in Proof General."
 (ert-deftest coq-eglot-split-goals ()
   "The conclusion can be displayed apart from the hypotheses."
   (with-test-file
+    ;; the other goals like Coq, until the cleanup below
+    (setq coq-eglot-detailed-goals nil)
     (goto-marker "split")
     (run #'coq-eglot-goto-point)
     (let ((whole (buffer-text "*goals*")))
@@ -676,7 +678,8 @@ buffers, on the active script buffer, like in Proof General."
             (goto-marker "split")
             (run #'coq-eglot-goto-point)
             (should (equal (buffer-text "*goals*") whole)))
-        (setq coq-eglot-split-goals nil)))))
+        (setq coq-eglot-split-goals nil)
+        (setq coq-eglot-detailed-goals t)))))
 
 (ert-deftest coq-eglot-allocate-heights ()
   "Windows get the height they need by priority, the first one the rest."
@@ -1203,6 +1206,8 @@ the numbers of goals.  Like in Proof General."
   (with-test-file
     (unwind-protect
         (progn
+          ;; the other goals like Coq
+          (setq coq-eglot-detailed-goals nil)
           (goto-marker "split")
           (run #'coq-eglot-goto-point)
           (with-current-buffer "*goals*"
@@ -1242,6 +1247,7 @@ the numbers of goals.  Like in Proof General."
             (should (equal (coq-goals-mode-line) " 0+1"))
             (should (= (window-start (get-buffer-window "*goals*"))
                        (point-min)))))
+      (setq coq-eglot-detailed-goals t)
       (setq coq-fold-other-goals t))))
 
 (defun hyp-overlay (name property)
@@ -5128,6 +5134,7 @@ the unfocused goals by level, with the next bullet."
     (unwind-protect
         (progn
           (setq coq-fold-other-goals nil)
+          (setq coq-eglot-detailed-goals nil)
           ;; like Coq: only the conclusions, and the next bullet
           (goto-marker "subproof")
           (search-backward "-")
@@ -5146,15 +5153,19 @@ the unfocused goals by level, with the next bullet."
           (should coq-eglot-detailed-goals)
           (with-current-buffer "*goals*"
             (should (string-match-p
-                     "\n\ngoal 2 is:\n  n : nat\n  =+\n True\\'"
+                     "\n\ngoal 2:\n  n : nat\n  =+\n True\\'"
                      (buffer-text "*goals*")))
             (goto-char (point-min))
-            (search-forward "goal 2 is:")
+            (search-forward "goal 2:")
             (goto-char (match-beginning 0))
             (should (= (point) (coq-goals--other-goals-start)))
             (should (equal (goal-button-text) "  ▸ 1 hypothesis"))
             (let ((hyp (save-excursion (search-forward "n : nat"))))
               (should (invisible-p hyp))
+              ;; no empty line between the button and the conclusion
+              (should (invisible-p (save-excursion
+                                     (search-forward "\n True")
+                                     (match-beginning 0))))
               ;; above the keymap of the other goals
               (should (eq (key-binding (kbd "RET"))
                           #'coq-eglot-toggle-goal-hyps))
@@ -5182,13 +5193,13 @@ the unfocused goals by level, with the next bullet."
           (run #'coq-eglot-goto-point)
           (with-current-buffer "*goals*"
             (goto-char (point-min))
-            (should-not (invisible-p (search-forward "goal 2 is:\n  n"))))
+            (should-not (invisible-p (search-forward "goal 2:\n  n"))))
           ;; in a bullet, the other goal is unfocused, at level 1
           (goto-marker "hello")
           (run #'coq-eglot-goto-point)
           (should (string-match-p
                    (concat "\\*\\*\\* Unfocused goals:\n\n"
-                           "── level 1, next bullet: -\ngoal 2 is:\n  n : nat\n")
+                           "── level 1, next bullet: -\ngoal 2:\n  n : nat\n")
                    (buffer-text "*goals*")))
           ;; no goal focused: the folding starts at the level
           (goto-marker "subproof")
@@ -5198,7 +5209,7 @@ the unfocused goals by level, with the next bullet."
             (should (string-match-p
                      (concat "\\`This subproof is complete, but there are some "
                              "unfocused goals.\nFocus next goal with bullet -.\n\n"
-                             "1 goal\n\n── level 1, next bullet: -\ngoal 1 is:\n")
+                             "1 goal\n\n── level 1, next bullet: -\ngoal 1:\n")
                      (buffer-text "*goals*")))
             (goto-char (point-min))
             (search-forward "── level")
@@ -5211,7 +5222,7 @@ the unfocused goals by level, with the next bullet."
           (should-not coq-eglot-detailed-goals)
           (should (string-match-p "\n\ngoal 1 is:\n True\\'"
                                   (buffer-text "*goals*"))))
-      (setq coq-eglot-detailed-goals nil)
+      (setq coq-eglot-detailed-goals t)
       (setq coq-fold-other-goals t)
       (setq coq-eglot-goals--unfolded nil))))
 
@@ -5241,7 +5252,7 @@ goals window needs: they are displayed only if the response leaves room."
                              (+ mode-line
                                 (count-screen-lines (point-min) (point-max)
                                                     nil goals))))))))
-        (setq coq-eglot-detailed-goals nil)
+        (setq coq-eglot-detailed-goals t)
         (setq coq-fold-other-goals t)))))
 
 (provide 'coq-eglot-test-basic)
