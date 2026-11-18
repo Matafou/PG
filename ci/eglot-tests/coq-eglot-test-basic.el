@@ -254,11 +254,28 @@ the error location with `proof-warning-face', and point moves there."
     (should-not (memq #'eglot-hover-eldoc-function eldoc-documentation-functions))
     (goto-marker "hello")
     (should (= 0 (let ((requests 0))
-                   (cl-letf* ((ask (symbol-function 'eglot-hover-eldoc-function))
-                              ((symbol-function 'eglot-hover-eldoc-function)
-                               (lambda (&rest args) (cl-incf requests) (apply ask args))))
+                   (cl-letf (((symbol-function 'coq-eglot-lsp-hover-async)
+                              (lambda (&rest _) (cl-incf requests))))
                      (coq-eglot--hover-eldoc-function #'ignore))
                    requests)))))
+
+(ert-deftest coq-eglot-hover-through-pseudo-server ()
+  "A useful hover is sent and formatted by the pseudo-server."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (should (wait-until (lambda () (null coq-eglot-lsp--active-requests)) 2))
+    (goto-char (point-min))
+    (search-forward "double")
+    (let ((result 'pending))
+      (should
+       (coq-eglot-lsp-hover-async
+        (point)
+        (lambda (info _echo) (setq result info))
+        (lambda (failure) (setq result failure))))
+      (should (wait-until (lambda () (not (eq result 'pending))) 2))
+      (should (stringp result))
+      (should (string-search "double" result)))))
 
 (ert-deftest coq-eglot-no-completion ()
   "Eglot does not ask completions: it would force a check up to point."
@@ -3459,7 +3476,7 @@ do what they do, and warn."
     (cl-letf (((symbol-function 'coq-eglot-lsp-query-async)
                (lambda (&rest _) (setq queried t)))
               ((symbol-function 'coq-eglot-lsp--async-request)
-               (lambda (_pos _method _params success _error)
+               (lambda (_pos _method _params success _error &rest _policy)
                  (setq goals-success success)
                  'goals-context))
               ((symbol-function 'coq-eglot-lsp--answer)
@@ -3580,39 +3597,45 @@ do what they do, and warn."
                 (should-not (plist-get goal :hyp-sorts-late))))
           (coq-eglot--cancel-hyp-sorts))))))
 
-(ert-deftest coq-eglot-lsp-critical-section-waits-for-user-request ()
-  "A critical section neither interrupts an active read nor lets a new one in."
+(ert-deftest coq-eglot-lsp-finalization-waits-for-user-request ()
+  "Finalization neither interrupts an active read nor lets a new one in."
   (with-temp-buffer
     (let* ((user (coq-eglot-lsp--make-context :petanque/run_at_point 1))
            (critical (coq-eglot-lsp--make-context :proof/goals 1))
            (later (coq-eglot-lsp--make-context :petanque/run_at_point 1))
            sent)
-      (setq coq-eglot-lsp--interactive-context user
-            coq-eglot-lsp--critical-queue
-            (list (cons critical (lambda () (push 'critical sent))))
-            coq-eglot-lsp--interactive-queue
-            (list (cons later (lambda () (push 'later sent)))))
-      ;; The critical section waits for the explicit user request.
+      (setf (coq-eglot-lsp-context-policy user) coq-eglot-lsp-user-policy
+            (coq-eglot-lsp-context-policy critical)
+            coq-eglot-lsp-finalization-policy
+            (coq-eglot-lsp-context-policy later) coq-eglot-lsp-user-policy)
+      (setq coq-eglot-lsp--active-requests (list user)
+            coq-eglot-lsp--request-queue
+            (list (cons critical (lambda () (push 'critical sent)))
+                  (cons later (lambda () (push 'later sent)))))
+      ;; Finalization waits for the explicit user request.
       (coq-eglot-lsp--dispatch-scheduled)
       (should-not sent)
       (coq-eglot-lsp--request-finished user)
       (should (equal sent '(critical)))
-      (should (eq coq-eglot-lsp--critical-context critical))
-      (should-not coq-eglot-lsp--interactive-context)
-      ;; The later read waits until the critical section is over.
+      (should (equal coq-eglot-lsp--active-requests (list critical)))
+      ;; The later read waits until finalization is over.
       (coq-eglot-lsp--request-finished critical)
       (should (equal sent '(later critical)))
-      (should (eq coq-eglot-lsp--interactive-context later)))))
+      (should (equal coq-eglot-lsp--active-requests (list later))))))
 
-(ert-deftest coq-eglot-lsp-critical-request-roles ()
-  "Final goals and sorts are critical; document checking is preemptible."
-  (let (goals-role sorts-role check-role)
+(ert-deftest coq-eglot-lsp-request-policies ()
+  "Final goals, sorts and checks have explicit independent policies."
+  (let (goals-policy sorts-policy check-policy)
     (cl-letf (((symbol-function 'coq-eglot-lsp-goals-async)
-               (lambda (&rest _) (setq goals-role coq-eglot-lsp--request-role)))
+               (lambda (_pos _success _error &optional policy _key)
+                 (setq goals-policy policy)))
               ((symbol-function 'coq-eglot-lsp-query-async)
-               (lambda (&rest _) (setq sorts-role coq-eglot-lsp--request-role)))
+               (lambda (_pos _command _success _error &optional policy _key)
+                 (setq sorts-policy policy)))
               ((symbol-function 'coq-eglot-lsp--async-request)
-               (lambda (&rest _) (setq check-role coq-eglot-lsp--request-role))))
+               (lambda (_pos _method _params _success _error
+                        &optional policy _key)
+                 (setq check-policy policy))))
       (coq-eglot-lsp-final-goals-async 1 #'ignore #'ignore)
       (let ((coq-eglot-lsp-hyp-sort-names-function nil))
         (coq-eglot-lsp-hyp-sorts-async
@@ -3620,9 +3643,95 @@ do what they do, and warn."
           :context (coq-eglot-lsp--make-context :proof/goals 1))
          #'ignore #'ignore))
       (coq-eglot-lsp-check-async 1 #'ignore #'ignore))
-    (should (eq goals-role 'critical))
-    (should (eq sorts-role 'critical))
-    (should (eq check-role 'preemptible))))
+    (should (eq goals-policy coq-eglot-lsp-finalization-policy))
+    (should (eq sorts-policy coq-eglot-lsp-background-policy))
+    (should (eq check-policy coq-eglot-lsp-work-policy))))
+
+(ert-deftest coq-eglot-lsp-policy-preemption ()
+  "A foreground request passes work and discards background work."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'coq-eglot-lsp-current-server) #'ignore))
+      (let ((work (coq-eglot-lsp--make-context :work 1))
+            (user (coq-eglot-lsp--make-context :user 1))
+            sent)
+        (setf (coq-eglot-lsp-context-policy work) coq-eglot-lsp-work-policy
+              (coq-eglot-lsp-context-policy user) coq-eglot-lsp-user-policy)
+        (setq coq-eglot-lsp--active-requests (list work)
+              coq-eglot-lsp--request-queue
+              (list (cons user (lambda () (setq sent t)))))
+        (coq-eglot-lsp--dispatch-scheduled)
+        (should sent)
+        (should (memq work coq-eglot-lsp--active-requests))
+        (should (memq user coq-eglot-lsp--active-requests)))
+      (let ((background (coq-eglot-lsp--make-context :background 1))
+            (work (coq-eglot-lsp--make-context :work 1))
+            sent)
+        (setf (coq-eglot-lsp-context-policy background)
+              coq-eglot-lsp-background-policy
+              (coq-eglot-lsp-context-policy work) coq-eglot-lsp-work-policy)
+        (setq coq-eglot-lsp--active-requests (list background)
+              coq-eglot-lsp--request-queue
+              (list (cons work (lambda () (setq sent t)))))
+        (coq-eglot-lsp--dispatch-scheduled)
+        (should sent)
+        (should (coq-eglot-lsp-context-cancelled background))
+        (should (equal coq-eglot-lsp--active-requests (list work)))))))
+
+(ert-deftest coq-eglot-lsp-hover-is-dropped-while-busy ()
+  "A hover is not queued behind useful work."
+  (with-temp-buffer
+    (let ((user (coq-eglot-lsp--make-context :user 1))
+          (hover (coq-eglot-lsp--make-context :textDocument/hover 1)))
+      (setf (coq-eglot-lsp-context-policy user) coq-eglot-lsp-user-policy
+            (coq-eglot-lsp-context-policy hover) coq-eglot-lsp-hover-policy)
+      (setq coq-eglot-lsp--active-requests (list user))
+      (should-not (coq-eglot-lsp--schedule hover #'ignore))
+      (should (coq-eglot-lsp-context-cancelled hover))
+      (should-not coq-eglot-lsp--request-queue))))
+
+(ert-deftest coq-eglot-lsp-interrupted-work-is-reissued ()
+  "Work interrupted by a foreground request resumes after that request."
+  (with-temp-buffer
+    (let (sent failures)
+      (cl-letf (((symbol-function 'coq-eglot-lsp-connect)
+                 (lambda () 'server))
+                ((symbol-function 'coq-eglot-lsp-current-server)
+                 (lambda () 'server))
+                ((symbol-function 'coq-eglot-lsp--flush-document)
+                 (lambda () 1))
+                ((symbol-function 'jsonrpc--async-request-1)
+                 (lambda (_server method _params &rest args)
+                   (push (list method
+                               (plist-get args :success-fn)
+                               (plist-get args :error-fn))
+                         sent)
+                   (list (length sent)))))
+        (let ((work
+               (coq-eglot-lsp--async-request
+                1 :work #'ignore #'ignore
+                (lambda (failure) (push failure failures))
+                coq-eglot-lsp-work-policy 'check)))
+          (coq-eglot-lsp--async-request
+           1 :user #'ignore #'ignore
+           (lambda (failure) (push failure failures)))
+          (should (equal (mapcar #'car (reverse sent)) '(:work :user)))
+          ;; The user request interrupts the synchronous part of work.
+          (funcall (nth 2 (cadr sent))
+                   '(:code -32001 :message "Interrupted"))
+          (should (wait-until
+                   (lambda ()
+                     (and (memq work (mapcar #'car coq-eglot-lsp--request-queue))
+                          (= (length coq-eglot-lsp--active-requests) 1)))
+                   2))
+          (should-not failures)
+          ;; Once the protected user request answers, work is sent again.
+          (funcall (nth 1 (car sent)) 'answer)
+          (should (wait-until (lambda () (= (length sent) 3)) 2))
+          (should (equal (mapcar #'car (reverse sent))
+                         '(:work :user :work)))
+          (funcall (nth 1 (car sent)) 'answer)
+          (should (wait-until
+                   (lambda () (null coq-eglot-lsp--active-requests)) 2)))))))
 
 (ert-deftest coq-eglot-twins-do-not-compact-contexts ()
   "Twins neither compact contexts nor ask for their hypothesis sorts."
@@ -4337,7 +4446,7 @@ long as it connects, as Eglot does; with it, they fail after it."
             ;; that answer before the second connection scenario.
             (funcall request-success 'answer)
             (should (wait-until
-                     (lambda () (not coq-eglot-lsp--interactive-context))
+                     (lambda () (not coq-eglot-lsp--active-requests))
                      2)))
           ;; with a timeout
           (setq connected nil)

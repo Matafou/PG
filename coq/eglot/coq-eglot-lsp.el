@@ -45,6 +45,8 @@
     (function eglot--signal-textDocument/didChange)
     (function eglot--VersionedTextDocumentIdentifier)
     (function eglot--TextDocumentIdentifier)
+    (function eglot--hover-info)
+    (function eglot-server-capable eglot--server-capable)
     (function eglot-uri-to-path eglot--uri-to-path)
     (variable eglot--servers-by-project)
     (variable eglot--versioned-identifier))
@@ -488,10 +490,11 @@ buffers it managed, and those that waited for it."
   "What a request was about, kept from its sending.
 METHOD is its LSP method, a keyword.  POSITION is the buffer position it
 was sent at.  VERSION is the version of the document sent with it.  ID
-is its jsonrpc id, for `$/cancelRequest'.  ROLE is `interactive',
-`critical' or `preemptible', for the small client-side scheduler.
-CANCELLED is non-nil when a request was abandoned before being sent."
-  method position version id role cancelled)
+is its jsonrpc id, for `$/cancelRequest'.  POLICY describes its
+client-side scheduling, see `coq-eglot-lsp-policy'.  QUEUE-KEY groups
+replaceable requests of the same kind.  CANCELLED is non-nil when the
+request was abandoned."
+  method position version id policy queue-key cancelled)
 
 (cl-defstruct (coq-eglot-lsp-message
                (:constructor coq-eglot-lsp--make-message (severity text)))
@@ -686,77 +689,198 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
                 (with-demoted-errors "Coq: %S"
                   (funcall fn server))))))))))
 
-(defvar coq-eglot-lsp--request-role 'interactive
-  "Role dynamically assigned to the next request.
-`interactive' requests are sent FIFO, `critical' requests are short
-critical sections during which interactive requests wait, and
-`preemptible' requests are long document checks that interactive
-requests may interrupt and that coq-lsp resumes.")
+;; Request scheduling
+;;
+;; coq-lsp may interrupt its current synchronous request when it receives
+;; another one.  This is useful while it is checking the document, but not
+;; while it is formatting the final goals or answering an explicit query.
+;; Every request therefore carries three independent scheduling properties:
+;;
+;;                           interruption     priority       queue
+;;   `finalization'          `protected'       40            `fifo'
+;;   `user'                  `protected'       30            `fifo'
+;;   `work'                  `resumable'       20            `latest'
+;;   `background'            `discardable'     10            `latest'
+;;   `hover'                 `discardable'      0            `drop'
+;;
+;; Interruptibility says what a request of greater priority may do to an
+;; active request.  A `protected' request must finish first.  A `resumable'
+;; request may be interrupted; if coq-lsp answers Interrupted, the scheduler
+;; sends it again after the more important request.  A `discardable' request
+;; is cancelled and its result is ignored.
+;;
+;; Priority decides which waiting request is considered first and whether it
+;; may pass active, unprotected requests.  In particular, `finalization' waits
+;; for an already active `user' request, but once waiting it runs before newer
+;; `user' requests.  A `user' request may pass `work'; `work' may discard
+;; `background' presentation enrichment; `background' may discard a `hover'.
+;;
+;; Queue discipline applies between equivalent requests.  `fifo' preserves
+;; every request.  `latest' replaces requests with the same policy and
+;; QUEUE-KEY.  `drop' does not queue at all when anything is active or
+;; waiting.  Thus hovers never delay useful work, while hypothesis sorts may
+;; wait briefly and a newer sorts request replaces the obsolete one.
+;;
+;; The named policies are known outside the scheduler: the request adapters
+;; below select `finalization', `user', `work', `background' or `hover' for
+;; each operation.  Only this scheduler interprets their properties and owns
+;; the queues.  Callers outside this pseudo-server normally ask for an
+;; operation, not a policy, and the session remains unaware of both policies
+;; and transport scheduling: it tracks only the logical proof state.
+;;
+;; A request adapter is a function such as `coq-eglot-lsp-check-async' or
+;; `coq-eglot-lsp-hover-async': it translates one semantic operation into an
+;; LSP method and parameters, normalizes its answer, and selects its scheduling
+;; policy.  They are grouped under "Request adapters" below; comments there
+;; make each policy choice explicit.
 
-(defvar-local coq-eglot-lsp--critical-context nil
-  "Context of the short critical section currently in flight.")
+(cl-defstruct (coq-eglot-lsp-policy
+               (:constructor coq-eglot-lsp--make-policy
+                             (name interruptibility priority discipline)))
+  "Independent scheduling properties of a request.
+INTERRUPTIBILITY is `protected', `resumable' or `discardable'.  PRIORITY
+is a number: a request can pass an unprotected request of lower
+priority.  DISCIPLINE is `fifo', `latest' or `drop'."
+  name interruptibility priority discipline)
 
-(defvar-local coq-eglot-lsp--interactive-context nil
-  "Context of the interactive request currently in flight.")
+(defconst coq-eglot-lsp-finalization-policy
+  (coq-eglot-lsp--make-policy 'finalization 'protected 40 'fifo)
+  "Policy of the short request that finishes a script operation.")
 
-(defvar-local coq-eglot-lsp--critical-queue nil
-  "FIFO of critical requests waiting for an interactive request to finish.")
+(defconst coq-eglot-lsp-user-policy
+  (coq-eglot-lsp--make-policy 'user 'protected 30 'fifo)
+  "Policy of an explicit read requested by the user.")
 
-(defvar-local coq-eglot-lsp--interactive-queue nil
-  "FIFO of interactive requests waiting to be sent.
+(defconst coq-eglot-lsp-work-policy
+  (coq-eglot-lsp--make-policy 'work 'resumable 20 'latest)
+  "Policy of long document work that coq-lsp can resume.")
+
+(defconst coq-eglot-lsp-background-policy
+  (coq-eglot-lsp--make-policy 'background 'discardable 10 'latest)
+  "Policy of optional presentation enrichment.")
+
+(defconst coq-eglot-lsp-hover-policy
+  (coq-eglot-lsp--make-policy 'hover 'discardable 0 'drop)
+  "Policy of a hover: do not even queue it while the server is busy.")
+
+(defvar-local coq-eglot-lsp--request-queue nil
+  "Requests waiting for the scheduler.
 Each entry is (CONTEXT . SEND-FUNCTION).")
 
-(defun coq-eglot-lsp-critical-p ()
-  "Non-nil while a short request should not be interrupted by a read query."
-  (and coq-eglot-lsp--critical-context t))
+(defvar-local coq-eglot-lsp--active-requests nil
+  "Contexts of the scheduled requests that have not answered yet.")
 
-(defun coq-eglot-lsp-exclusive-p ()
-  "Non-nil while automatic reads must not interrupt the current request.
-This includes a critical section and an explicit interactive request."
-  (and (or coq-eglot-lsp--critical-context
-           coq-eglot-lsp--interactive-context)
-       t))
+(defun coq-eglot-lsp--protected-active-p ()
+  "Non-nil if an active request must finish before another one starts."
+  (seq-some
+   (lambda (context)
+     (eq (coq-eglot-lsp-policy-interruptibility
+          (coq-eglot-lsp-context-policy context))
+         'protected))
+   coq-eglot-lsp--active-requests))
+
+(defun coq-eglot-lsp--priority (context)
+  "Scheduling priority of CONTEXT."
+  (coq-eglot-lsp-policy-priority (coq-eglot-lsp-context-policy context)))
+
+(defun coq-eglot-lsp--queue-entry ()
+  "Highest-priority entry of `coq-eglot-lsp--request-queue'.
+Preserve FIFO order between entries of equal priority."
+  (let ((best nil) (priority -1))
+    (dolist (entry coq-eglot-lsp--request-queue best)
+      (let ((candidate (coq-eglot-lsp--priority (car entry))))
+        (when (> candidate priority)
+          (setq best entry priority candidate))))))
+
+(defun coq-eglot-lsp--can-start-p (context)
+  "Non-nil if CONTEXT may start with the requests currently active."
+  (and (not (coq-eglot-lsp--protected-active-p))
+       (or (null coq-eglot-lsp--active-requests)
+           (> (coq-eglot-lsp--priority context)
+              (apply #'max (mapcar #'coq-eglot-lsp--priority
+                                   coq-eglot-lsp--active-requests))))))
+
+(defun coq-eglot-lsp--abandon (context)
+  "Cancel and forget active or queued CONTEXT, without dispatching."
+  (setf (coq-eglot-lsp-context-cancelled context) t)
+  (setq coq-eglot-lsp--active-requests
+        (delq context coq-eglot-lsp--active-requests)
+        coq-eglot-lsp--request-queue
+        (seq-remove (lambda (entry) (eq (car entry) context))
+                    coq-eglot-lsp--request-queue))
+  (let ((server (coq-eglot-lsp-current-server))
+        (id (coq-eglot-lsp-context-id context)))
+    (when (and server id)
+      (jsonrpc-notify server :$/cancelRequest (list :id id)))))
+
+(defun coq-eglot-lsp--same-queue-kind-p (left right)
+  "Non-nil if LEFT and RIGHT replace one another under `latest'."
+  (and (eq (coq-eglot-lsp-policy-name
+            (coq-eglot-lsp-context-policy left))
+           (coq-eglot-lsp-policy-name
+            (coq-eglot-lsp-context-policy right)))
+       (equal (coq-eglot-lsp-context-queue-key left)
+              (coq-eglot-lsp-context-queue-key right))))
 
 (defun coq-eglot-lsp--dispatch-scheduled ()
-  "Start the next critical or interactive request.
-Finish an interactive request already in flight before opening a
-critical section.  Once requested, a critical section starts before
-new interactive reads."
-  (while (and (not coq-eglot-lsp--critical-context)
-              (not coq-eglot-lsp--interactive-context)
-              (or coq-eglot-lsp--critical-queue
-                  coq-eglot-lsp--interactive-queue))
-    (let* ((critical (and coq-eglot-lsp--critical-queue t))
-           (entry (if critical
-                      (pop coq-eglot-lsp--critical-queue)
-                    (pop coq-eglot-lsp--interactive-queue)))
-           (context (car entry)))
-      (unless (coq-eglot-lsp-context-cancelled context)
-        (if critical
-            (setq coq-eglot-lsp--critical-context context)
-          (setq coq-eglot-lsp--interactive-context context))
-        (funcall (cdr entry))))))
+  "Start the highest-priority request allowed by the active requests."
+  (let (entry context)
+    (while (and (setq entry (coq-eglot-lsp--queue-entry))
+                (progn (setq context (car entry))
+                       (coq-eglot-lsp--can-start-p context)))
+      (setq coq-eglot-lsp--request-queue
+            (delq entry coq-eglot-lsp--request-queue))
+      ;; Optional lower-priority requests are discarded, not suspended.
+      (dolist (active (copy-sequence coq-eglot-lsp--active-requests))
+        (when (and (< (coq-eglot-lsp--priority active)
+                      (coq-eglot-lsp--priority context))
+                   (eq (coq-eglot-lsp-policy-interruptibility
+                        (coq-eglot-lsp-context-policy active))
+                       'discardable))
+          (coq-eglot-lsp--abandon active)))
+      (push context coq-eglot-lsp--active-requests)
+      (funcall (cdr entry)))))
+
+(defun coq-eglot-lsp--schedule (context send)
+  "Schedule CONTEXT to call SEND.  Return non-nil unless it was dropped."
+  (let* ((policy (coq-eglot-lsp-context-policy context))
+         (discipline (coq-eglot-lsp-policy-discipline policy)))
+    (cond
+     ((and (eq discipline 'drop)
+           (or coq-eglot-lsp--active-requests coq-eglot-lsp--request-queue))
+      (setf (coq-eglot-lsp-context-cancelled context) t)
+      nil)
+     (t
+      (when (eq discipline 'latest)
+        (dolist (entry (copy-sequence coq-eglot-lsp--request-queue))
+          (when (coq-eglot-lsp--same-queue-kind-p context (car entry))
+            (coq-eglot-lsp--abandon (car entry))))
+        (dolist (active (copy-sequence coq-eglot-lsp--active-requests))
+          (when (coq-eglot-lsp--same-queue-kind-p context active)
+            (coq-eglot-lsp--abandon active))))
+      (setq coq-eglot-lsp--request-queue
+            (append coq-eglot-lsp--request-queue
+                    (list (cons context send))))
+      (coq-eglot-lsp--dispatch-scheduled)
+      t))))
 
 (defun coq-eglot-lsp--request-finished (context)
   "Update the scheduler after the request of CONTEXT answered."
-  (when (eq context coq-eglot-lsp--critical-context)
-    (setq coq-eglot-lsp--critical-context nil))
-  (when (eq context coq-eglot-lsp--interactive-context)
-    (setq coq-eglot-lsp--interactive-context nil))
+  (setq coq-eglot-lsp--active-requests
+        (delq context coq-eglot-lsp--active-requests))
   (coq-eglot-lsp--dispatch-scheduled))
 
 (defun coq-eglot-lsp--reset-scheduler ()
   "Forget all scheduler state of the current buffer."
-  (dolist (entry coq-eglot-lsp--interactive-queue)
+  (dolist (entry coq-eglot-lsp--request-queue)
     (setf (coq-eglot-lsp-context-cancelled (car entry)) t))
-  (dolist (entry coq-eglot-lsp--critical-queue)
-    (setf (coq-eglot-lsp-context-cancelled (car entry)) t))
-  (setq coq-eglot-lsp--critical-context nil
-        coq-eglot-lsp--interactive-context nil
-        coq-eglot-lsp--critical-queue nil
-        coq-eglot-lsp--interactive-queue nil))
+  (dolist (context coq-eglot-lsp--active-requests)
+    (setf (coq-eglot-lsp-context-cancelled context) t))
+  (setq coq-eglot-lsp--request-queue nil
+        coq-eglot-lsp--active-requests nil))
 
-(defun coq-eglot-lsp--async-request (pos method params on-success on-error)
+(defun coq-eglot-lsp--async-request
+    (pos method params on-success on-error &optional policy queue-key)
   "Send request METHOD at POS with PARAMS to the server of the buffer.
 Without waiting, even for the server to connect, see
 `coq-eglot-lsp--when-connected'.  Pending changes of the buffer are sent
@@ -764,15 +888,18 @@ first.  Return immediately its `coq-eglot-lsp-context'.  ON-SUCCESS is
 called with the answer and the context, ON-ERROR with a
 `coq-eglot-lsp-failure', in the current buffer if still live: also if
 the server does not connect.  PARAMS is a function returning the
-parameters, called after the changes are sent.  ON-SUCCESS and
-ON-ERROR are called from a timer, not from the process filter: they
-may send other requests.  No request of the backend waits for its
-answer: while waiting in `jsonrpc-request', the answers of the others
-would come, and callbacks sending other requests would run, nested."
+parameters, called after the changes are sent.  POLICY defaults to
+`coq-eglot-lsp-user-policy'; QUEUE-KEY distinguishes replaceable
+requests under a `latest' policy.  ON-SUCCESS and ON-ERROR are called
+from a timer, not from the process filter: they may send other requests.
+No request of the backend waits for its answer: while waiting in
+`jsonrpc-request', the answers of the others would come, and callbacks
+sending other requests would run, nested."
   (let ((buffer (current-buffer))
-        (context (coq-eglot-lsp--make-context method pos))
-        (role coq-eglot-lsp--request-role))
-    (setf (coq-eglot-lsp-context-role context) role)
+        (context (coq-eglot-lsp--make-context method pos)))
+    (setf (coq-eglot-lsp-context-policy context)
+          (or policy coq-eglot-lsp-user-policy)
+          (coq-eglot-lsp-context-queue-key context) queue-key)
     (cl-labels ((run (fn arg)
                   (when (buffer-live-p buffer)
                     (with-current-buffer buffer (funcall fn arg))))
@@ -780,12 +907,28 @@ would come, and callbacks sending other requests would run, nested."
                   (lambda (arg) (run-at-time 0 nil #'run fn arg)))
                 (succeed (answer)
                   (unwind-protect
-                      (funcall on-success answer context)
+                      (unless (coq-eglot-lsp-context-cancelled context)
+                        (funcall on-success answer context))
                     (coq-eglot-lsp--request-finished context)))
                 (fail (failure)
-                  (unwind-protect
-                      (funcall on-error failure)
-                    (coq-eglot-lsp--request-finished context)))
+                  (if (and (not (coq-eglot-lsp-context-cancelled context))
+                           (eq (coq-eglot-lsp-policy-interruptibility
+                                (coq-eglot-lsp-context-policy context))
+                               'resumable)
+                           (= (or (coq-eglot-lsp-failure-code failure) 0)
+                              -32001))
+                      ;; coq-lsp interrupted the synchronous request to run a
+                      ;; more important one.  Reissue it after that request;
+                      ;; the document check itself is kept by the server.
+                      (progn
+                        (setq coq-eglot-lsp--active-requests
+                              (delq context coq-eglot-lsp--active-requests))
+                        (setf (coq-eglot-lsp-context-id context) nil)
+                        (coq-eglot-lsp--schedule context #'send))
+                    (unwind-protect
+                        (unless (coq-eglot-lsp-context-cancelled context)
+                          (funcall on-error failure))
+                      (coq-eglot-lsp--request-finished context))))
                 (send ()
                   (coq-eglot-lsp--when-connected
                    (lambda (server)
@@ -820,18 +963,7 @@ would come, and callbacks sending other requests would run, nested."
                              (coq-eglot-lsp--make-failure
                               context nil (error-message-string err)
                               nil))))))))))
-      (pcase role
-        ('interactive
-         (setq coq-eglot-lsp--interactive-queue
-               (append coq-eglot-lsp--interactive-queue
-                       (list (cons context #'send))))
-         (coq-eglot-lsp--dispatch-scheduled))
-        ('critical
-         (setq coq-eglot-lsp--critical-queue
-               (append coq-eglot-lsp--critical-queue
-                       (list (cons context #'send))))
-         (coq-eglot-lsp--dispatch-scheduled))
-        (_ (funcall #'send)))
+      (coq-eglot-lsp--schedule context #'send)
       context)))
 
 (defun coq-eglot-lsp--pending-ids (server)
@@ -860,13 +992,9 @@ server to connect are not sent, and get no answer."
   "Ask the server to cancel the request of CONTEXT, if it was sent.
 Its answer, an error for a cancelled request, may still come later."
   (when context
-    (setf (coq-eglot-lsp-context-cancelled context) t))
-  (let ((server (coq-eglot-lsp-current-server))
-        (id (and context (coq-eglot-lsp-context-id context))))
-    (when (and server id)
-      (jsonrpc-notify server :$/cancelRequest (list :id id))))
-  ;; Only after sending the cancellation may a queued request be emitted.
-  (when context (coq-eglot-lsp--request-finished context)))
+    ;; Only after sending the cancellation may a queued request be emitted.
+    (coq-eglot-lsp--abandon context)
+    (coq-eglot-lsp--dispatch-scheduled)))
 
 (defun coq-eglot-lsp-send-changes ()
   "Send now the pending changes of the current buffer to the server.
@@ -1029,7 +1157,13 @@ not affect this key."
   (list (coq-eglot-lsp--printing-width)
         (coq-eglot-lsp--printing-flags)))
 
-(defun coq-eglot-lsp-goals-async (pos on-success on-error)
+;;; Request adapters
+;;
+;; These functions are the semantic API of the pseudo-server.  Each one owns
+;; the scheduling policy of the request it builds; callers normally do not.
+
+(defun coq-eglot-lsp-goals-async
+    (pos on-success on-error &optional policy queue-key)
   "Ask asynchronously the goals after the sentence at POS.
 ON-SUCCESS is called with a `coq-eglot-lsp-answer', or nil if the
 server answered nothing, ON-ERROR with a `coq-eglot-lsp-failure'.
@@ -1038,6 +1172,7 @@ presentation enrichment, see `coq-eglot-lsp-hyp-sorts-async'.  See
 `coq-eglot-lsp--async-request'.  Return the context of the request."
   (let ((width (coq-eglot-lsp--printing-width))
         (flags (coq-eglot-lsp--printing-flags)))
+    ;; `user' by default; final goals pass `finalization' below.
     (coq-eglot-lsp--async-request
      pos :proof/goals
      (lambda () (coq-eglot-lsp--goals-params pos width flags))
@@ -1046,14 +1181,15 @@ presentation enrichment, see `coq-eglot-lsp-hyp-sorts-async'.  See
          ;; Whoever asked, the observers learn the sentence range now.
          (when answer (coq-eglot-lsp--publish answer))
          (funcall on-success answer)))
-     on-error)))
+     on-error policy queue-key)))
 
 (defun coq-eglot-lsp-final-goals-async (pos on-success on-error)
   "Ask the final goals at POS as a short critical section.
 Unlike a general goals query, interactive read requests wait for this
 one to answer instead of interrupting its synchronous formatting phase."
-  (let ((coq-eglot-lsp--request-role 'critical))
-    (coq-eglot-lsp-goals-async pos on-success on-error)))
+  ;; `finalization': protect the short synchronous formatting phase.
+  (coq-eglot-lsp-goals-async
+   pos on-success on-error coq-eglot-lsp-finalization-policy 'final-goals))
 
 (defun coq-eglot-lsp-hyp-sorts-async (answer on-success on-error)
   "Ask asynchronously for the hypothesis sorts needed by ANSWER.
@@ -1066,46 +1202,49 @@ presentation only and never changes ANSWER by itself."
          (names (and answer (coq-eglot-lsp--hyp-sort-names answer)))
          (command (and pos (coq-eglot-lsp--hyp-sorts-command names))))
     (when command
-      (let ((coq-eglot-lsp--request-role 'critical))
-        (coq-eglot-lsp-query-async
-         pos command
-         (lambda (messages)
-           (funcall on-success (coq-eglot-lsp--parse-hyp-sorts messages)))
-         on-error)))))
+      ;; `background': presentation enrichment must yield to useful work.
+      (coq-eglot-lsp-query-async
+       pos command
+       (lambda (messages)
+         (funcall on-success (coq-eglot-lsp--parse-hyp-sorts messages)))
+       on-error coq-eglot-lsp-background-policy 'hyp-sorts))))
 
 (defun coq-eglot-lsp-ping (on-answer)
   "Send a cheap request, call ON-ANSWER without argument when it is answered.
 Its answer tells that the server is ready again after an interruption."
-  (let ((coq-eglot-lsp--request-role 'preemptible))
-    (coq-eglot-lsp--async-request
-     (point-min) :proof/goals
-     (lambda () (coq-eglot-lsp--goals-params (point-min)))
-     (lambda (_answer _context) (funcall on-answer))
-     (lambda (_failure) (funcall on-answer)))))
+  ;; `work': this readiness probe participates in interruption recovery.
+  (coq-eglot-lsp--async-request
+   (point-min) :proof/goals
+   (lambda () (coq-eglot-lsp--goals-params (point-min)))
+   (lambda (_answer _context) (funcall on-answer))
+   (lambda (_failure) (funcall on-answer))
+   coq-eglot-lsp-work-policy 'ping))
 
 (defun coq-eglot-lsp-check-async (pos on-success on-error)
   "Ask asynchronously the server to check up to the sentence at POS.
 No goals are computed.  ON-SUCCESS is called with a
 `coq-eglot-lsp-checked', ON-ERROR with a `coq-eglot-lsp-failure'.  See
 `coq-eglot-lsp--async-request'.  Return the context of the request."
-  (let ((coq-eglot-lsp--request-role 'preemptible))
-    (coq-eglot-lsp--async-request
-     pos :petanque/get_state_at_pos
-     (lambda ()
-       (list :uri (plist-get (eglot--TextDocumentIdentifier) :uri)
-             :position (coq-eglot-lsp-position pos)
-             :opts (list :memo t :hash :json-false)))
-     (lambda (_answer context)
-       (funcall on-success (coq-eglot-lsp--make-checked context)))
-     on-error)))
+  ;; `work': checking is long and can be resumed after an interruption.
+  (coq-eglot-lsp--async-request
+   pos :petanque/get_state_at_pos
+   (lambda ()
+     (list :uri (plist-get (eglot--TextDocumentIdentifier) :uri)
+           :position (coq-eglot-lsp-position pos)
+           :opts (list :memo t :hash :json-false)))
+   (lambda (_answer context)
+     (funcall on-success (coq-eglot-lsp--make-checked context)))
+   on-error coq-eglot-lsp-work-policy 'check))
 
-(defun coq-eglot-lsp-query-async (pos command on-success on-error)
+(defun coq-eglot-lsp-query-async
+    (pos command on-success on-error &optional policy queue-key)
   "Run Coq COMMAND asynchronously in the state at POS.
 The state is the one after the sentences ending before POS.  The
 document does not change.  ON-SUCCESS is called with the messages of
 COMMAND, a list of strings, ON-ERROR with a `coq-eglot-lsp-failure'.
 See `coq-eglot-lsp--async-request'.  Return the context of the
 request."
+  ;; `user' by default; presentation adapters may supply `background'.
   (coq-eglot-lsp--async-request
    pos :petanque/run_at_point
    (lambda ()
@@ -1117,7 +1256,38 @@ request."
      (funcall on-success
               (mapcar (lambda (feedback) (aref feedback 1))
                       (plist-get answer :feedback))))
-   on-error))
+   on-error policy queue-key))
+
+(defun coq-eglot-lsp--server-capable (feature)
+  "Non-nil if the current Eglot server supports FEATURE."
+  (if (fboundp 'eglot-server-capable)
+      (eglot-server-capable feature)
+    (with-no-warnings (eglot--server-capable feature))))
+
+(defun coq-eglot-lsp-hover-async (pos on-success on-error)
+  "Ask for hover information at POS without delaying other requests.
+Call ON-SUCCESS with the formatted text and its echo-area preference,
+or ON-ERROR with a `coq-eglot-lsp-failure'.  Return the request context,
+or nil when hover is unsupported or the server scheduler is busy.  A
+hover is deliberately dropped rather than queued."
+  (when (coq-eglot-lsp--server-capable :hoverProvider)
+    ;; `hover': never queue an automatic cursor read behind useful work.
+    (let ((context
+           (coq-eglot-lsp--async-request
+            pos :textDocument/hover
+            (lambda ()
+              (list :textDocument (eglot--TextDocumentIdentifier)
+                    :position (coq-eglot-lsp-position pos)))
+            (lambda (answer _context)
+              (let* ((contents (plist-get answer :contents))
+                     (info (unless (seq-empty-p contents)
+                             (eglot--hover-info
+                              contents (plist-get answer :range)))))
+                (funcall on-success info
+                         (and info (string-match-p "\n" info)))))
+            on-error coq-eglot-lsp-hover-policy 'hover)))
+      (unless (coq-eglot-lsp-context-cancelled context)
+        context))))
 
 ;;; Notifications
 

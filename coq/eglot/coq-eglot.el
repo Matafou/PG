@@ -2673,14 +2673,16 @@ is bound to `coq-terminator-insert'."
 
 ;;; Hover
 
-(defun coq-eglot--hover-eldoc-function (callback &rest args)
-  "Like `eglot-hover-eldoc-function' with CALLBACK and ARGS.
-But only in the processed part, and not during a short critical
-request: elsewhere the server has nothing useful to say, and a pending
-hover would make it check up to point or interrupt final formatting."
-  (when (and (< (point) (coq-eglot-position))
-             (not (coq-eglot-lsp-exclusive-p)))
-    (apply #'eglot-hover-eldoc-function callback args)))
+(defun coq-eglot--hover-eldoc-function (callback &rest _args)
+  "Ask the pseudo-server for Eldoc information through CALLBACK.
+Only ask in the processed part.  The pseudo-server drops the hover if
+another request is active instead of letting it interrupt useful work."
+  (when (< (point) (coq-eglot-position))
+    (and (coq-eglot-lsp-hover-async
+          (point)
+          (lambda (info echo) (funcall callback info :echo echo))
+          (lambda (_failure) (funcall callback nil)))
+         t)))
 
 (defun coq-eglot--setup-eldoc ()
   "Replace the hover function of Eglot by `coq-eglot--hover-eldoc-function'.
