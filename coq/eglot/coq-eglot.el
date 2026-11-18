@@ -42,6 +42,36 @@
 ;; Sentences are delimited by the server, not by regexps.  The answers
 ;; of the server are kept with the processed sentences: moving back to
 ;; a sentence whose goals were displayed does not ask the server.
+;;
+;; The files of the backend, from the server to the user:
+;; - coq-eglot-lsp.el: the connection to coq-lsp through Eglot, its
+;;   requests and its events.  The only file that knows the protocol.
+;; - coq-eglot-sentences.el: the bounds of the sentences, from the
+;;   events.
+;; - coq-eglot-session.el: what the server said about the script and is
+;;   still valid, the target, the running operation.  It only records.
+;; - coq-eglot-compile.el: the compilation of the required libraries.
+;; - this file: the proof position, the planner moving it toward the
+;;   target, the commands and the queries.
+;; - coq-eglot-goals.el: the text of the goals.
+;; - coq-eglot-output.el: the buffers of the goals and messages, and
+;;   their windows.
+;; - coq-eglot-ui.el: the faces, the mode line and the menu.
+;; - coq-eglot-twin.el: the two Rocq mode, an extension, see the section
+;;   "Interface of the extensions".
+;;
+;; A command moving forward, like `coq-eglot-goto-point', sets the
+;; target of the session, then the planner, `coq-eglot--plan', starts
+;; one operation at a time toward it: compile the required libraries,
+;; ask the server to check up to the target without goals
+;; (`coq-eglot--advance'), then ask the goals after the last sentence
+;; (`coq-eglot--advance-done').  Meanwhile, the events of the server
+;; move the proof position, and an error stops the check, see
+;; `coq-eglot--observe'.  The answer is kept with its sentence and
+;; displayed, see `coq-eglot--show-answer': its goals formatted by
+;; coq-eglot-goals.el, in the buffers of coq-eglot-output.el.  Moving
+;; back asks nothing when the sentences are known, see
+;; `coq-eglot--move-back'.
 
 ;;; Code:
 
