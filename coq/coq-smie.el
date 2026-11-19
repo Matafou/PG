@@ -277,7 +277,7 @@ the token of \".\" is simply \".\"."
     ;; skip a regular word + one backslash
     (when (zerop tok-punc)
       (skip-syntax-backward "w_'")
-      (if (looking-back "\\s-\\\\") (forward-char -1)))
+      (if (coq-looking-back "\\s-\\\\" (- (point) 2)) (forward-char -1)))
     ;; Special case: if the symbols found end by "." or ";",
     ;; then consider this last letter alone as a token
     (when (and (not (zerop tok-punc)) (string-match "\\s.+[.;]" str-punc))
@@ -428,7 +428,8 @@ The point should be at the beginning of the command name."
   (save-excursion              ; FIXME Is there other module starting commands?
     (let ((case-fold-search nil))
       (cond
-       ((looking-back "with\\s-+" nil) "module nodecl") ; Module that is not a declaration keyword (like in with Module)
+       ;; Module that is not a declaration keyword (like in with Module)
+       ((coq-looking-back-near "with\\s-+") "module nodecl")
        ((looking-at "\\(Module\\|Section\\)\\>")
         (if (coq-lonely-:=-in-this-command) "Module start" "Module def"))))))
 
@@ -645,7 +646,48 @@ The point should be at the beginning of the command name."
           "; equations"
         ";")))))
 
+(defvar coq-smie--tokens nil
+  "Tokens read backward during `coq-smie-indent-region', or nil.
+A hash table from a position to (TOKEN . START): the token before this
+position and where it starts.  Indenting each line reads backward the
+tokens before it: the next lines read them again.")
+
+(defun coq-smie--forget-tokens (beg _end _length)
+  "Forget the tokens cached at BEG or after, the text changed there.
+In `after-change-functions' during `coq-smie-indent-region'."
+  (when coq-smie--tokens
+    (maphash (lambda (pos _token)
+               (when (>= pos beg) (remhash pos coq-smie--tokens)))
+             coq-smie--tokens)))
+
+(defun coq-smie-indent-region (start end)
+  "Indent the lines between START and END, caching the tokens.
+This is `indent-region-function' in Coq mode: each line is indented by
+`indent-line-function', the tokens read for a line are not read again
+for the next ones, see `coq-smie--tokens'."
+  (let ((coq-smie--tokens (make-hash-table :test #'eql)))
+    (add-hook 'after-change-functions #'coq-smie--forget-tokens nil t)
+    (unwind-protect
+        (if (fboundp 'indent-region-line-by-line)
+            (indent-region-line-by-line start end)
+          (let ((indent-region-function nil))
+            (indent-region start end)))
+      (remove-hook 'after-change-functions #'coq-smie--forget-tokens t))))
+
 (defun coq-smie-backward-token ()
+  "Return the token before point, move point before it.
+Cached during `coq-smie-indent-region', see `coq-smie--tokens'."
+  (let ((cached (and coq-smie--tokens (gethash (point) coq-smie--tokens))))
+    (if cached
+        (progn (goto-char (cdr cached)) (car cached))
+      (let ((pos (point))
+            (token (coq-smie--backward-token)))
+        (when coq-smie--tokens
+          (puthash pos (cons token (point)) coq-smie--tokens))
+        token))))
+
+(defun coq-smie--backward-token ()
+  "Return the token before point, move point before it."
   (let ((tok (coq-smie-backward-token-aux)))
     (cond
      ((assoc tok coq-smie-user-tokens)
@@ -667,7 +709,7 @@ The point should be at the beginning of the command name."
    (let ((dist (skip-syntax-forward ".")))
      
      (when (or (zerop dist)
-               (and (= 1 dist) (looking-back "\\\\")))
+               (and (= 1 dist) (coq-looking-back "\\\\" (1- (point)))))
        (skip-syntax-forward "w_'"))
      (point))))
 
@@ -677,7 +719,7 @@ The point should be at the beginning of the command name."
    (point)
    (progn (when (zerop (skip-syntax-backward "."))
             (skip-syntax-backward "w_'")
-            (if (looking-back "\\s-\\\\") (forward-char -1)))
+            (if (coq-looking-back "\\s-\\\\" (- (point) 2)) (forward-char -1)))
           (point))))
 
 (defun coq-smie-backward-token-aux ()
@@ -776,14 +818,14 @@ The point should be at the beginning of the command name."
            (save-excursion
              (forward-char -1)
              (if (and (looking-at "{")
-                      (looking-back coq-goal-selector-regexp nil t))
+                      (coq-looking-back-near coq-goal-selector-regexp t))
                  (goto-char (match-beginning 0)))
              (let ((nxttok (coq-smie-backward-token))) ;; recursive call
                (coq-is-cmdend-token nxttok))))
       (forward-char -1)
       (if (looking-at "}") "} subproof"
         (if (and (looking-at "{")
-                 (looking-back coq-goal-selector-regexp nil t))
+                 (coq-looking-back-near coq-goal-selector-regexp t))
             (goto-char (match-beginning 0)))
         "{ subproof"
         ))
@@ -796,8 +838,8 @@ The point should be at the beginning of the command name."
      ;;  (forward-char -1)
      ;;  (if (looking-at "{") "{ subproof" "} subproof"))
 
-     ((and (equal tok ":") (looking-back "\\<\\(constr\\|ltac2?\\|uconstr\\)"
-                                         (- (point) 7)))
+     ((and (equal tok ":")
+           (coq-looking-back "\\<\\(constr\\|ltac2?\\|uconstr\\)" (- (point) 7)))
       ": ltacconstr")
 
      ((member tok '(":=" "::="))
@@ -1292,6 +1334,30 @@ Typical values are 2 or 4."
 (defun coq-smie--same-line-as-parent (parent-pos child-pos)
   "Return non-nil if PARENT-POS is on same line as CHILD-POS."
   (= (line-number-at-pos parent-pos) (line-number-at-pos child-pos)))
+
+(defcustom coq-indent-enable t
+  "If non-nil, indent Coq scripts according to their syntax.
+If nil, a line is indented like the previous one, by
+\\[indent-for-tab-command] or by a newline, and the lines are not
+indented again while typing, see `electric-indent-inhibit'.  This is
+also much faster on large scripts.  Takes effect when `coq-mode' starts
+in a buffer."
+  :group 'coq-mode
+  :type 'boolean
+  :safe #'booleanp)
+
+(defun coq-indent-like-previous-line ()
+  "Indent the current line like the previous non blank one.
+This is `indent-line-function' when `coq-indent-enable' is nil.  Point
+stays in the text if it is after the indentation."
+  (let ((column (save-excursion
+                  (beginning-of-line)
+                  (if (re-search-backward "^[ \t]*[^ \t\n]" nil t)
+                      (current-indentation)
+                    0))))
+    (if (<= (current-column) (current-indentation))
+        (indent-line-to column)
+      (save-excursion (indent-line-to column)))))
 
 (defcustom coq-indent-basic 2
   "Basic indentation step.
