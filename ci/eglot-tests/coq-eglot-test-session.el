@@ -187,7 +187,8 @@ The first error between two positions, warnings do not count."
            cancelled failed traced)
       (coq-eglot-session-set-target (point-max))
       (setq coq-eglot--work-context context
-            coq-eglot--work-start 1)
+            coq-eglot--work-start 1
+            coq-eglot--work-position 3)
       (let ((event
              (coq-eglot-lsp--make-diagnostics
               1 (list (coq-eglot-lsp--make-diagnostic
@@ -200,18 +201,19 @@ The first error between two positions, warnings do not count."
                      (setq traced (list start end answer))))
                   ((symbol-function 'coq-eglot-position) (lambda () 7))
                   ((symbol-function 'coq-eglot--fail)
-                   (lambda (start end text &optional _answer)
-                     (setq failed (list start end text)))))
+                   (lambda (start end text &optional _answer floor)
+                     (setq failed (list start end text floor)))))
           ;; The real hook has this order: the session, then the interface.
           (coq-eglot-session-observe event)
           (coq-eglot--observe event))
         (should (eq cancelled context))
         (should (equal traced '(1 4 nil)))
-        (should (equal failed '(4 6 "bad B")))
+        (should (equal failed '(4 6 "bad B" 3)))
         (should-not (coq-eglot-session-work-p work))
         (should-not (coq-eglot-session-target))
         (should-not coq-eglot--work-context)
-        (should-not coq-eglot--work-start)))))
+        (should-not coq-eglot--work-start)
+        (should-not coq-eglot--work-position)))))
 
 (ert-deftest coq-eglot-known-error-sends-no-operation ()
   "The planner stops at a valid recorded error without asking the server."
@@ -233,11 +235,11 @@ The first error between two positions, warnings do not count."
                 ((symbol-function 'coq-eglot--update-overlays) #'ignore)
                 ((symbol-function 'coq-eglot--trace-check) #'ignore)
                 ((symbol-function 'coq-eglot--fail)
-                 (lambda (start end text &optional _answer)
-                   (setq failed (list start end text)))))
+                 (lambda (start end text &optional _answer floor)
+                   (setq failed (list start end text floor)))))
         (coq-eglot--plan))
       (should-not sent)
-      (should (equal failed '(4 6 "known bad B")))
+      (should (equal failed '(4 6 "known bad B" 1)))
       (should-not (coq-eglot-session-target)))))
 
 (ert-deftest coq-eglot-document-error-stops-running-check ()
@@ -260,7 +262,7 @@ The first error between two positions, warnings do not count."
                    (lambda (request) (setq cancelled request)))
                   ((symbol-function 'coq-eglot--update-overlays) #'ignore)
                   ((symbol-function 'coq-eglot--show-error)
-                   (lambda (text) (setq shown text)))
+                   (lambda (text &optional _scripted) (setq shown text)))
                   ((symbol-function 'coq-eglot--highlight-error)
                    (lambda (start end) (setq highlighted (cons start end)))))
           (coq-eglot-session-observe event)

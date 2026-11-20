@@ -780,15 +780,22 @@ twins are highlighted; not while they are at other positions."
         (should-not (twin-differences twin-goals))))))
 
 (ert-deftest coq-eglot-twin-synchronize-error ()
-  "An error of the follower stops it, not the leader; off, the
-synchronization does not move the twin."
+  "An error on either side stops both; off, it does not move the twin."
   (with-sync-twins (string-replace "idtac." "exact 0." sync-twin-text)
     (goto-char (point-max))
     (run #'coq-eglot-process-buffer)
     (wait-for-twins)
-    (should (position-at-marker-p "l3"))
+    ;; The follower's error stops the leader too, and brings it back if a
+    ;; progress notification had already moved it past the corresponding
+    ;; sentence.
+    (should-not (coq-eglot-checking-p))
+    (should (= (coq-eglot-position)
+               (coq-eglot-twin-position
+                (with-current-buffer twin (coq-eglot-position)) twin)))
+    (should-not (position-at-marker-p "l3"))
     (with-current-buffer twin
       ;; stopped before the error
+      (should-not (coq-eglot-checking-p))
       (should (= (coq-eglot-position) (search-position "1 = 1.\nProof.")))
       ;; the sentence that failed
       (should (cl-some (lambda (overlay)
@@ -806,6 +813,45 @@ synchronization does not move the twin."
       (wait-for-twins)
       (should (= (coq-eglot-position) (point-min)))
       (should (= (with-current-buffer twin (coq-eglot-position)) before)))))
+
+(ert-deftest coq-eglot-twin-synchronize-leader-error ()
+  "An error of the leader retargets its follower exactly before the error."
+  (with-sync-twins sync-twin-text
+    (goto-char (point-min))
+    (search-forward "reflexivity.")
+    (replace-match "exact 0." t t)
+    (goto-char (point-max))
+    (run #'coq-eglot-process-buffer)
+    (wait-for-twins)
+    (should-not (coq-eglot-checking-p))
+    (should (cl-some (lambda (overlay)
+                       (equal (buffer-substring (overlay-start overlay)
+                                                (overlay-end overlay))
+                              "exact 0."))
+                     coq-eglot--error-overlays))
+    (should-not (with-current-buffer twin (coq-eglot-checking-p)))
+    (should (= (with-current-buffer twin (coq-eglot-position))
+               (coq-eglot-twin-position (coq-eglot-position))))))
+
+(ert-deftest coq-eglot-twin-synchronize-earliest-error ()
+  "Of errors on both sides, the earliest one becomes their common target."
+  (with-sync-twins (string-replace "idtac." "exact 0." sync-twin-text)
+    ;; The leader fails in l1, before the follower's error in l2.
+    (goto-char (point-min))
+    (search-forward "exact I.")
+    (replace-match "exact 0." t t)
+    (goto-char (point-max))
+    (run #'coq-eglot-process-buffer)
+    (wait-for-twins)
+    (let ((before-first-error (search-position "Lemma l1 : True.\nProof.")))
+      (should (= (coq-eglot-position) before-first-error))
+      (should (= (with-current-buffer twin (coq-eglot-position))
+                 (coq-eglot-twin-position before-first-error))))
+    (should (cl-some (lambda (overlay)
+                       (equal (buffer-substring (overlay-start overlay)
+                                                (overlay-end overlay))
+                              "exact 0."))
+                     coq-eglot--error-overlays))))
 
 (ert-deftest coq-eglot-twin-pair-errors ()
   "A buffer has at most one twin, and it is not itself."

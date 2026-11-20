@@ -588,6 +588,10 @@ Then its windows show its proof position, see
 (defvar-local coq-eglot-twin--show-timer nil
   "Timer showing the proof position of the follower, or nil.")
 
+(defvar coq-eglot-twin--stopping-at-error nil
+  "Non-nil while an error stops and aligns both twins.
+It prevents the induced position change from scheduling ordinary following.")
+
 (defun coq-eglot-twin--unhighlight ()
   "Remove the highlighting of the diverging sentences of the buffer."
   (dolist (overlay coq-eglot-twin--overlays)
@@ -827,7 +831,8 @@ See `coq-eglot-twin--start-alignment'.")
 ;; functions: it does not become the leader.  If it is checking, it
 ;; goes on further if needed, otherwise it waits for the end of its
 ;; check.  When it has moved, its windows show its new proof position,
-;; or its error.
+;; or its error.  An error on either side stops the scripting of the
+;; other side too, at or before the corresponding proof position.
 
 (defcustom coq-eglot-twin-synchronize t
   "If non-nil, the proof position of a twin follows the one of the other.
@@ -843,10 +848,16 @@ The twin where the user works leads, see `coq-eglot-twin-pair'."
 
 (defun coq-eglot-twin--target ()
   "Where the current buffer, a follower, must move its proof position.
-The position corresponding to the one of its twin, the leader."
+The position corresponding to the destination of its twin, the leader.
+While the leader is checking, use its target rather than its current proof
+position, so both sides start checking concurrently."
   (let ((leader coq-eglot--twin))
     (coq-eglot-twin-position
-     (with-current-buffer leader (coq-eglot-position)) leader)))
+     (with-current-buffer leader
+       (if (coq-eglot-checking-p)
+           (coq-eglot-check-target)
+         (coq-eglot-position)))
+     leader)))
 
 (defun coq-eglot-twin--move (target)
   "Move the proof position of the current buffer to TARGET.
@@ -881,12 +892,34 @@ is left before, see `coq-eglot-twin--following'."
           (setq coq-eglot-twin--following nil))))))
 
 (defun coq-eglot-twin--show-error ()
-  "Show the error of the current buffer, a follower, in its windows.
-See `coq-eglot-error-hook'."
-  (when (and coq-eglot-twin-synchronize (buffer-live-p coq-eglot--twin)
-             (not (coq-eglot-twin--leader-p)))
-    (setq coq-eglot-twin--following nil)
-    (coq-eglot-twin--show (point))))
+  "Retarget both twins at the earliest error and show the current one.
+The other side moves to the position corresponding to the proof position
+before this error.  If it finds an earlier error on the way, its own error
+hook retargets this side in turn: targets can only move backward until the
+earliest error wins.  See `coq-eglot-error-hook'."
+  (when (and coq-eglot-twin-synchronize (buffer-live-p coq-eglot--twin))
+    (let* ((failed (current-buffer))
+           (other coq-eglot--twin)
+           (error-position (point))
+           (failed-position (coq-eglot-position))
+           (other-position (coq-eglot-twin-position failed-position failed)))
+      (coq-eglot-twin--cancel coq-eglot-twin--follow-timer)
+      (coq-eglot-twin--cancel coq-eglot-twin--show-timer)
+      (setq coq-eglot-twin--following nil)
+      (let ((coq-eglot-twin--stopping-at-error t))
+        (with-current-buffer other
+          (coq-eglot-twin--cancel coq-eglot-twin--follow-timer)
+          (coq-eglot-twin--cancel coq-eglot-twin--show-timer)
+          (setq coq-eglot-twin--out-of-sync nil
+                coq-eglot-twin--following other-position)
+          ;; Replace a farther target, go back if already past the error, or
+          ;; continue up to it if still behind.  A new, earlier error repeats
+          ;; the same operation symmetrically.
+          (coq-eglot-retarget-proof-position other-position)
+          (unless (coq-eglot-checking-p)
+            (coq-eglot-twin--schedule-show (current-buffer)))))
+      (with-current-buffer failed
+        (coq-eglot-twin--show error-position)))))
 
 (defun coq-eglot-twin--schedule-show (buffer)
   "Show the proof position of BUFFER after the current command.
@@ -907,7 +940,19 @@ Once for several moves, see `coq-eglot-twin--show-position'."
         ;; without waiting for its server: its requests wait for it
         ;; to connect, see `coq-eglot-lsp--when-connected'
         (condition-case err
-            (coq-eglot-twin--move (coq-eglot-twin--target))
+            (let ((target (coq-eglot-twin--target)))
+              ;; In particular, do not replace the window showing an error
+              ;; merely because the other side has now converged to it.
+              (if (= target (coq-eglot-position))
+                  (progn
+                    (setq coq-eglot-twin--out-of-sync nil)
+                    ;; Preserve a show already owed by this follower, but do
+                    ;; not create one when its window deliberately shows an
+                    ;; error and FOLLOWING is nil.
+                    (when (and coq-eglot-twin--following
+                               (not (coq-eglot-checking-p)))
+                      (coq-eglot-twin--schedule-show (current-buffer))))
+                (coq-eglot-twin--move target)))
           (error (setq coq-eglot-twin--following nil)
                  (message "Coq: %s does not follow its twin: %s"
                           (buffer-name) (error-message-string err))))))))
@@ -923,10 +968,16 @@ Once for several moves of the leader."
   "The proof position of the current buffer may have moved.
 In the leader, the follower follows; in a follower that waited for the
 end of its check, it moves now.  See `coq-eglot-position-hook'."
-  (when (and coq-eglot-twin-synchronize (buffer-live-p coq-eglot--twin))
+  (when (and (not coq-eglot-twin--stopping-at-error)
+             coq-eglot-twin-synchronize (buffer-live-p coq-eglot--twin))
     (cond
      ((coq-eglot-twin--leader-p)
-      (coq-eglot-twin--schedule-follow coq-eglot--twin))
+      (coq-eglot-twin--schedule-follow coq-eglot--twin)
+      ;; An error of the follower may have retargeted the leader backward.
+      ;; Once that shorter check ends, show and clear its convergence target
+      ;; just as for an ordinary follower.
+      (when (and coq-eglot-twin--following (not (coq-eglot-checking-p)))
+        (coq-eglot-twin--schedule-show (current-buffer))))
      ((coq-eglot-checking-p))
      (coq-eglot-twin--out-of-sync
       (coq-eglot-twin--schedule-follow (current-buffer)))

@@ -336,15 +336,17 @@ nothing if there is no such sentence or a request fails."
             ;; it does not end before POS: take the one before it
             (t (coq-eglot--sentence-before (car bounds) on-found))))))))))
 
-(defun coq-eglot--move-back (pos &optional goals-only)
+(defun coq-eglot--move-back (pos &optional goals-only floor)
   "Move the proof position back to the last sentence ending at POS or before.
 Without waiting.  Usually the server told the bounds of all the
 sentences it checked (see `coq-eglot-sentences-previous-end'): the
 proof position moves there at once.  Otherwise first to the last
 processed sentence known, at once, then to the one the server finds, if
 the user did not ask anything else meanwhile and the answer is still
-valid.  Display the goals and messages, or only the goals if
-GOALS-ONLY: the response buffer keeps an error."
+valid.  With FLOOR, do not move before that already committed position.
+Display the goals and messages, or only the goals if GOALS-ONLY: the response
+buffer keeps an error."
+  (when floor (setq pos (max pos floor)))
   (let ((intent (coq-eglot--new-intent))
         (known (coq-eglot-sentences-previous-end pos)))
     (coq-eglot-session-forget-sentences pos)
@@ -1197,10 +1199,16 @@ progress of the server."
   "Start of the text covered by the operation moving the proof position.
 Unlike the proof position, it does not move with progress notifications.")
 
+(defvar-local coq-eglot--work-position nil
+  "Proof position at the start of the current forward operation.
+An error found by that operation must not move the locked region before this
+already committed position, even if its reported sentence range overlaps it.")
+
 (defun coq-eglot--start-work (start)
   "Note that an operation starts at START, return its session work object."
   (setq coq-eglot--work-context nil
-        coq-eglot--work-start start)
+        coq-eglot--work-start start
+        coq-eglot--work-position (coq-eglot-position))
   (prog1 (coq-eglot-session-start-work)
     (coq-eglot--update-overlays)))
 
@@ -1230,9 +1238,21 @@ cancelled request."
 (defun coq-eglot--stop ()
   "Forget the target and the running operation: nothing is checked."
   (setq coq-eglot--work-context nil
-        coq-eglot--work-start nil)
+        coq-eglot--work-start nil
+        coq-eglot--work-position nil)
   (coq-eglot-session-stop-work)
   (coq-eglot--update-overlays))
+
+(defun coq-eglot--stop-scripting ()
+  "Stop the current scripting operation without cancelling user requests.
+Cancel its compilation or LSP request if one is in flight.  Answers arriving
+afterwards are ignored because the session work is stopped first."
+  (let ((context coq-eglot--work-context))
+    (coq-eglot--cancel-hyp-sorts)
+    (coq-eglot-compile-cancel)
+    (coq-eglot--stop)
+    (when context
+      (coq-eglot-lsp-cancel-request context))))
 
 (defun coq-eglot--queue (target)
   "Move the target further, to TARGET, during a check.
@@ -1246,13 +1266,14 @@ being checked: moving back while checking is not possible."
   (coq-eglot-session-set-target target)
   (coq-eglot--update-overlays))
 
-(defun coq-eglot--fail (start end text &optional _answer)
+(defun coq-eglot--fail (start end text &optional _answer floor)
   "The sentence between START and END failed with error TEXT.
 Move the proof position before it, without waiting, see
-`coq-eglot--move-back', and display the error, with the goals before
-the sentence."
+`coq-eglot--move-back', but not before FLOOR when non-nil: a forward
+operation cannot invalidate the position where it started.  Display the
+error, with the goals before the sentence."
   (coq-eglot--trace-error start end text)
-  (coq-eglot--move-back start t)
+  (coq-eglot--move-back start t floor)
   (coq-eglot--show-error text)
   (coq-eglot--highlight-error start end))
 
@@ -1282,7 +1303,10 @@ A function of `coq-eglot-lsp-event-functions', after the session."
 (defun coq-eglot--stop-at-error (diag start &optional cancel)
   "Stop at DIAG, the first error of an operation starting at START.
 With CANCEL, cancel the request of the running operation first."
-  (let ((sentence (coq-eglot-lsp-diagnostic-sentence diag)))
+  (let ((sentence (coq-eglot-lsp-diagnostic-sentence diag))
+        ;; A diagnostic already known is handled before work starts; its
+        ;; floor is the current committed position.
+        (floor (or coq-eglot--work-position (coq-eglot-position))))
     (when cancel
       (coq-eglot-lsp-cancel-request coq-eglot--work-context))
     (coq-eglot--stop)
@@ -1291,7 +1315,8 @@ With CANCEL, cancel the request of the running operation first."
           (when (< start (car sentence))
             (coq-eglot--trace-check start (car sentence) nil))
           (coq-eglot--fail (car sentence) (cdr sentence)
-                           (coq-eglot-lsp-diagnostic-message diag)))
+                           (coq-eglot-lsp-diagnostic-message diag)
+                           nil floor))
       ;; Document-level errors, such as an invalid filename, have no
       ;; sentence.  Keep the anchor and at least report their range.
       (coq-eglot--show-error (coq-eglot-lsp-diagnostic-message diag))
@@ -1454,7 +1479,8 @@ See `coq-eglot--advance-done'.  Stop at the first error."
       (when (< start (car sentence))
         (coq-eglot--trace-check start (car sentence) nil))
       (coq-eglot--fail (car sentence) (cdr sentence)
-                       (coq-eglot-lsp-diagnostic-message diag)))
+                       (coq-eglot-lsp-diagnostic-message diag)
+                       nil before))
      (error
       ;; the sentence that failed and its error message, not its goals
       (coq-eglot--send
@@ -1468,7 +1494,8 @@ See `coq-eglot--advance-done'.  Stop at the first error."
              (coq-eglot--trace-check start (car bounds) nil))
            (coq-eglot--fail (car bounds) (cdr bounds)
                             (or (and answer (coq-eglot-lsp-answer-error answer))
-                                "Error."))))))
+                                "Error.")
+                            answer before)))))
      ;; an error the diagnostics did not report
      ((and bounds (coq-eglot-lsp-answer-error answer))
       (coq-eglot-session-finish-work work)
@@ -1476,7 +1503,8 @@ See `coq-eglot--advance-done'.  Stop at the first error."
       (when (< start (car bounds))
         (coq-eglot--trace-check start (car bounds) nil))
       (coq-eglot--fail (car bounds) (cdr bounds)
-                       (coq-eglot-lsp-answer-error answer)))
+                       (coq-eglot-lsp-answer-error answer)
+                       answer before))
      (t
       (coq-eglot-session-finish-work work)
       (when bounds
@@ -2095,6 +2123,18 @@ non-nil otherwise."
    ((< target (coq-eglot-position)) (coq-eglot--retract target) t)
    ((> target (coq-eglot-position)) (coq-eglot--go target) t)
    (t t)))
+
+(defun coq-eglot-retarget-proof-position (target)
+  "Make TARGET the destination of the current script buffer.
+Unlike `coq-eglot-move-proof-position', TARGET may shorten a running check.
+In that case cancel the current scripting request, then move from the proof
+position already reached toward TARGET.  This is intended for coordination
+between interfaces, such as twins converging on their earliest error; it does
+not make the buffer the one where the user works."
+  (when (and (coq-eglot-checking-p)
+             (< target (coq-eglot-check-target)))
+    (coq-eglot--stop-scripting))
+  (coq-eglot-move-proof-position target))
 
 (defun coq-eglot-next-sentence-position (pos)
   "Position after the blanks and comments following POS."
