@@ -493,8 +493,9 @@ was sent at.  VERSION is the version of the document sent with it.  ID
 is its jsonrpc id, for `$/cancelRequest'.  POLICY describes its
 client-side scheduling, see `coq-eglot-lsp-policy'.  QUEUE-KEY groups
 replaceable requests of the same kind.  CANCELLED is non-nil when the
-request was abandoned."
-  method position version id policy queue-key cancelled)
+request was abandoned.  DEBOUNCE is its admission delay before it enters the
+scheduler, or nil."
+  method position version id policy queue-key cancelled debounce)
 
 (cl-defstruct (coq-eglot-lsp-message
                (:constructor coq-eglot-lsp--make-message (severity text)))
@@ -689,19 +690,103 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
                 (with-demoted-errors "Coq: %S"
                   (funcall fn server))))))))))
 
+;; Request admission
+;;
+;; Automatic UI events may occur in bursts.  Delay the creation of a
+;; replaceable request until events with the same key have stopped for a short
+;; time.  This is deliberately before request scheduling below: a superseded
+;; event allocates no JSON-RPC id, captures no document version and needs no
+;; LSP cancellation.
+
+(cl-defstruct (coq-eglot-lsp-debounce
+               (:constructor coq-eglot-lsp--make-debounce
+                             (key timer on-cancel)))
+  "A delayed automatic request.
+KEY identifies equivalent events and TIMER runs the last one.  ON-CANCEL is
+called if the request is replaced or explicitly cancelled."
+  key timer on-cancel)
+
+(defvar-local coq-eglot-lsp--debounces nil
+  "Delayed automatic requests of the current buffer, by equal keys.
+The value is a hash table created on first use.  Its entries are
+`coq-eglot-lsp-debounce' objects.")
+
+(defun coq-eglot-lsp--debounces ()
+  "Return the debounce table of the current buffer, creating it if needed."
+  (or coq-eglot-lsp--debounces
+      (progn
+        (add-hook 'kill-buffer-hook #'coq-eglot-lsp--cancel-debounces nil t)
+        (setq coq-eglot-lsp--debounces (make-hash-table :test #'equal)))))
+
+(defun coq-eglot-lsp--run-debounce (buffer key debounce request)
+  "Run REQUEST for KEY in BUFFER if DEBOUNCE is still its current entry."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((table coq-eglot-lsp--debounces))
+        (when (and table (eq (gethash key table) debounce))
+          (remhash key table)
+          (funcall request))))))
+
+(defun coq-eglot-lsp--cancel-debounce (debounce)
+  "Cancel DEBOUNCE if it is still current.
+Call its cancellation callback and return non-nil if it was current."
+  (let* ((table coq-eglot-lsp--debounces)
+         (key (coq-eglot-lsp-debounce-key debounce)))
+    (when (and table (eq (gethash key table) debounce))
+      (remhash key table)
+      (let ((timer (coq-eglot-lsp-debounce-timer debounce)))
+        (when (timerp timer) (cancel-timer timer)))
+      (when-let ((callback (coq-eglot-lsp-debounce-on-cancel debounce)))
+        (funcall callback))
+      t)))
+
+(cl-defun coq-eglot-lsp--debounce
+    (key delay request &key on-cancel)
+  "Run REQUEST after DELAY seconds without another call for KEY.
+REQUEST is a function without arguments.  A newer call in the same buffer
+with an equal KEY cancels and replaces the delayed request.  Replacement or
+explicit cancellation calls ON-CANCEL when non-nil.  Return the internal
+debounce object."
+  (unless (and (numberp delay) (>= delay 0))
+    (error "Invalid debounce delay: %S" delay))
+  (unless (functionp request)
+    (error "Invalid debounced request: %S" request))
+  (let* ((table (coq-eglot-lsp--debounces))
+         (old (gethash key table))
+         (buffer (current-buffer))
+         debounce)
+    (when old
+      (coq-eglot-lsp--cancel-debounce old))
+    (setq debounce
+          (coq-eglot-lsp--make-debounce
+           key nil on-cancel))
+    (setf (coq-eglot-lsp-debounce-timer debounce)
+          (run-at-time delay nil #'coq-eglot-lsp--run-debounce
+                       buffer key debounce request))
+    (puthash key debounce table)
+    debounce))
+
+(defun coq-eglot-lsp--cancel-debounces ()
+  "Cancel every delayed automatic request of the current buffer."
+  (when coq-eglot-lsp--debounces
+    (dolist (debounce (hash-table-values coq-eglot-lsp--debounces))
+      (coq-eglot-lsp--cancel-debounce debounce))))
+
 ;; Request scheduling
 ;;
 ;; coq-lsp may interrupt its current synchronous request when it receives
 ;; another one.  This is useful while it is checking the document, but not
 ;; while it is formatting the final goals or answering an explicit query.
-;; Every request therefore carries three independent scheduling properties:
+;; Every request therefore carries three scheduling properties; the queue
+;; discipline may additionally wait for a burst of equivalent automatic
+;; events to settle before admitting its last request:
 ;;
-;;                           interruption     priority       queue
-;;   `finalization'          `protected'       40            `fifo'
-;;   `user'                  `protected'       30            `fifo'
-;;   `work'                  `resumable'       20            `latest'
-;;   `background'            `discardable'     10            `latest'
-;;   `hover'                 `discardable'      0            `drop'
+;;                           interruption     priority       queue      settle
+;;   `finalization'          `protected'       40            `fifo'       -
+;;   `user'                  `protected'       30            `fifo'       -
+;;   `work'                  `resumable'       20            `latest'     -
+;;   `background'            `discardable'     10            `latest'     -
+;;   `hover'                 `discardable'      0            `drop'      0.05
 ;;
 ;; Interruptibility says what a request of greater priority may do to an
 ;; active request.  A `protected' request must finish first.  A `resumable'
@@ -720,6 +805,10 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
 ;; QUEUE-KEY.  `drop' does not queue at all when anything is active or
 ;; waiting.  Thus hovers never delay useful work, while hypothesis sorts may
 ;; wait briefly and a newer sorts request replaces the obsolete one.
+;; SETTLE-DELAY, when non-nil, is a trailing-edge debounce attached to
+;; `latest' or `drop': before entering the scheduler, equivalent events wait
+;; that many seconds and only the last one becomes a request.  `fifo' cannot
+;; settle because it promises to preserve every request.
 ;;
 ;; The named policies are known outside the scheduler: the request adapters
 ;; below select `finalization', `user', `work', `background' or `hover' for
@@ -735,13 +824,54 @@ Call the functions waiting for it, see `coq-eglot-lsp--waiting'."
 ;; make each policy choice explicit.
 
 (cl-defstruct (coq-eglot-lsp-policy
-               (:constructor coq-eglot-lsp--make-policy
-                             (name interruptibility priority discipline)))
-  "Independent scheduling properties of a request.
+               (:constructor coq-eglot-lsp--create-policy
+                             (name interruptibility priority discipline
+                                   settle-delay)))
+  "Scheduling properties of a request.
 INTERRUPTIBILITY is `protected', `resumable' or `discardable'.  PRIORITY
 is a number: a request can pass an unprotected request of lower
-priority.  DISCIPLINE is `fifo', `latest' or `drop'."
-  name interruptibility priority discipline)
+priority.  DISCIPLINE is `fifo', `latest' or `drop'.  SETTLE-DELAY, when
+non-nil, debounces equivalent events before scheduling.  It is coupled to
+DISCIPLINE: it is valid with `latest' or `drop', never with `fifo'."
+  name interruptibility priority discipline settle-delay)
+
+(defconst coq-eglot-lsp--supported-policy-combinations
+  '((protected fifo)
+    (resumable latest)
+    (discardable latest)
+    (discardable drop))
+  "Supported pairs of request interruptibility and queue discipline.
+Other combinations do not yet have a complete implementation: in particular,
+replacement of an active `protected' request and the place of a resumed `fifo'
+request are undefined.  Add a pair only with tests of replacement,
+interruption and resumption.")
+
+(defun coq-eglot-lsp--make-policy
+    (name interruptibility priority discipline &optional settle-delay)
+  "Make a validated scheduling policy named NAME.
+See `coq-eglot-lsp-policy' for INTERRUPTIBILITY, PRIORITY, DISCIPLINE and
+SETTLE-DELAY.
+Signal an error for a combination whose semantics the scheduler does not
+implement explicitly."
+  (unless (symbolp name)
+    (error "Invalid request policy name: %S" name))
+  (unless (numberp priority)
+    (error "Invalid request priority: %S" priority))
+  (unless (memq interruptibility '(protected resumable discardable))
+    (error "Invalid request interruptibility: %S" interruptibility))
+  (unless (memq discipline '(fifo latest drop))
+    (error "Invalid request queue discipline: %S" discipline))
+  (unless (or (null settle-delay)
+              (and (numberp settle-delay) (>= settle-delay 0)))
+    (error "Invalid request settle delay: %S" settle-delay))
+  (when (and settle-delay (eq discipline 'fifo))
+    (error "A fifo request policy cannot have a settle delay"))
+  (unless (member (list interruptibility discipline)
+                  coq-eglot-lsp--supported-policy-combinations)
+    (error "Unsupported request policy combination: %S with %S"
+           interruptibility discipline))
+  (coq-eglot-lsp--create-policy
+   name interruptibility priority discipline settle-delay))
 
 (defconst coq-eglot-lsp-finalization-policy
   (coq-eglot-lsp--make-policy 'finalization 'protected 40 'fifo)
@@ -760,8 +890,8 @@ priority.  DISCIPLINE is `fifo', `latest' or `drop'."
   "Policy of optional presentation enrichment.")
 
 (defconst coq-eglot-lsp-hover-policy
-  (coq-eglot-lsp--make-policy 'hover 'discardable 0 'drop)
-  "Policy of a hover: do not even queue it while the server is busy.")
+  (coq-eglot-lsp--make-policy 'hover 'discardable 0 'drop 0.05)
+  "Policy of a hover: settle for 50 ms, then send only if the server is free.")
 
 (defvar-local coq-eglot-lsp--request-queue nil
   "Requests waiting for the scheduler.
@@ -802,7 +932,10 @@ Preserve FIFO order between entries of equal priority."
 
 (defun coq-eglot-lsp--abandon (context)
   "Cancel and forget active or queued CONTEXT, without dispatching."
-  (setf (coq-eglot-lsp-context-cancelled context) t)
+  (when-let ((debounce (coq-eglot-lsp-context-debounce context)))
+    (coq-eglot-lsp--cancel-debounce debounce))
+  (setf (coq-eglot-lsp-context-cancelled context) t
+        (coq-eglot-lsp-context-debounce context) nil)
   (setq coq-eglot-lsp--active-requests
         (delq context coq-eglot-lsp--active-requests)
         coq-eglot-lsp--request-queue
@@ -872,6 +1005,7 @@ Preserve FIFO order between entries of equal priority."
 
 (defun coq-eglot-lsp--reset-scheduler ()
   "Forget all scheduler state of the current buffer."
+  (coq-eglot-lsp--cancel-debounces)
   (dolist (entry coq-eglot-lsp--request-queue)
     (setf (coq-eglot-lsp-context-cancelled (car entry)) t))
   (dolist (context coq-eglot-lsp--active-requests)
@@ -890,7 +1024,9 @@ called with the answer and the context, ON-ERROR with a
 the server does not connect.  PARAMS is a function returning the
 parameters, called after the changes are sent.  POLICY defaults to
 `coq-eglot-lsp-user-policy'; QUEUE-KEY distinguishes replaceable
-requests under a `latest' policy.  ON-SUCCESS and ON-ERROR are called
+requests under a `latest' policy and is required when the policy has a
+settle delay.  Such a request enters the scheduler only after its burst
+of equivalent events has settled.  ON-SUCCESS and ON-ERROR are called
 from a timer, not from the process filter: they may send other requests.
 No request of the backend waits for its answer: while waiting in
 `jsonrpc-request', the answers of the others would come, and callbacks
@@ -900,6 +1036,10 @@ sending other requests would run, nested."
     (setf (coq-eglot-lsp-context-policy context)
           (or policy coq-eglot-lsp-user-policy)
           (coq-eglot-lsp-context-queue-key context) queue-key)
+    (when (and (coq-eglot-lsp-policy-settle-delay
+                (coq-eglot-lsp-context-policy context))
+               (null queue-key))
+      (error "A settled request policy needs a queue key"))
     (cl-labels ((run (fn arg)
                   (when (buffer-live-p buffer)
                     (with-current-buffer buffer (funcall fn arg))))
@@ -962,8 +1102,22 @@ sending other requests would run, nested."
                              (later #'fail)
                              (coq-eglot-lsp--make-failure
                               context nil (error-message-string err)
-                              nil))))))))))
-      (coq-eglot-lsp--schedule context #'send)
+                              nil)))))))))
+                (cancel-admission ()
+                  (setf (coq-eglot-lsp-context-cancelled context) t
+                        (coq-eglot-lsp-context-debounce context) nil))
+                (admit ()
+                  (setf (coq-eglot-lsp-context-debounce context) nil)
+                  (coq-eglot-lsp--schedule context #'send)))
+      (let* ((policy (coq-eglot-lsp-context-policy context))
+             (delay (coq-eglot-lsp-policy-settle-delay policy)))
+        (if (null delay)
+            (coq-eglot-lsp--schedule context #'send)
+          (setf (coq-eglot-lsp-context-debounce context)
+                (coq-eglot-lsp--debounce
+                 (cons (coq-eglot-lsp-policy-name policy) queue-key)
+                 delay #'admit
+                 :on-cancel #'cancel-admission))))
       context)))
 
 (defun coq-eglot-lsp--pending-ids (server)
@@ -1268,10 +1422,12 @@ request."
   "Ask for hover information at POS without delaying other requests.
 Call ON-SUCCESS with the formatted text and its echo-area preference,
 or ON-ERROR with a `coq-eglot-lsp-failure'.  Return the request context,
-or nil when hover is unsupported or the server scheduler is busy.  A
-hover is deliberately dropped rather than queued."
+or nil when hover is unsupported.  Equivalent hover events first settle
+briefly; the last one is then sent if the server is free, or dropped rather
+than queued."
   (when (coq-eglot-lsp--server-capable :hoverProvider)
-    ;; `hover': never queue an automatic cursor read behind useful work.
+    ;; `hover': coalesce cursor movement, then never queue the resulting
+    ;; automatic read behind useful work.
     (let ((context
            (coq-eglot-lsp--async-request
             pos :textDocument/hover

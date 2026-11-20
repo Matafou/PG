@@ -2035,8 +2035,9 @@ is bound to `coq-terminator-insert'."
 
 (defun coq-eglot--hover-eldoc-function (callback &rest _args)
   "Ask the pseudo-server for Eldoc information through CALLBACK.
-Only ask in the processed part.  The pseudo-server drops the hover if
-another request is active instead of letting it interrupt useful work."
+Only ask in the processed part.  The pseudo-server coalesces nearby hover
+events, then drops the remaining one if another request is active instead of
+letting it interrupt useful work."
   (when (< (point) (coq-eglot-position))
     (and (coq-eglot-lsp-hover-async
           (point)

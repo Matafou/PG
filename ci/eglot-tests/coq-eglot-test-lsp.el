@@ -128,6 +128,160 @@ the load path of the buffer."
       (coq-eglot-lsp-cancel-request context)
       (should (equal notified '(server :$/cancelRequest (:id 42)))))))
 
+;;; Admission of automatic requests
+
+(ert-deftest coq-eglot-lsp-debounce-keeps-latest ()
+  "Only the last automatic request with an equal key is run."
+  (with-temp-buffer
+    (let (ran cancelled)
+      (coq-eglot-lsp--debounce
+       'refresh 0.05 (lambda () (push 'old ran))
+       :on-cancel (lambda () (setq cancelled t)))
+      (coq-eglot-lsp--debounce
+       'refresh 0.01 (lambda () (push 'new ran)))
+      (should cancelled)
+      (should (wait-until (lambda () ran) 1))
+      (accept-process-output nil 0.08)
+      (should (equal ran '(new)))
+      (should-not (gethash 'refresh coq-eglot-lsp--debounces)))))
+
+(ert-deftest coq-eglot-lsp-debounce-keys-are-independent ()
+  "Automatic requests with different keys do not replace one another."
+  (with-temp-buffer
+    (let (ran)
+      (coq-eglot-lsp--debounce 'left 0 (lambda () (push 'left ran)))
+      (coq-eglot-lsp--debounce 'right 0 (lambda () (push 'right ran)))
+      (should (wait-until (lambda () (= (length ran) 2)) 1))
+      (should (equal (sort ran #'string-lessp) '(left right))))))
+
+(ert-deftest coq-eglot-lsp-debounce-can-be-cancelled ()
+  "Cancelling a debounce prevents it from creating its request."
+  (with-temp-buffer
+    (let (ran cancelled debounce)
+      (setq debounce
+            (coq-eglot-lsp--debounce
+             'refresh 0.02 (lambda () (setq ran t))
+             :on-cancel (lambda () (setq cancelled t))))
+      (should (coq-eglot-lsp--cancel-debounce debounce))
+      (should-not (coq-eglot-lsp--cancel-debounce debounce))
+      (accept-process-output nil 0.05)
+      (should-not ran)
+      (should cancelled))))
+
+(ert-deftest coq-eglot-lsp-reset-cancels-debounces ()
+  "Resetting the scheduler cancels automatic requests not sent yet."
+  (with-temp-buffer
+    (let (ran)
+      (coq-eglot-lsp--debounce 'refresh 0.02 (lambda () (setq ran t)))
+      (coq-eglot-lsp--reset-scheduler)
+      (accept-process-output nil 0.05)
+      (should-not ran)
+      (should (hash-table-empty-p coq-eglot-lsp--debounces)))))
+
+(ert-deftest coq-eglot-lsp-debounce-cleaned-up-with-buffer ()
+  "Killing a buffer cancels its delayed automatic requests."
+  (let ((buffer (generate-new-buffer " *coq-eglot-debounce-test*"))
+        timer ran)
+    (with-current-buffer buffer
+      (setq timer
+            (coq-eglot-lsp-debounce-timer
+             (coq-eglot-lsp--debounce
+              'refresh 10 (lambda () (setq ran t))))))
+    (should (memq timer timer-list))
+    (kill-buffer buffer)
+    (should-not (memq timer timer-list))
+    (should-not ran)))
+
+;;; Scheduling policies
+
+(ert-deftest coq-eglot-lsp-policy-combinations-validated ()
+  "Only combinations with an implemented scheduler semantics are accepted."
+  (dolist (combination coq-eglot-lsp--supported-policy-combinations)
+    (should
+     (coq-eglot-lsp--make-policy
+      'test (car combination) 1 (cadr combination))))
+  (dolist (combination '((protected latest)
+                         (protected drop)
+                         (resumable fifo)
+                         (resumable drop)
+                         (discardable fifo)))
+    (should-error
+     (coq-eglot-lsp--make-policy
+      'test (car combination) 1 (cadr combination))))
+  (should-error (coq-eglot-lsp--make-policy 'test 'unknown 1 'fifo))
+  (should-error (coq-eglot-lsp--make-policy 'test 'protected 1 'unknown))
+  (should (coq-eglot-lsp--make-policy
+           'settled 'discardable 1 'latest 0.05))
+  (should (coq-eglot-lsp--make-policy
+           'settled 'discardable 1 'drop 0.05))
+  (should-error
+   (coq-eglot-lsp--make-policy 'settled 'protected 1 'fifo 0.05))
+  (should-error
+   (coq-eglot-lsp--make-policy 'settled 'discardable 1 'latest -1))
+  (should (= (coq-eglot-lsp-policy-settle-delay
+              coq-eglot-lsp-hover-policy)
+             0.05)))
+
+(ert-deftest coq-eglot-lsp-policy-debounces-before-scheduling ()
+  "A settled policy admits only the last equivalent request."
+  (with-temp-buffer
+    (let ((policy (coq-eglot-lsp--make-policy
+                   'refresh 'discardable 1 'latest 0.02))
+          sent first second success)
+      (cl-letf (((symbol-function 'coq-eglot-lsp-connect)
+                 (lambda () 'server))
+                ((symbol-function 'coq-eglot-lsp-current-server)
+                 (lambda () 'server))
+                ((symbol-function 'coq-eglot-lsp--flush-document)
+                 (lambda () 1))
+                ((symbol-function 'jsonrpc--async-request-1)
+                 (lambda (_server method _params &rest args)
+                   (push method sent)
+                   (setq success (plist-get args :success-fn))
+                   '(42))))
+        (setq first
+              (coq-eglot-lsp--async-request
+               1 :old #'ignore #'ignore #'ignore policy 'refresh)
+              second
+              (coq-eglot-lsp--async-request
+               1 :new #'ignore #'ignore #'ignore policy 'refresh))
+        (should (coq-eglot-lsp-context-cancelled first))
+        (should-not (coq-eglot-lsp-context-cancelled second))
+        (should-not sent)
+        (should (wait-until (lambda () sent) 1))
+        (should (equal sent '(:new)))
+        (funcall success 'answer)
+        (should (wait-until
+                 (lambda () (null coq-eglot-lsp--active-requests)) 1))))))
+
+(ert-deftest coq-eglot-lsp-settled-policy-needs-key ()
+  "A settled request must identify the equivalent events it replaces."
+  (let ((policy (coq-eglot-lsp--make-policy
+                 'refresh 'discardable 1 'latest 0.02)))
+    (should-error
+     (coq-eglot-lsp--async-request
+      1 :refresh #'ignore #'ignore #'ignore policy nil))))
+
+(ert-deftest coq-eglot-lsp-settled-request-can-be-cancelled ()
+  "Cancelling during settlement prevents admission to the scheduler."
+  (with-temp-buffer
+    (let ((policy (coq-eglot-lsp--make-policy
+                   'refresh 'discardable 1 'latest 10))
+          sent context)
+      (cl-letf (((symbol-function 'coq-eglot-lsp-current-server)
+                 (lambda () nil)))
+        (setq context
+              (coq-eglot-lsp--async-request
+               1 :refresh (lambda () (setq sent t))
+               #'ignore #'ignore policy 'refresh))
+        (should (coq-eglot-lsp-context-debounce context))
+        (coq-eglot-lsp-cancel-request context)
+        (should (coq-eglot-lsp-context-cancelled context))
+        (should-not (coq-eglot-lsp-context-debounce context))
+        (should-not coq-eglot-lsp--request-queue)
+        (should-not coq-eglot-lsp--active-requests)
+        (should-not sent)))))
+
 (ert-deftest coq-eglot-compile-hooks-cheap ()
   "The hooks of the outdated libraries schedule nothing if no buffer
 has compiled Require sentences."
