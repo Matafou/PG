@@ -967,11 +967,14 @@ See `coq-eglot-split-goals'."
       :printing-flags (coq-eglot--output-flags output))))
   (message "Coq: conclusion %s" (if coq-eglot-split-goals "apart" "with the hypotheses")))
 
-(defun coq-eglot--show-response (text)
+(defun coq-eglot--show-response (text &optional scripted)
   "Display TEXT in the response buffer.
+With SCRIPTED, TEXT comes from scripting at the proof position, not from an
+explicit query local to this buffer.
 Run `coq-eglot-output-hook'.  Do nothing in a script buffer that is not
 active, see `coq-eglot--displays-p'."
   (when (coq-eglot--displays-p)
+    (setf (coq-eglot--output-response-scripted (coq-eglot--output)) scripted)
     (coq-eglot--set-buffer-text (coq-eglot--response-name)
                                 #'coq-eglot-response-mode text)
     (run-hooks 'coq-eglot-output-hook)))
@@ -1023,7 +1026,8 @@ sorts.  A late enrichment still in flight does not make this nil."
   (unless goals-only
     (coq-eglot--show-response
      (coq-eglot--format-messages
-      (and answer (coq-eglot-lsp-answer-messages answer))))))
+      (and answer (coq-eglot-lsp-answer-messages answer)))
+     t)))
 
 (defun coq-eglot--hyp-sorts-display (answer goals-only)
   "Display ANSWER if it is still the one waiting for hypothesis sorts."
@@ -1115,15 +1119,17 @@ Only the goals if GOALS-ONLY."
   (unless goals-only
     (coq-eglot--show-response
      (coq-eglot--format-messages
-      (and answer (coq-eglot-lsp-answer-messages answer)))))
+      (and answer (coq-eglot-lsp-answer-messages answer)))
+     t))
   ;; If goals are delayed, display the messages again after them: in the
   ;; two-window layout they share a window and messages have precedence.
   (coq-eglot--show-answer-enriched answer goals-only))
 
-(defun coq-eglot--show-error (text)
-  "Display error TEXT in the response buffer."
+(defun coq-eglot--show-error (text &optional scripted)
+  "Display error TEXT in the response buffer.
+With SCRIPTED, the error comes from scripting at the proof position."
   ;; not face: font-lock would remove it
-  (coq-eglot--show-response (propertize text 'font-lock-face 'error)))
+  (coq-eglot--show-response (propertize text 'font-lock-face 'error) scripted))
 
 (defun coq-eglot--goals-at-position (&optional ask goals-only)
   "Display the goals and messages at the proof position, without waiting.
@@ -1136,7 +1142,7 @@ GOALS-ONLY: the response buffer keeps an error."
     (cond
      ((null last)
       (coq-eglot--show-goals nil)
-      (unless goals-only (coq-eglot--show-response "")))
+      (unless goals-only (coq-eglot--show-response "" t)))
      ((and (not ask) (coq-eglot-session-sentence-answer last))
       (coq-eglot--show-answer (coq-eglot-session-sentence-answer last)
                               goals-only))
@@ -1274,7 +1280,7 @@ operation cannot invalidate the position where it started.  Display the
 error, with the goals before the sentence."
   (coq-eglot--trace-error start end text)
   (coq-eglot--move-back start t floor)
-  (coq-eglot--show-error text)
+  (coq-eglot--show-error text t)
   (coq-eglot--highlight-error start end))
 
 (defun coq-eglot--failed-request (failure)
@@ -1319,7 +1325,7 @@ With CANCEL, cancel the request of the running operation first."
                            nil floor))
       ;; Document-level errors, such as an invalid filename, have no
       ;; sentence.  Keep the anchor and at least report their range.
-      (coq-eglot--show-error (coq-eglot-lsp-diagnostic-message diag))
+      (coq-eglot--show-error (coq-eglot-lsp-diagnostic-message diag) t)
       (coq-eglot--highlight-error
        (coq-eglot-lsp-diagnostic-start diag)
        (coq-eglot-lsp-diagnostic-end diag)))))
@@ -1396,7 +1402,8 @@ it is not left running without anything to wait for."
   "Report that the compilation for the Require sentence at START failed."
   (coq-eglot--show-error
    (format "Compilation of the required libraries failed, see buffer %s."
-           coq--compile-response-buffer))
+           coq--compile-response-buffer)
+   t)
   (coq-eglot--highlight-error start (coq-eglot--guess-end start)))
 
 (defun coq-eglot--step (start)

@@ -315,8 +315,44 @@ Definition s := \"a (* not a comment *) . string\"." ""
     (let ((sentences (coq-eglot-twin--sentences)))
       (should (eq (coq-eglot-twin--sentences) sentences))
       (goto-char (point-max))
+      (setq coq-eglot-twin--sentences-dirty-start (point))
       (insert "\nCheck s.")
-      (should (equal (car (last (sentence-texts))) "Check s.")))))
+      (let ((new (coq-eglot-twin--sentences)))
+        ;; The unchanged prefix, including a locked prefix in a real script,
+        ;; keeps the same sentence objects.
+        (should (eq (aref new 0) (aref sentences 0)))
+        (should (equal (coq-eglot-twin--sentence-text
+                        (aref new (1- (length new))))
+                       "Check s."))))))
+
+(ert-deftest coq-eglot-twin-sentences-reuse-suffix ()
+  "A local edit reparses its sentence and reuses the unchanged suffix."
+  (with-twin-texts "Check 1. Check 2. Check 3. Check 4." ""
+    (let* ((sentences (coq-eglot-twin--sentences))
+           (first (aref sentences 0))
+           (third (aref sentences 2))
+           (fourth (aref sentences 3))
+           (old-third-start (coq-eglot-twin--sentence-start third)))
+      (add-hook 'after-change-functions #'coq-eglot-twin--after-change nil t)
+      (goto-char (search-position "Check 2"))
+      (insert "0")
+      (let ((new (coq-eglot-twin--sentences)))
+        (should (equal (sentence-texts)
+                       '("Check 1." "Check 20." "Check 3." "Check 4.")))
+        (should (eq (aref new 0) first))
+        (should (eq (aref new 2) third))
+        (should (eq (aref new 3) fourth))
+        (should (= (coq-eglot-twin--sentence-start (aref new 2))
+                   (1+ old-third-start))))
+      ;; Changing a command boundary prevents a premature rejoin: parsing
+      ;; continues through the merged command, then reuses the next sentence.
+      (goto-char (search-position "Check 20."))
+      (backward-char)
+      (delete-char 1)
+      (let ((new (coq-eglot-twin--sentences)))
+        (should (equal (sentence-texts)
+                       '("Check 1." "Check 20 Check 3." "Check 4.")))
+        (should (eq (aref new 2) fourth))))))
 
 (ert-deftest coq-eglot-twin-common-subsequence ()
   "The longest common subsequence of two vectors, as pairs of indices."
@@ -467,6 +503,15 @@ ones together, and updated when idle after a change."
         (goto-char (point-max))
         (delete-region (search-position "Check 4.") (point-max)))
       (should (coq-eglot-twin--twins-highlight-timer coq-eglot-twin--twins))
+      ;; A later edition restarts the debounce instead of keeping the timer
+      ;; scheduled by the first one.
+      (let ((first (coq-eglot-twin--twins-highlight-timer
+                    coq-eglot-twin--twins)))
+        (with-current-buffer twin
+          (coq-eglot-twin--after-change (point-max)))
+        (should-not
+         (eq first (coq-eglot-twin--twins-highlight-timer
+                    coq-eglot-twin--twins))))
       (cancel-timer (coq-eglot-twin--twins-highlight-timer coq-eglot-twin--twins))
       (coq-eglot-twin--idle-update coq-eglot-twin--twins)
       (should-not (coq-eglot-twin--twins-highlight-timer coq-eglot-twin--twins))
@@ -486,6 +531,27 @@ ones together, and updated when idle after a change."
                                        coq-eglot-twin--overlays))
                    '("2")))))
 
+(ert-deftest coq-eglot-twin-refine-size-limit ()
+  "Large zones keep sentence highlighting without word refinement."
+  (with-twin-texts "Check 1." "Check 2."
+    (let ((coq-eglot-twin-max-refine-characters 0))
+      (coq-eglot-twin--highlight)
+      (should (seq-some (lambda (overlay)
+                          (overlay-get overlay 'coq-eglot-twin))
+                        coq-eglot-twin--overlays))
+      (should-not
+       (seq-some (lambda (overlay)
+                   (overlay-get overlay 'coq-eglot-twin-refine))
+                 coq-eglot-twin--overlays))
+      (with-current-buffer twin
+        (should (seq-some (lambda (overlay)
+                            (overlay-get overlay 'coq-eglot-twin))
+                          coq-eglot-twin--overlays))
+        (should-not
+         (seq-some (lambda (overlay)
+                     (overlay-get overlay 'coq-eglot-twin-refine))
+                   coq-eglot-twin--overlays))))))
+
 (ert-deftest coq-eglot-twin-blend ()
   "Over the processed part, the diverging zones have a background
 blending theirs with the one of the processed part."
@@ -493,11 +559,15 @@ blending theirs with the one of the processed part."
                                                (:background "#000000")))
                  "#000000"))
   (should-not (coq-eglot-twin--blend '(:background "#000000") 'default))
+  (should (equal (coq-eglot-twin--blend '(:background "#000000")
+                                        '(:background "#ffffff") 0.65)
+                 "#a5a5a5"))
   (with-twin-texts "Check 1. Check 2. Check 3. Check 4." "Check 1. Check 4."
     (cl-letf (((symbol-function 'coq-eglot-twin--blend)
-               (lambda (face1 face2)
+               (lambda (face1 face2 &optional face2-weight)
                  (and (eq face1 'coq-eglot-twin-added)
                       (eq face2 'proof-locked-face)
+                      (= face2-weight 0.65)
                       "#808080"))))
       (setq coq-eglot--locked-overlay
             (make-overlay (point-min) (search-position "Check 2")))
@@ -772,6 +842,27 @@ twins are highlighted; not while they are at other positions."
                       (twin-differences twin-goals)))
       ;; the same hypotheses and number of goals: not highlighted
       (should-not (assoc "1 goal" (twin-differences goals)))
+      (let ((response (get-buffer (coq-eglot--response-name)))
+            (twin-response
+             (with-current-buffer twin
+               (get-buffer (coq-eglot--response-name)))))
+        ;; Responses produced by scripting on both sides are compared.
+        (coq-eglot--show-response "left response" t)
+        (with-current-buffer twin
+          (coq-eglot--show-response "right response" t))
+        (wait-for-twins)
+        (should (twin-differences response))
+        (should (twin-differences twin-response))
+        ;; An explicit query belongs to this side only: its response is not
+        ;; compared with the scripting response left on the other side.  The
+        ;; comparison of the goals remains active.
+        (should (string-match-p
+                 "nat" (query #'coq-eglot-run-query "About nat")))
+        (wait-for-twins)
+        (should-not (twin-differences response))
+        (should-not (twin-differences twin-response)))
+      (should (member '("1" . coq-eglot-twin-refine-added)
+                      (twin-differences goals)))
       ;; not compared when the positions do not correspond
       (let ((coq-eglot-twin-synchronize nil))
         (run #'coq-eglot-retract-buffer)

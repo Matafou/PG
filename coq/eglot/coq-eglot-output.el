@@ -54,6 +54,9 @@ other script buffers of the output is grayed: they go on checking, but
 display nothing.  Any command in one of them makes it active again.")
   (goals nil :documentation "Goals of the last answer displayed, to
 display them again.")
+  (response-scripted nil :documentation "Non-nil if the response was
+displayed by scripting.  A response to an explicit query is local to one
+script buffer and must not be compared with the response of its twin.")
   (width nil :documentation "Printing width of the goals displayed, or
 nil for Coq's default.  See `coq-eglot--goals-printing-width'.")
   (flags nil :documentation "Printing flags of the goals displayed, see

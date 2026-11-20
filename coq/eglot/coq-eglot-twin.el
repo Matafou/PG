@@ -395,9 +395,18 @@ different: aligning them would take too long."
   :type 'natnum
   :group 'coq-eglot)
 
-(defcustom coq-eglot-twin-idle-delay 0.5
-  "Seconds of idleness before updating the highlighting of the twins.
-After a change in one of them."
+(defcustom coq-eglot-twin-max-refine-characters 8000
+  "Maximal combined size of two diverging zones refined word by word.
+Larger zones keep their sentence-level highlighting.  Refinement repeatedly
+checks syntax to exclude comments, which is disproportionately expensive for
+a single command spanning hundreds of lines."
+  :type 'natnum
+  :group 'coq-eglot)
+
+(defcustom coq-eglot-twin-idle-delay 1.0
+  "Seconds after the last edit before updating the twin highlighting.
+Every new change restarts this debounce delay.  The update reparses the
+changed script and realigns the twins, so it should not interrupt typing."
   :type 'number
   :group 'coq-eglot)
 
@@ -409,6 +418,21 @@ After a change in one of them."
 (defvar-local coq-eglot-twin--sentences nil
   "The sentences of the buffer, (TICK . VECTOR), or nil.
 TICK is the `buffer-chars-modified-tick' they were computed at.")
+
+(defvar-local coq-eglot-twin--sentences-dirty-start nil
+  "Earliest position changed since `coq-eglot-twin--sentences' was computed.
+Sentences ending there or before are intact and can be reused.  In particular,
+after an ordinary user edit this includes the whole locked region.")
+
+(defvar-local coq-eglot-twin--sentences-dirty-end nil
+  "Marker after the latest changed region since the sentence cache was made.
+Together with `coq-eglot-twin--sentences-dirty-start', it bounds the part that
+must be reparsed.  The markers follow later edits, so unchanged cached
+sentences after this marker can be recognized and reused.")
+
+(defvar-local coq-eglot-twin--sentences-buffer-size nil
+  "Buffer size when `coq-eglot-twin--sentences' was computed.
+The difference with the current size shifts cached sentences after all edits.")
 
 (defun coq-eglot-twin--normalize (start end)
   "Text of the region START..END without comments, blanks compacted."
@@ -428,32 +452,136 @@ TICK is the `buffer-chars-modified-tick' they were computed at.")
       (string-trim (replace-regexp-in-string
                     "[ \t\n\r]+" " " (apply #'concat (nreverse parts)))))))
 
+(defun coq-eglot-twin--shift-sentence (sentence delta)
+  "Shift the bounds of SENTENCE by DELTA and return SENTENCE."
+  (setf (coq-eglot-twin--sentence-start sentence)
+        (+ (coq-eglot-twin--sentence-start sentence) delta)
+        (coq-eglot-twin--sentence-end sentence)
+        (+ (coq-eglot-twin--sentence-end sentence) delta))
+  sentence)
+
+(defun coq-eglot-twin--parse-sentences-from (start &optional old suffix delta)
+  "Vector of the sentences from the sentence boundary START to buffer end.
+If OLD is a previous sentence vector, try to rejoin it at or after index
+SUFFIX.  Its bounds after the edits are shifted by DELTA.  A cached suffix is
+reused only after a freshly parsed sentence has exactly the expected bounds
+and normalized text, so edits changing comments or command boundaries merely
+delay the rejoin."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char start)
+      (forward-comment (buffer-size))
+      (let ((sentences nil)
+            (candidate suffix)
+            (rejoined nil))
+        (while (and (< (point) (point-max))
+                    (not rejoined)
+                    (let ((sentence-start (point)))
+                      (when (eq (coq-script-parse-cmdend-forward) 'cmd)
+                        (let* ((sentence-end (point))
+                               (text (coq-eglot-twin--normalize
+                                      sentence-start sentence-end)))
+                          ;; Candidates before the parsed sentence cannot be
+                          ;; the resynchronization point.
+                          (while (and old candidate (< candidate (length old))
+                                      (< (+ (coq-eglot-twin--sentence-start
+                                             (aref old candidate))
+                                            delta)
+                                         sentence-start))
+                            (setq candidate (1+ candidate)))
+                          (if (and old candidate (< candidate (length old))
+                                   (= sentence-start
+                                      (+ (coq-eglot-twin--sentence-start
+                                          (aref old candidate))
+                                         delta))
+                                   (= sentence-end
+                                      (+ (coq-eglot-twin--sentence-end
+                                          (aref old candidate))
+                                         delta))
+                                   (equal text (coq-eglot-twin--sentence-text
+                                                (aref old candidate))))
+                              (progn
+                                (setq rejoined candidate)
+                                ;; The freshly parsed sentence is identical;
+                                ;; retain its old object with the whole suffix.
+                                (cl-loop for i from candidate below (length old)
+                                         do (push (coq-eglot-twin--shift-sentence
+                                                   (aref old i) delta)
+                                                  sentences)))
+                            (push (coq-eglot-twin--make-sentence
+                                   sentence-start sentence-end text)
+                                  sentences)))
+                        t)))
+          (forward-comment (buffer-size)))
+        (if rejoined
+            ;; The reused suffix was pushed in increasing order after the
+            ;; parsed prefix, hence appears reversed independently of it.
+            (let* ((suffix-length (- (length old) rejoined))
+                   (reused (seq-take sentences suffix-length))
+                   (parsed (seq-drop sentences suffix-length)))
+              (vconcat (nreverse parsed) (nreverse reused)))
+          (vconcat (nreverse sentences)))))))
+
+(defun coq-eglot-twin--sentences-before (sentences pos)
+  "Number of SENTENCES ending at POS or before."
+  (let ((low 0) (high (length sentences)))
+    (while (< low high)
+      (let ((middle (/ (+ low high) 2)))
+        (if (<= (coq-eglot-twin--sentence-end (aref sentences middle)) pos)
+            (setq low (1+ middle))
+          (setq high middle))))
+    low))
+
 (defun coq-eglot-twin--sentences (&optional buffer)
   "Vector of the sentences of BUFFER, by default the current one.
-See `coq-eglot-twin--sentence'.  Computed again if the buffer changed."
+See `coq-eglot-twin--sentence'.  Reuse the cached prefix preceding the first
+change.  Parsing rejoins and reuses the cached suffix at the first unchanged
+sentence after the last change."
   (with-current-buffer (or buffer (current-buffer))
     (let ((tick (buffer-chars-modified-tick)))
       (unless (eql (car coq-eglot-twin--sentences) tick)
-        (setq coq-eglot-twin--sentences
-              (cons tick
-                    (save-excursion
-                      (save-restriction
-                        (widen)
-                        (goto-char (point-min))
-                        (forward-comment (buffer-size))
-                        (let ((sentences nil))
-                          (while (and (< (point) (point-max))
-                                      (let ((start (point)))
-                                        (when (eq (coq-script-parse-cmdend-forward)
-                                                  'cmd)
-                                          (push (coq-eglot-twin--make-sentence
-                                                 start (point)
-                                                 (coq-eglot-twin--normalize
-                                                  start (point)))
-                                                sentences)
-                                          t)))
-                            (forward-comment (buffer-size)))
-                          (vconcat (nreverse sentences))))))))
+        (let* ((old (cdr coq-eglot-twin--sentences))
+               (kept (if (and old coq-eglot-twin--sentences-dirty-start)
+                         (coq-eglot-twin--sentences-before
+                          old coq-eglot-twin--sentences-dirty-start)
+                       0))
+               (prefix (and (> kept 0) (seq-subseq old 0 kept)))
+               (start (if (> kept 0)
+                          (coq-eglot-twin--sentence-end
+                           (aref old (1- kept)))
+                        (point-min)))
+               (delta (if coq-eglot-twin--sentences-buffer-size
+                          (- (buffer-size)
+                             coq-eglot-twin--sentences-buffer-size)
+                        0))
+               (dirty-end (and (markerp coq-eglot-twin--sentences-dirty-end)
+                               (marker-position
+                                coq-eglot-twin--sentences-dirty-end)))
+               ;; A candidate starts after every edit.  Its old coordinates,
+               ;; shifted by the total size change, must reach DIRTY-END.
+               (suffix
+                (and old dirty-end
+                     (let ((i kept))
+                       (while (and (< i (length old))
+                                   (< (+ (coq-eglot-twin--sentence-start
+                                          (aref old i))
+                                         delta)
+                                      dirty-end))
+                         (setq i (1+ i)))
+                       i))))
+          (setq coq-eglot-twin--sentences
+                (cons tick
+                      (vconcat prefix
+                               (coq-eglot-twin--parse-sentences-from
+                                start old suffix delta)))
+                coq-eglot-twin--sentences-buffer-size (buffer-size))
+          (when (markerp coq-eglot-twin--sentences-dirty-start)
+            (set-marker coq-eglot-twin--sentences-dirty-start nil))
+          (when (markerp coq-eglot-twin--sentences-dirty-end)
+            (set-marker coq-eglot-twin--sentences-dirty-end nil))
+          (setq coq-eglot-twin--sentences-dirty-start nil
+                coq-eglot-twin--sentences-dirty-end nil)))
       (cdr coq-eglot-twin--sentences))))
 
 (defun coq-eglot-twin--align (&optional buffer)
@@ -640,26 +768,28 @@ Only in the zones with sentences on both sides, see
         (twin-face (coq-eglot-twin--face t twin)))
     (pcase-dolist (`(,range . ,twin-range) zones)
       (when (and range twin-range)
-        (let ((words (coq-eglot-twin--pieces
-                      this coq-eglot-twin--word-regexp
-                      (coq-eglot-twin--sentence-start (aref sentences (car range)))
-                      (coq-eglot-twin--sentence-end
-                       (aref sentences (1- (cdr range))))
-                      t))
-              (twin-words (coq-eglot-twin--pieces
-                           twin coq-eglot-twin--word-regexp
-                           (coq-eglot-twin--sentence-start
-                            (aref twin-sentences (car twin-range)))
-                           (coq-eglot-twin--sentence-end
-                            (aref twin-sentences (1- (cdr twin-range))))
-                           t)))
-          (pcase-dolist (`(,run . ,twin-run)
-                         (coq-eglot-twin--unmatched words twin-words))
-            (when run
-              (coq-eglot-twin--mark-refine this words run face 12))
-            (when twin-run
-              (coq-eglot-twin--mark-refine twin twin-words twin-run
-                                          twin-face 12))))))))
+        (let* ((start (coq-eglot-twin--sentence-start
+                       (aref sentences (car range))))
+               (end (coq-eglot-twin--sentence-end
+                     (aref sentences (1- (cdr range)))))
+               (twin-start (coq-eglot-twin--sentence-start
+                            (aref twin-sentences (car twin-range))))
+               (twin-end (coq-eglot-twin--sentence-end
+                          (aref twin-sentences (1- (cdr twin-range))))))
+          (when (<= (+ (- end start) (- twin-end twin-start))
+                    coq-eglot-twin-max-refine-characters)
+            (let ((words (coq-eglot-twin--pieces
+                          this coq-eglot-twin--word-regexp start end t))
+                  (twin-words (coq-eglot-twin--pieces
+                               twin coq-eglot-twin--word-regexp
+                               twin-start twin-end t)))
+              (pcase-dolist (`(,run . ,twin-run)
+                             (coq-eglot-twin--unmatched words twin-words))
+                (when run
+                  (coq-eglot-twin--mark-refine this words run face 12))
+                (when twin-run
+                  (coq-eglot-twin--mark-refine twin twin-words twin-run
+                                              twin-face 12))))))))))
 
 (defun coq-eglot-twin--highlight (&optional buffer)
   "Highlight the diverging sentences of BUFFER and of its twin.
@@ -693,13 +823,16 @@ the property `face'."
                ((consp face) (seq-some #'coq-eglot-twin--background face)))))
     (and (stringp color) (color-defined-p color) color)))
 
-(defun coq-eglot-twin--blend (face1 face2)
-  "The mean of the backgrounds of FACE1 and FACE2, or nil if one has none."
+(defun coq-eglot-twin--blend (face1 face2 &optional face2-weight)
+  "Weighted mean of the backgrounds of FACE1 and FACE2.
+FACE2-WEIGHT defaults to 0.5.  Return nil if either face has no background."
   (let ((color1 (coq-eglot-twin--background face1))
-        (color2 (coq-eglot-twin--background face2)))
+        (color2 (coq-eglot-twin--background face2))
+        (weight (or face2-weight 0.5)))
     (when (and color1 color2)
       (apply #'color-rgb-to-hex
-             (append (cl-mapcar (lambda (a b) (/ (+ a b) 2))
+             (append (cl-mapcar (lambda (a b)
+                                  (+ (* (- 1 weight) a) (* weight b)))
                                 (color-name-to-rgb color1)
                                 (color-name-to-rgb color2))
                      '(2))))))
@@ -718,7 +851,14 @@ A list of (START END COLOR), see `coq-eglot-twin--update-blend'."
                       (color (with-memoization
                                  (alist-get key coq-eglot-twin--blend-colors
                                             nil nil #'equal)
-                               (or (coq-eglot-twin--blend (car key) (cdr key))
+                               (or (coq-eglot-twin--blend
+                                    (car key) (cdr key)
+                                    ;; Make a locked difference retain mostly
+                                    ;; the locked-region background.  The
+                                    ;; checked queue keeps the neutral mean.
+                                    (if (eq (cdr key) 'proof-locked-face)
+                                        0.65
+                                      0.5))
                                    'none))))
                  (and (stringp color) (list start end color))))))
          parts)))
@@ -782,13 +922,24 @@ around the bounds that moved are blended again."
   (when (coq-eglot-twin--live-p twins)
     (coq-eglot-twin--highlight (coq-eglot-twin--twins-this twins))))
 
-(defun coq-eglot-twin--after-change (&rest _)
-  "Schedule the update of the highlighting of the twins."
+(defun coq-eglot-twin--after-change (start &optional end &rest _)
+  "Update the highlighting after no twin has changed for the debounce delay."
+  (setq end (or end start))
+  (if (markerp coq-eglot-twin--sentences-dirty-start)
+      (when (< start (marker-position coq-eglot-twin--sentences-dirty-start))
+        (set-marker coq-eglot-twin--sentences-dirty-start start))
+    (setq coq-eglot-twin--sentences-dirty-start (copy-marker start nil)))
+  (if (markerp coq-eglot-twin--sentences-dirty-end)
+      (when (> end (marker-position coq-eglot-twin--sentences-dirty-end))
+        (set-marker coq-eglot-twin--sentences-dirty-end end))
+    (setq coq-eglot-twin--sentences-dirty-end (copy-marker end t)))
   (let ((twins coq-eglot-twin--twins))
     (when twins
-      (coq-eglot-twin--once (coq-eglot-twin--twins-highlight-timer twins)
-        (run-with-idle-timer coq-eglot-twin-idle-delay nil
-                             #'coq-eglot-twin--idle-update twins)))))
+      (coq-eglot-twin--cancel
+       (coq-eglot-twin--twins-highlight-timer twins))
+      (setf (coq-eglot-twin--twins-highlight-timer twins)
+            (run-at-time coq-eglot-twin-idle-delay nil
+                         #'coq-eglot-twin--idle-update twins)))))
 
 (defconst coq-eglot-twin--hooks
   '((after-change-functions . coq-eglot-twin--after-change)
@@ -1082,24 +1233,32 @@ And none is checking."
 
 (defun coq-eglot-twin--compare-outputs (buffer)
   "Compare the goals and messages of BUFFER and of its twin.
-If their proof positions do not correspond, only remove the highlighting."
+If their proof positions do not correspond, only remove the highlighting.
+Compare response buffers only when both responses come from scripting: an
+explicit query such as About or Search is local to the buffer where it ran."
   (let* ((twin (buffer-local-value 'coq-eglot--twin buffer))
+         (output-state (with-current-buffer buffer (coq-eglot--output)))
+         (twin-output-state (with-current-buffer twin (coq-eglot--output)))
          (outputs (with-current-buffer buffer (coq-eglot-output-buffers)))
          (twin-outputs (with-current-buffer twin (coq-eglot-output-buffers)))
          (compare (and coq-eglot-twin-compare-outputs
-                       (coq-eglot-twin--corresponding-p buffer))))
-    (cl-mapc (lambda (output twin-output)
+                       (coq-eglot-twin--corresponding-p buffer)))
+         (compare-response
+          (and (coq-eglot--output-response-scripted output-state)
+               (coq-eglot--output-response-scripted twin-output-state))))
+    (cl-mapc (lambda (output twin-output kind)
                (coq-eglot-twin--uncompare output)
                (coq-eglot-twin--uncompare twin-output)
                (when (and compare (buffer-live-p output)
-                          (buffer-live-p twin-output))
+                          (buffer-live-p twin-output)
+                          (or (not (eq kind 'response)) compare-response))
                  (coq-eglot-twin--compare-buffers
                   output twin-output
                   (coq-eglot-twin--face nil buffer)
                   (coq-eglot-twin--face t buffer)
                   (coq-eglot-twin--face nil twin)
                   (coq-eglot-twin--face t twin))))
-             outputs twin-outputs)))
+             outputs twin-outputs '(goals conclusion response))))
 
 (defun coq-eglot-twin--pieces (buffer regexp &optional start end no-comments)
   "Vector of the matches of REGEXP in BUFFER, between START and END.
