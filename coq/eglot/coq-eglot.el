@@ -446,9 +446,37 @@ active script buffer."
   (add-hook 'window-size-change-functions
             #'coq-eglot--schedule-width-refresh nil t))
 
+(defvar coq-eglot--quoted-keywords nil
+  "The compiled `coq-goals-font-lock-keywords', for the quoted terms.
+See `coq-eglot--fontify-quoted'.")
+
+(defun coq-eglot--fontify-quoted (limit)
+  "Highlight the terms quoted in the messages, from point to LIMIT.
+Like the goals, see `coq-goals-font-lock-keywords'.  A font-lock
+matcher that highlights the quoted terms itself and matches nothing."
+  (unless coq-eglot--quoted-keywords
+    (setq coq-eglot--quoted-keywords
+          (font-lock-compile-keywords coq-goals-font-lock-keywords)))
+  ;; from the opening quote if point is inside a quoted term
+  (when (cl-oddp (how-many "\"" (point-min) (point)))
+    (search-backward "\""))
+  (while (re-search-forward "\"\\([^\"]*\\)\"" limit t)
+    (let ((end (match-end 0))
+          (font-lock-keywords coq-eglot--quoted-keywords))
+      (font-lock-fontify-keywords-region (match-beginning 1) (match-end 1))
+      (goto-char end)))
+  nil)
+
+(defvar coq-eglot--response-font-lock-keywords
+  (append coq-response-font-lock-keywords '(coq-eglot--fontify-quoted))
+  "Highlighting of the response buffer.
+Like in Proof General, see `coq-response-font-lock-keywords', but the
+quoted terms are highlighted like the goals, not as strings.")
+
 (define-derived-mode coq-eglot-response-mode coq-eglot-output-mode "Coq Response"
   "Major mode for the messages of the Eglot backend of Coq."
-  (setq-local font-lock-defaults '(coq-response-font-lock-keywords)))
+  ;; keywords only: the quoted terms are not strings
+  (setq-local font-lock-defaults '(coq-eglot--response-font-lock-keywords t)))
 
 (defun coq-eglot-layout-windows ()
   "Display the goals and response windows again, like in Proof General.
@@ -1129,10 +1157,12 @@ Only the goals if GOALS-ONLY."
 
 (defun coq-eglot--show-error (text &optional scripted)
   "Display error TEXT in the response buffer, after \"Error: \".
-With SCRIPTED, the error comes from scripting at the proof position."
+Only \"Error:\" has `proof-error-face', TEXT is highlighted like the
+other messages, like in Proof General.  With SCRIPTED, the error comes
+from scripting at the proof position."
   ;; not face: font-lock would remove it
   (coq-eglot--show-response
-   (propertize (concat "Error: " text) 'font-lock-face 'error)
+   (concat (propertize "Error:" 'font-lock-face 'proof-error-face) " " text)
    scripted))
 
 (defun coq-eglot--goals-at-position (&optional ask goals-only)

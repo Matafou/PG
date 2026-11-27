@@ -173,10 +173,14 @@ are common to all backends."
     ;; l is defined after the proof position
     (should (string-match-p "not a defined object"
                             (query #'coq-run-query "About l")))
-    ;; errors are displayed as such
-    (should (string-match-p "was not found" (query #'coq-run-query "Check l")))
+    ;; errors are displayed as such: only "Error:" in the error face
+    (should (string-match-p "\\`Error: .*was not found"
+                            (query #'coq-run-query "Check l")))
     (with-current-buffer "*response*"
-      (should (eq (get-text-property (point-min) 'font-lock-face) 'error)))
+      (should (eq (get-text-property (point-min) 'font-lock-face)
+                  'proof-error-face))
+      (should-not (get-text-property (search-forward "was not found")
+                                     'font-lock-face)))
     ;; the proof position does not move
     (should (position-at-marker-p "definition"))))
 
@@ -491,8 +495,13 @@ buffers, on the active script buffer, like in Proof General."
     (query #'coq-run-query "About double")
     (should (eq (face-of "*response*" "double :") 'proof-declaration-name-face))
     (query #'coq-run-query "Check unknown_thing")
-    ;; fontification keeps the face of errors
-    (should (eq (face-of "*response*" "The reference") 'error))))
+    ;; only "Error:" in the error face, the rest like the other messages
+    (should (eq (face-of "*response*" "Error:") 'proof-error-face))
+    (should-not (face-of "*response*" "The reference"))
+    ;; the quoted terms like the goals, the rest not
+    (query #'coq-run-query "Check (0 (fun n : nat => n))")
+    (should (eq (face-of "*response*" "fun n") 'font-lock-type-face))
+    (should-not (face-of "*response*" "cannot be applied"))))
 
 (ert-deftest coq-eglot-split-goals ()
   "The conclusion can be displayed apart from the hypotheses."
