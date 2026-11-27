@@ -57,6 +57,8 @@
 ;; - coq-eglot-output.el: the buffers of the goals and messages, and
 ;;   their windows.
 ;; - coq-eglot-ui.el: the faces, the mode line and the menu.
+;; - coq-eglot-servers.el: the Rocq checking a project, chosen among
+;;   the installations found (opam switches, exec-path, executables).
 ;; - coq-eglot-twin.el: the two Rocq mode, an extension, see the section
 ;;   "Interface of the extensions".
 ;;
@@ -2131,6 +2133,52 @@ non-nil otherwise."
    ((> target (coq-eglot-position)) (coq-eglot--go target) t)
    (t t)))
 
+(defvar coq-eglot-server-changed-hook nil
+  "Hook run in a script buffer when its server changed.
+Another Rocq, or the same in a server of its own, see
+`coq-eglot-change-server'.")
+
+(defun coq-eglot-change-server (change)
+  "Call CHANGE to give the current script buffer another server.
+CHANGE is a function without arguments.  First stop what the server
+does for the buffer, without stopping the server, which may check other
+buffers: the proof position goes back to the beginning.  Then connect
+to the new server, without waiting.  Run
+`coq-eglot-server-changed-hook'."
+  (coq-eglot--forget-checks (list (current-buffer)))
+  (coq-eglot-lsp-detach)
+  (coq-eglot--set-position nil nil)
+  (coq-eglot--clear-error)
+  (when (coq-eglot--displays-p)
+    (coq-eglot--show-goals nil)
+    (coq-eglot--show-response ""))
+  (funcall change)
+  (coq-eglot-lsp-connect)
+  (run-hooks 'coq-eglot-server-changed-hook))
+
+(defun coq-eglot-stop-server-of-buffers (buffers change)
+  "Stop the server of the script BUFFERS, sharing it, then call CHANGE.
+CHANGE is a function without arguments, giving them another server.
+Their proof positions go back to the beginning, like with
+`coq-eglot-exit', and their next commands start the new server.  Run
+`coq-eglot-server-changed-hook' in each one."
+  (when buffers
+    (let ((stopped (with-current-buffer (car buffers)
+                     (coq-eglot-lsp-shutdown))))
+      (setq buffers (seq-uniq (append buffers stopped)))
+      (funcall change)
+      (coq-eglot--forget-checks buffers)
+      (dolist (buffer buffers)
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when coq-eglot-mode
+              (coq-eglot--set-position nil nil)
+              (coq-eglot--clear-error)
+              (when (coq-eglot--displays-p)
+                (coq-eglot--show-goals nil)
+                (coq-eglot--show-response ""))
+              (run-hooks 'coq-eglot-server-changed-hook))))))))
+
 (defun coq-eglot-retarget-proof-position (target)
   "Make TARGET the destination of the current script buffer.
 Unlike `coq-eglot-move-proof-position', TARGET may shorten a running check.
@@ -2346,7 +2394,11 @@ buffer is set up, after the configuration of the user."
 (autoload 'coq-eglot-twin-pair "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-unpair "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-layout "coq-eglot-twin" nil t)
-(autoload 'coq-eglot-twin-set-opam-switch "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-set-rocq "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-twin-toggle-two-servers "coq-eglot-twin" nil t)
+(autoload 'coq-eglot-set-rocq "coq-eglot-servers" nil t)
+(autoload 'coq-eglot-servers-rescan "coq-eglot-servers" nil t)
+(autoload 'coq-eglot-servers-menu "coq-eglot-servers")
 (autoload 'coq-eglot-twin-goto-twin-position "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-toggle-synchronize "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-swap-reference "coq-eglot-twin" nil t)

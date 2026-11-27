@@ -1230,14 +1230,27 @@ The next command starts a new server."
 
 (ert-deftest coq-eglot-exit-other-buffer-checking ()
   "Stopping or restarting the server from a buffer stops the check of
-another buffer of the server: no answer will come, it is not busy."
+another buffer of the server: no answer will come, it is not busy.  In
+a project, isolated files have servers of their own."
+  (let ((dir (file-name-as-directory (make-temp-file "coq-eglot-exit-" t))))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "_CoqProject" dir)
+            (insert "-R . Exit\n"))
+          (dolist (file '("eglot_slow.v" "eglot_test.v"))
+            (copy-file file (expand-file-name file dir)))
+          (exit-other-buffer-checking dir))
+      (delete-directory dir t))))
+
+(defun exit-other-buffer-checking (dir)
+  "Body of `coq-eglot-exit-other-buffer-checking', in project DIR."
   (dolist (command '(coq-eglot-restart-server coq-eglot-exit))
-    (with-file "eglot_slow.v"
+    (with-file (expand-file-name "eglot_slow.v" dir)
       (force-new-check)
       (let ((slow (current-buffer)))
         (coq-eglot-process-buffer)
         (should (coq-eglot-checking-p))
-        (with-test-file
+        (with-file (expand-file-name "eglot_test.v" dir)
           (funcall command))
         (with-current-buffer slow
           (should-not (coq-eglot-checking-p))

@@ -41,6 +41,7 @@
 (require 'coq-eglot-lsp)
 
 (declare-function coq-eglot-position "coq-eglot")
+(defvar coq-autodetected-version)        ; coq-system.el
 
 (defface coq-eglot-outdated-require '((t :inherit flymake-warning))
   "Face of a processed Require sentence whose libraries changed since."
@@ -54,9 +55,38 @@ the function to call at the end.")
 
 ;;; Programs
 
+(defvar coq-eglot-compile--rocq-versions (make-hash-table :test #'equal)
+  "Cache of the versions of Rocq of the servers, by file name.")
+
+(defun coq-eglot-compile-rocq-version (program)
+  "Version of the Rocq of the server PROGRAM, a string, or nil.
+The one of the rocq or coqc program next to it.  Cached."
+  (let* ((file (or (executable-find program) program))
+         (cached (gethash file coq-eglot-compile--rocq-versions 'unknown)))
+    (if (not (eq cached 'unknown))
+        cached
+      (puthash file
+               (let ((bin (file-name-directory file)))
+                 (seq-some
+                  (lambda (name)
+                    (let ((exe (and bin (expand-file-name name bin))))
+                      (and exe (file-executable-p exe)
+                           (let ((output (ignore-errors
+                                           (string-join
+                                            (process-lines exe "--version")
+                                            "\n"))))
+                             (and output
+                                  (string-match "version \\([0-9][^ \n]*\\)"
+                                                output)
+                                  (match-string 1 output))))))
+                  '("rocq" "coqc")))
+               coq-eglot-compile--rocq-versions))))
+
 (defun coq-eglot-compile--set-programs ()
   "Use the Rocq or Coq programs next to the language server.
-Set buffer locally the programs used by the compilation.  Keep the
+Set buffer locally the programs used by the compilation, and the
+version of Rocq it adapts its options to, see `coq-version': those of
+the Rocq of the project, see `coq-eglot-lsp-server-command'.  Keep the
 global values if they are not found there."
   (let* ((server (car (ignore-errors (coq-eglot-lsp-server-command))))
          (server-path (and server (executable-find server)))
@@ -72,7 +102,12 @@ global values if they are not found there."
      (coqc
       (setq-local proof-prog-name (executable-find "coqtop"))
       (setq-local coq-compiler coqc)
-      (setq-local coq-dependency-analyzer (executable-find "coqdep"))))))
+      (setq-local coq-dependency-analyzer (executable-find "coqdep"))))
+    ;; the options of coqdep and coqc depend on the version, see
+    ;; `coq--post-v818': not the one of the first Rocq used in the session
+    (when-let ((version (and server-path
+                             (coq-eglot-compile-rocq-version server-path))))
+      (setq-local coq-autodetected-version version))))
 
 ;;; Require sentences
 
@@ -94,6 +129,88 @@ delimited locally: the server did not check them yet."
                       t)))
         (forward-comment (buffer-size))))
     (nreverse requires)))
+
+;;; Libraries of the project
+
+(defun coq-eglot-compile--project-libraries ()
+  "Logical names of the libraries of the project, lists of strings.
+The .v files under the directories of `coq-load-path' bound to a
+logical name, with -R or -Q: those of the project file, in particular."
+  (let (libraries)
+    (dolist (entry coq-load-path)
+      (pcase-let ((`(,dir ,alias)
+                   (pcase entry
+                     ((and (pred stringp) dir) (list dir ""))
+                     (`(recnoimport ,dir ,alias) (list dir alias))
+                     ((or `(rec ,dir ,alias) `(,(and (pred stringp) dir) ,alias))
+                      (list dir alias)))))
+        (when (and dir (file-directory-p dir))
+          (let ((dir (file-name-as-directory (expand-file-name dir)))
+                (prefix (and alias (not (string-empty-p alias))
+                             (split-string alias "\\."))))
+            (dolist (file (directory-files-recursively dir "\\.v\\'"))
+              (push (append prefix
+                            (split-string
+                             (file-name-sans-extension
+                              (file-relative-name file dir))
+                             "/"))
+                    libraries))))))
+    libraries))
+
+(defun coq-eglot-compile--required-names (start end)
+  "Names of the libraries required by the sentence between START and END.
+A list of (FROM . NAME): FROM is the prefix of a From clause or nil,
+NAME the required name, lists of strings."
+  (let* ((text (coq-eglot-compile--sentence-text start end))
+         (from (and (string-match
+                     "\\`From[ \t\n]+\\([[:alnum:]_'.]+\\)[ \t\n]+" text)
+                    (prog1 (split-string (match-string 1 text) "\\.")
+                      (setq text (substring text (match-end 0)))))))
+    (when (string-match "\\`Require[ \t\n]+\\(?:\\(?:Import\\|Export\\)[ \t\n]+\\)?"
+                        text)
+      (setq text (substring text (match-end 0)))
+      ;; categories of Import, like Import -(notations) M
+      (setq text (replace-regexp-in-string "[-+]?([^)]*)" " " text))
+      (mapcar (lambda (name) (cons from (split-string name "\\.")))
+              (split-string (string-trim-right text "\\.[ \t\n]*\\'")
+                            "[ \t\n]+" t)))))
+
+(defun coq-eglot-compile--sentence-text (start end)
+  "Text of the sentence between START and END, without comments."
+  (let ((text (buffer-substring-no-properties start end)))
+    (while (string-match "(\\*\\(?:[^*]\\|\\*+[^*)]\\)*\\*+)" text)
+      (setq text (replace-match " " t t text)))
+    (string-trim text)))
+
+(defun coq-eglot-compile--matches-p (required library)
+  "Non-nil if LIBRARY, a logical name, may be the one of REQUIRED.
+REQUIRED is (FROM . NAME), see `coq-eglot-compile--required-names':
+LIBRARY starts with FROM and ends with NAME, a partially qualified name."
+  (pcase-let ((`(,from . ,name) required))
+    (and (or (null from)
+             (equal (seq-take library (length from)) from))
+         (let ((rest (nthcdr (length from) library)))
+           (and (<= (length name) (length rest))
+                (equal (last rest (length name)) name))))))
+
+(defun coq-eglot-compile-local-requires (&optional start end)
+  "Bounds of the Require sentences loading a library of the project.
+Between START and END, the whole buffer by default.  A list of (BEG
+. END).  The libraries of the project are compiled by the Rocq of the
+project: a buffer checked by another Rocq cannot load them."
+  (let ((requires (coq-eglot-compile--require-sentences
+                   (or start (point-min)) (or end (point-max)))))
+    (when requires
+      (let ((libraries (coq-eglot-compile--project-libraries)))
+        (seq-filter
+         (lambda (bounds)
+           (seq-some (lambda (required)
+                       (seq-some (lambda (library)
+                                   (coq-eglot-compile--matches-p required library))
+                                 libraries))
+                     (coq-eglot-compile--required-names
+                      (car bounds) (cdr bounds))))
+         requires)))))
 
 ;;; Compilation
 
@@ -179,6 +296,21 @@ With `setq', not saved by customize."
   (setq coq-lock-ancestors nil)
   (setq coq-compile-vos 'ensure-vo))
 
+(defun coq-eglot-compile--check-version (requires)
+  "Signal a user error if REQUIRES load libraries of another Rocq.
+REQUIRES are the bounds of Require sentences of the current buffer.  If
+its server is not the one of its project (see
+`coq-eglot-lsp-foreign-p'), its Rocq cannot load the libraries of the
+project: they are compiled for the Rocq of the project."
+  (when (and (coq-eglot-lsp-foreign-p)
+             (let ((coq-compile-before-require t))
+               (seq-some (lambda (bounds)
+                           (coq-eglot-compile-local-requires (car bounds)
+                                                             (cdr bounds)))
+                         requires)))
+    (user-error "Coq: %s is checked by another Rocq than its project, \
+it cannot load the libraries of the project" (buffer-name))))
+
 (defun coq-eglot-compile-requires (start end on-done)
   "Compile the libraries required by the sentences between START and END.
 Return nil if there is nothing to compile: no Require sentence there,
@@ -197,6 +329,7 @@ The errors are displayed by the compilation."
     ;; the processed Require sentences are after the proof position
     (coq-eglot-compile--forget-from start)
     (when requires
+      (coq-eglot-compile--check-version requires)
       (coq-eglot-compile--set-programs)
       (setq-local coq-par-release-items-function #'coq-eglot-compile--release)
       (setq-local coq-par-failure-function #'coq-eglot-compile--failure)

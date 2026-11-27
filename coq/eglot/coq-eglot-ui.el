@@ -277,6 +277,8 @@ Compact contexts are a presentation option, not a command sent to Rocq.")
     ["Interrupt" coq-eglot-interrupt]
     ["Restart Server" coq-eglot-restart-server]
     ["Exit Server" coq-eglot-exit]
+    ("Rocq Version" :filter coq-eglot-servers-menu
+     :help "The Rocq checking the files of the project, for this session")
     "---"
     ("Two Rocq"
      ["Pair With..." coq-eglot-twin-pair
@@ -293,9 +295,17 @@ Compact contexts are a presentation option, not a command sent to Rocq.")
      ["Synchronize Proof Positions" coq-eglot-twin-toggle-synchronize
       :style toggle :selected (bound-and-true-p coq-eglot-twin-synchronize)
       :help "The proof position of a twin follows the one of the other"]
-     ["Twin Opam Switch..." coq-eglot-twin-set-opam-switch
+     ("Rocq of the Twin" :filter coq-eglot-twin--rocq-menu
       :active coq-eglot--twin
-      :help "The server of the twin from another opam switch"]
+      :help "The Rocq checking the twin, the buffer with its own goals")
+     ["Two Servers" coq-eglot-twin-toggle-two-servers
+      :style toggle
+      :selected (and (fboundp 'coq-eglot-twin-two-servers-p)
+                     (coq-eglot-twin-two-servers-p))
+      :active (and coq-eglot--twin (fboundp 'coq-eglot-twin--same-project-p)
+                   (coq-eglot-twin--same-project-p (current-buffer)
+                                                   coq-eglot--twin))
+      :help "Twins of one project checked at the same time, using more memory"]
      ["Unpair" coq-eglot-twin-unpair
       :active coq-eglot--twin]))
   "Menu of the Eglot backend of Coq, see `easy-menu-define'.")

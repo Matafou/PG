@@ -217,6 +217,23 @@ closed document: the following sentences are checked again."
               (lambda (name &rest _) (car (member name ,programs)))))
      ,@body))
 
+(defun other-server ()
+  "Command line of the server of another opam switch, or nil.
+Of rocq-9.2 or rocq-9.0, not the one of the current buffer."
+  (require 'coq-eglot-servers)
+  (let ((current (coq-eglot-lsp--program-file
+                  (car (coq-eglot-lsp-server-command)))))
+    (seq-some (lambda (candidate)
+                (and (member (car candidate) '("rocq-9.2" "rocq-9.0"))
+                     (not (equal (file-truename (cdr candidate)) current))
+                     (list (cdr candidate))))
+              (coq-eglot-servers--opam-servers))))
+
+(defun server-program ()
+  "True name of the program of the running server of the current buffer."
+  (coq-eglot-lsp--program-file
+   (car (process-command (jsonrpc--process (coq-eglot-lsp-current-server))))))
+
 (provide 'coq-eglot-test-common)
 
 ;;; coq-eglot-test-common.el ends here

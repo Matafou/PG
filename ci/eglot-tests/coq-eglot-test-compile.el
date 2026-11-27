@@ -141,12 +141,20 @@ like the compilation."
                           args)))))))
 
 (ert-deftest coq-eglot-use-project-file-nil ()
-  "Without `coq-use-project-file', the server of a file runs in its
-directory, not in the one of the dominating project file."
+  "Without `coq-use-project-file', a file is a project of its own: its
+server runs in its directory, not in the one of the dominating project
+file."
   (skip-unless-server)
-  (let ((coq-use-project-file nil)
-        (dir (expand-file-name "lib/" load-path-directory)))
-    (should (equal (coq-eglot-lsp-project dir) (cons 'transient dir)))))
+  (let* ((coq-use-project-file nil)
+         (dir (expand-file-name "lib/" load-path-directory))
+         (file (expand-file-name "eglot_lib.v" dir)))
+    (with-current-buffer (find-file-noselect file)
+      (unwind-protect
+          (progn
+            (should (equal (coq-eglot-lsp-project dir)
+                           (list 'coq-eglot-file file dir)))
+            (should (equal (project-root (coq-eglot-lsp-project dir)) dir)))
+        (kill-buffer)))))
 
 (ert-deftest coq-eglot-compile-vo-no-locks ()
   "The compilation produces .vo files and locks nothing, whatever the

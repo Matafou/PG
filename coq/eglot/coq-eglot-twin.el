@@ -15,15 +15,13 @@
 ;; supposedly a modification of the other, checked at the same time,
 ;; side by side.  The typical use is the repair of a development for a
 ;; new version of Rocq: the reference in a worktree, the repaired copy
-;; in another one, each with its own server (a .dir-locals.el setting
-;; `coq-eglot-server-program').
+;; in another one, each checked by its Rocq, see `coq-eglot-set-rocq'.
 ;;
 ;; The server of each twin is the one of its project (see
-;; `coq-eglot-lsp-project'), so the twins must be in two projects, like
-;; two worktrees.  Its program is `coq-eglot-server-program', set by a
-;; .dir-locals.el, or, for the twin, by an opam switch of its own while
-;; the other one uses the current switch of Emacs: see
-;; `coq-eglot-twin-set-opam-switch'.
+;; `coq-eglot-lsp-project'): twins in two projects, like two
+;; worktrees, are checked at the same time.  Twins in the same project
+;; share a server, unless the twin gets one of its own, see "The Rocq
+;; of the twins" below.
 ;;
 ;; Each twin displays its goals and messages in its own output (see
 ;; `coq-eglot--output'): both are active at the same time.  The layout
@@ -50,16 +48,7 @@
 (require 'diff-mode)                    ; the faces of the diffs
 (require 'coq-db)                       ; the faces of the diffs of Coq
 (require 'coq-eglot)
-
-(defcustom coq-eglot-twin-opam-switch nil
-  "Opam switch of the server of the twin, or nil.
-If non-nil, `coq-eglot-twin-pair' gives the twin the server of this
-switch, see `coq-eglot-twin-set-opam-switch', while the other buffer
-uses the current switch of Emacs.  If nil, the twin keeps its server,
-see `coq-eglot-server-program'."
-  :type '(choice (const :tag "The server of the twin" nil)
-                 (string :tag "Opam switch"))
-  :group 'coq-eglot)
+(require 'coq-eglot-servers)              ; the Rocq of the twins
 
 ;;; The twins
 ;;
@@ -76,8 +65,10 @@ paired with it, with an output of its own, see
 `coq-eglot-twin-swap-reference'.  ALIGNMENT is the alignment of their
 sentences, see `coq-eglot-twin--align'.  HIGHLIGHT-TIMER and
 COMPARE-TIMER update their highlighting and compare their outputs, see
-`coq-eglot-twin--once'."
-  this other reference alignment highlight-timer compare-timer)
+`coq-eglot-twin--once'.  TWO-SERVERS is non-nil if OTHER, in the
+project of THIS, has a server of its own even with the same Rocq, see
+`coq-eglot-twin-toggle-two-servers'."
+  this other reference alignment highlight-timer compare-timer two-servers)
 
 (defvar-local coq-eglot-twin--twins nil
   "The twins of the current script buffer, a `coq-eglot-twin--twins', or nil.
@@ -135,55 +126,6 @@ sets PLACE to nil first."
      (cancel-timer ,place)
      (setf ,place nil)))
 
-;;; Opam switches
-
-(defun coq-eglot-twin--opam (&rest args)
-  "Output lines of opam with ARGS, or a user error if it fails."
-  (condition-case err
-      (apply #'process-lines "opam" args)
-    (error (user-error "Coq: opam %s failed: %s"
-                       (string-join args " ") (error-message-string err)))))
-
-(defun coq-eglot-twin--read-opam-switch ()
-  "Ask an opam switch."
-  (completing-read "Opam switch of the twin: "
-                   (coq-eglot-twin--opam "switch" "list" "--short")
-                   nil t nil nil coq-eglot-twin-opam-switch))
-
-(defun coq-eglot-twin--switch-server (switch)
-  "Command line of the server of opam SWITCH, a list of strings.
-The first of rocq-lsp and coq-lsp in the bin directory of SWITCH."
-  (let* ((prefix (car (coq-eglot-twin--opam "var" "prefix"
-                                            (concat "--switch=" switch))))
-         (program (seq-find #'file-executable-p
-                            (mapcar (lambda (name)
-                                      (expand-file-name name
-                                                        (expand-file-name
-                                                         "bin" prefix)))
-                                    coq-eglot-lsp--program-names))))
-    (unless program
-      (user-error "Coq: no language server in opam switch %s, \
-install coq-lsp there" switch))
-    (list program)))
-
-(defun coq-eglot-twin--server-label (program)
-  "Short name of the server PROGRAM: its opam switch, or its file name.
-The switch of ~/.opam/SWITCH/bin/PROGRAM, or the project of a local
-switch PROJECT/_opam/bin/PROGRAM."
-  (let* ((bin (directory-file-name (or (file-name-directory program) "")))
-         (prefix (file-name-directory bin))
-         (prefix-name (and prefix (file-name-nondirectory
-                                   (directory-file-name prefix))))
-         (parent (and prefix (file-name-directory (directory-file-name prefix))))
-         (parent-name (and parent (file-name-nondirectory
-                                   (directory-file-name parent)))))
-    (cond
-     ((not (equal (file-name-nondirectory bin) "bin"))
-      (file-name-nondirectory program))
-     ((equal prefix-name "_opam") parent-name)
-     ((equal parent-name ".opam") prefix-name)
-     (t (file-name-nondirectory program)))))
-
 (defun coq-eglot-twin--update-label ()
   "Set the label of the server of the current buffer in the mode line.
 See `coq-eglot--twin-label'."
@@ -191,8 +133,8 @@ See `coq-eglot--twin-label'."
         (ignore-errors
           (let ((program (car (coq-eglot-lsp-server-command))))
             ;; found in exec-path: its opam switch
-            (coq-eglot-twin--server-label (or (executable-find program)
-                                              program)))))
+            (coq-eglot-servers-label (or (executable-find program)
+                                         program)))))
   (force-mode-line-update))
 
 (defun coq-eglot-twin--candidates ()
@@ -211,24 +153,23 @@ See `coq-eglot--twin-label'."
     (get-buffer (completing-read "Twin script buffer: " candidates nil t
                                  nil nil (car candidates)))))
 
-(defun coq-eglot-twin-pair (other &optional switch)
+(defun coq-eglot-twin-pair (other)
   "Pair the current script buffer with OTHER, its twin, side by side.
 Both display their goals and messages at the same time: OTHER gets an
 output of its own, see `coq-eglot--output', whose buffers are named
 after it, like \"*goals*<OTHER>\".  The windows are laid out again, see
 `coq-eglot-twin-layout'.  Killing one of them unpairs them, see
 `coq-eglot-twin-unpair'.  OTHER is the reference: its differences are
-highlighted as removed, see `coq-eglot-twin-swap-reference'.
-With SWITCH, or `coq-eglot-twin-opam-switch', the server of OTHER is the
-one of this opam switch, see `coq-eglot-twin-set-opam-switch'.
-Interactively, with a prefix argument, ask SWITCH."
+highlighted as removed, see `coq-eglot-twin-swap-reference'.  Each one
+is checked by the Rocq of its project, see `coq-eglot-set-rocq'; in the
+same project, by the same server, unless OTHER gets another one, see
+`coq-eglot-twin-set-rocq' and `coq-eglot-twin-toggle-two-servers'."
   (interactive
    (with-current-buffer (coq-eglot-script-buffer)
      (when coq-eglot--twin
        (user-error "Coq: this buffer has a twin already, %s"
                    (buffer-name coq-eglot--twin)))
-     (list (coq-eglot-twin--read-buffer)
-           (and current-prefix-arg (coq-eglot-twin--read-opam-switch)))))
+     (list (coq-eglot-twin--read-buffer))))
   (let ((this (coq-eglot-script-buffer)))
     (when (eq this other)
       (user-error "Coq: a buffer cannot be its own twin"))
@@ -243,54 +184,167 @@ Interactively, with a prefix argument, ask SWITCH."
     (coq-eglot-twin--link this other)
     (dolist (side (list this other))
       (with-current-buffer side
-        (add-hook 'kill-buffer-hook #'coq-eglot-twin--on-kill nil t)))
-    (with-current-buffer this
-      (coq-eglot-twin--update-label))
+        (add-hook 'kill-buffer-hook #'coq-eglot-twin--on-kill nil t)
+        (add-hook 'coq-eglot-server-changed-hook
+                  #'coq-eglot-twin--update-label nil t)
+        (coq-eglot-twin--update-label)))
     (coq-eglot-twin--start-alignment other)
     (coq-eglot-twin--start-alignment this)
-    (let ((switch (or switch coq-eglot-twin-opam-switch)))
-      (if switch
-          (with-current-buffer other
-            (coq-eglot-twin--set-switch switch))
-        (with-current-buffer other
-          (coq-eglot-twin--update-label))))
     (coq-eglot-twin-layout)
-    (message "Coq: %s and %s are twins" (buffer-name this) (buffer-name other))))
+    (message "Coq: %s and %s are twins%s"
+             (buffer-name this) (buffer-name other)
+             (if (coq-eglot-twin--same-project-p this other)
+                 ", in the same project: checked one after the other by \
+one server, see Two Servers in the menu"
+               ""))))
 
-(defun coq-eglot-twin--set-switch (switch)
-  "Give the current buffer the server of opam SWITCH.
-See `coq-eglot-twin-set-opam-switch'."
-  (let ((command (coq-eglot-twin--switch-server switch)))
-    (unless (equal command (ignore-errors (coq-eglot-lsp-server-command)))
-      ;; the goals and checks of another version of Rocq do not hold:
-      ;; the proof positions of the buffers of the server go back
-      (when (coq-eglot-lsp-current-server)
-        (coq-eglot-exit))
-      ;; a server still connecting, started when the twin was visited:
-      ;; killed, like Eglot does when the connection is canceled
-      (coq-eglot-lsp-kill-connecting-servers)
-      (setq-local coq-eglot-server-program command)
-      ;; without waiting, the commands wait for it to connect
-      (coq-eglot-lsp-connect))
-    (coq-eglot-twin--update-label)))
+;;; The Rocq of the twins
+;;
+;; Each twin is checked by the Rocq of its project, see
+;; `coq-eglot-set-rocq'.  Twins in two projects, like two worktrees,
+;; have two servers, which check them at the same time.  Twins in the
+;; same project share its server, which checks them one after the
+;; other.  Then OTHER, the twin with an output of its own, may get a
+;; server of its own, see `coq-eglot-lsp-own-server': with the same
+;; Rocq, faster but one more server in memory, see
+;; `coq-eglot-twin-toggle-two-servers'; or with another Rocq, if it
+;; requires no library of the project, compiled by the Rocq of the
+;; project only, see `coq-eglot-twin-set-rocq'.  Unpaired, it shares
+;; the server of its project again.
 
-(defun coq-eglot-twin-set-opam-switch (switch)
-  "Give the twin the server of opam SWITCH, the other buffer keeps its own.
-The twin is the buffer paired by `coq-eglot-twin-pair', with an output
-of its own.  The server of SWITCH is its rocq-lsp or coq-lsp: the value
-of `coq-eglot-server-program' in the twin.  If the server of the twin
-ran another program, it stops: the proof positions of its buffers go
-back to their beginning.  It is shared by the buffers of the project of
-the twin.  The mode line of the twins shows their servers.  The twin
-keeps this server when unpaired."
-  (interactive (list (coq-eglot-twin--read-opam-switch)))
-  (let ((twin (coq-eglot-twin--twins-other
-               (buffer-local-value 'coq-eglot-twin--twins
-                                   (car (coq-eglot-twin--script-and-twin))))))
-    (with-current-buffer twin
-      (coq-eglot-twin--set-switch switch))
-    (message "Coq: the server of %s is the one of opam switch %s"
-             (buffer-name twin) switch)))
+(defun coq-eglot-twin--same-project-p (this other)
+  "Non-nil if THIS and OTHER are in the same project.
+Then they share its server, unless OTHER has one of its own."
+  (equal (with-current-buffer this (coq-eglot-lsp-project-id))
+         (with-current-buffer other (coq-eglot-lsp-project-id))))
+
+(defun coq-eglot-twin--set-own-server (command)
+  "Give the current buffer, a twin, a server of its own running COMMAND.
+Or share again the server of its project if COMMAND is nil.  Confirm if
+its proof position goes back to its beginning.  Do nothing if it
+already has this server."
+  (unless (if command
+              (and coq-eglot-lsp-own-server
+                   (coq-eglot-lsp-same-server-p command coq-eglot-lsp-own-server))
+            (null coq-eglot-lsp-own-server))
+    (coq-eglot-servers-confirm-restart
+     (list (current-buffer))
+     (or command (coq-eglot-lsp-project-command)))
+    (coq-eglot-change-server
+     (lambda () (setq coq-eglot-lsp-own-server command)))))
+
+(defun coq-eglot-twin--check-requires (buffer command)
+  "Signal a user error if BUFFER cannot be checked by server COMMAND.
+In the project of its twin, another Rocq than the one of the project
+cannot load its libraries, see `coq-eglot-compile-local-requires'."
+  (with-current-buffer buffer
+    (when-let ((require (car (coq-eglot-compile-local-requires))))
+      (user-error "Coq: %s requires libraries of its project at line %d: \
+they are compiled for the Rocq of the project, %s cannot load them.  \
+Change the Rocq of the whole project instead, see `coq-eglot-set-rocq'"
+                  (buffer-name) (line-number-at-pos (car require))
+                  (coq-eglot-servers-label (car command))))))
+
+(defun coq-eglot-twin-set-rocq (command &optional buffer)
+  "Check BUFFER, a twin, with server COMMAND.
+BUFFER defaults to the twin with an output of its own.  In another
+project than its twin, the Rocq of its project changes, see
+`coq-eglot-set-rocq'.  In the same project, it gets a server of its
+own, see `coq-eglot-twin--set-own-server': with another Rocq, only if
+it requires no library of the project.  Choosing the Rocq of the
+project again, it shares its server again, unless Two Servers is on,
+see `coq-eglot-twin-toggle-two-servers'.  Interactively, ask COMMAND
+among the candidates, see `coq-eglot-servers-candidates'."
+  (interactive
+   (let ((twin (coq-eglot-twin--twins-other
+                (buffer-local-value
+                 'coq-eglot-twin--twins
+                 (car (coq-eglot-twin--script-and-twin))))))
+     (list (with-current-buffer twin
+             (coq-eglot-servers-read
+              (format "Rocq of %s: " (buffer-name twin))
+              (ignore-errors (coq-eglot-lsp-server-command))))
+           twin)))
+  (let* ((twins (buffer-local-value
+                 'coq-eglot-twin--twins
+                 (or buffer (car (coq-eglot-twin--script-and-twin)))))
+         (this (coq-eglot-twin--twins-this twins))
+         (other (coq-eglot-twin--twins-other twins))
+         (buffer (or buffer other)))
+    (cond
+     ((not (coq-eglot-twin--same-project-p this other))
+      (with-current-buffer buffer
+        (coq-eglot-servers-set-project-rocq command)))
+     ;; THIS shares the server of the project: the Rocq of the project
+     ((eq buffer this)
+      (with-current-buffer this
+        (coq-eglot-servers-set-project-rocq command)))
+     ((coq-eglot-lsp-same-server-p
+       command (with-current-buffer other (coq-eglot-lsp-project-command)))
+      (with-current-buffer other
+        (coq-eglot-twin--set-own-server
+         (and (coq-eglot-twin--twins-two-servers twins) command))))
+     (t
+      (coq-eglot-twin--check-requires other command)
+      (with-current-buffer other
+        (coq-eglot-twin--set-own-server command))))
+    (with-current-buffer buffer
+      (message "Coq: %s is checked by %s%s"
+               (buffer-name)
+               (coq-eglot-servers-describe
+                (coq-eglot-servers-label (car command)) (car command))
+               (if coq-eglot-lsp-own-server ", with a server of its own" "")))))
+
+(defun coq-eglot-twin-toggle-two-servers ()
+  "Give the twin a server of its own, or share the server of its project.
+Only for twins in the same project, otherwise they have two servers
+already.  With two servers, the twins are checked at the same time,
+but one more server uses memory.  With another Rocq for the twin, two
+servers are needed, see `coq-eglot-twin-set-rocq'."
+  (interactive)
+  (let* ((twins (buffer-local-value 'coq-eglot-twin--twins
+                                    (car (coq-eglot-twin--script-and-twin))))
+         (this (coq-eglot-twin--twins-this twins))
+         (other (coq-eglot-twin--twins-other twins)))
+    (unless (coq-eglot-twin--same-project-p this other)
+      (user-error "Coq: the twins are in two projects, they have two servers"))
+    (with-current-buffer other
+      (if (coq-eglot-twin--twins-two-servers twins)
+          (progn
+            (when (coq-eglot-lsp-foreign-p)
+              (user-error "Coq: %s is checked by another Rocq, it needs \
+a server of its own" (buffer-name)))
+            (coq-eglot-twin--set-own-server nil)
+            (setf (coq-eglot-twin--twins-two-servers twins) nil)
+            (message "Coq: the twins share one server, which checks them \
+one after the other"))
+        (unless coq-eglot-lsp-own-server
+          (coq-eglot-twin--set-own-server (coq-eglot-lsp-project-command)))
+        (setf (coq-eglot-twin--twins-two-servers twins) t)
+        (message "Coq: %s has a server of its own: the twins are checked \
+at the same time, one more server uses memory" (buffer-name))))))
+
+(defun coq-eglot-twin-two-servers-p ()
+  "Non-nil if the twins of the current buffer, in one project, have two servers."
+  (let ((twins coq-eglot-twin--twins))
+    (and twins
+         (buffer-live-p (coq-eglot-twin--twins-other twins))
+         (buffer-local-value 'coq-eglot-lsp-own-server
+                             (coq-eglot-twin--twins-other twins))
+         t)))
+
+(defun coq-eglot-twin--rocq-menu (_items)
+  "Submenu choosing the Rocq of the twin, a :filter of `easy-menu-define'.
+See `coq-eglot-twin-set-rocq'."
+  (let* ((this (ignore-errors (coq-eglot-script-buffer)))
+         (twins (and this (buffer-local-value 'coq-eglot-twin--twins this)))
+         (other (and twins (coq-eglot-twin--twins-other twins))))
+    (if (not (buffer-live-p other))
+        (list ["No twin" ignore :active nil])
+      (with-current-buffer other
+        (coq-eglot-servers-menu-items
+         (ignore-errors (coq-eglot-lsp-server-command))
+         (lambda (command) (coq-eglot-twin-set-rocq command other)))))))
 
 (defun coq-eglot-twin--forget (buffer)
   "Forget the twin of BUFFER, in BUFFER only."
@@ -299,7 +353,12 @@ keeps this server when unpaired."
       (setq coq-eglot--twin nil
             coq-eglot--twin-label nil
             coq-eglot-twin--twins nil)
-      (remove-hook 'kill-buffer-hook #'coq-eglot-twin--on-kill t))))
+      (remove-hook 'kill-buffer-hook #'coq-eglot-twin--on-kill t)
+      (remove-hook 'coq-eglot-server-changed-hook
+                   #'coq-eglot-twin--update-label t))))
+
+(defvar coq-eglot-twin--dying nil
+  "The buffer being killed, while it is unpaired.")
 
 (defun coq-eglot-twin--unpair (buffer)
   "Unpair BUFFER and its twin.
@@ -313,7 +372,16 @@ buffers of its output are killed."
       (coq-eglot-twin--cancel (coq-eglot-twin--twins-compare-timer twins)))
     (when (buffer-live-p side)
       (with-current-buffer side
-        (coq-eglot-share-output)))
+        (coq-eglot-share-output)
+        ;; the exception of the twins: back to the server of its project
+        (when coq-eglot-lsp-own-server
+          (if (eq side coq-eglot-twin--dying)
+              ;; its own server stops with it
+              (coq-eglot-lsp-detach)
+            (coq-eglot-change-server
+             (lambda () (setq coq-eglot-lsp-own-server nil)))
+            (message "Coq: %s is checked again by the server of its project"
+                     (buffer-name))))))
     (coq-eglot-twin--stop-alignment buffer)
     (coq-eglot-twin--stop-alignment twin)
     (coq-eglot-twin--forget buffer)
@@ -332,7 +400,8 @@ goals and messages buffers are killed."
 (defun coq-eglot-twin--on-kill ()
   "Unpair the buffer being killed and its twin."
   (when coq-eglot--twin
-    (coq-eglot-twin--unpair (current-buffer))))
+    (let ((coq-eglot-twin--dying (current-buffer)))
+      (coq-eglot-twin--unpair (current-buffer)))))
 
 (defun coq-eglot-twin-layout ()
   "Display the twins side by side, each above its goals and messages.

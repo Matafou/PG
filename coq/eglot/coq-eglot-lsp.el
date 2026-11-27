@@ -40,6 +40,8 @@
     (function eglot--current-project)
     (function eglot--guess-contact)
     (function eglot--managed-buffers)
+    (function eglot--managed-mode-off)
+    (variable eglot--managed-mode)
     (function eglot--pos-to-lsp-position)
     (function eglot--lsp-position-to-point)
     (function eglot--signal-textDocument/didChange)
@@ -69,11 +71,124 @@ server of a given opam switch."
 (defconst coq-eglot-lsp--program-names '("rocq-lsp" "coq-lsp")
   "Names of the server program, tried in this order.")
 
+(defvar coq-eglot-lsp--project-servers (make-hash-table :test #'equal)
+  "Command lines of the servers of the projects, by project.
+A project is checked by one Rocq for the session: the one chosen, see
+`coq-eglot-lsp-set-project-server', or else the one of its first server
+that started, see `coq-eglot-lsp--fix-server'.  Until then, its server
+is the one of `coq-eglot-server-program' or of `exec-path', which may
+still change, like with an opam switch.  They take precedence over
+`coq-eglot-server-program', even when set by a .dir-locals.el file.")
+
+(defvar coq-eglot-lsp--starting (make-hash-table :test #'equal)
+  "Command lines of the servers starting, by project.
+See `coq-eglot-lsp--fix-server'.")
+
+(defvar-local coq-eglot-lsp-own-server nil
+  "Command line of a server of the current buffer alone, or nil.
+If non-nil, the buffer does not share the server of its project: it has
+a project of its own, with the same root, see `coq-eglot-lsp-project'.
+Its server is started in the same directory and reads the same project
+file.  Set by the twins, see `coq-eglot-twin-set-rocq'.")
+(put 'coq-eglot-lsp-own-server 'permanent-local t)
+
+(defun coq-eglot-lsp--shared-project (dir)
+  "Project of the current Coq buffer, in DIR, shared by its other files.
+The directory of the dominating Coq project file (_CoqProject), if any
+and `coq-use-project-file' is non-nil.  Otherwise the file is isolated,
+it is a project of its own, (coq-eglot-file FILE DIR).  See
+`coq-eglot-lsp-project'."
+  (let ((root (and coq-use-project-file
+                   (locate-dominating-file
+                    dir (lambda (d) (funcall coq-project-filename d))))))
+    (if root
+        (cons 'transient (file-name-as-directory (expand-file-name root)))
+      (list 'coq-eglot-file (or buffer-file-name (buffer-name))
+            (file-name-as-directory (expand-file-name dir))))))
+
+(defun coq-eglot-lsp-project-id ()
+  "Project of the current buffer, shared by the other files of the project.
+Even if the buffer has a server of its own, see
+`coq-eglot-lsp-own-server'.  Two buffers are in the same project if
+their projects are `equal'."
+  (coq-eglot-lsp--shared-project default-directory))
+
+(defun coq-eglot-lsp-project-root ()
+  "Root directory of the project of the current buffer.
+Where its server starts, see `coq-eglot-lsp-project-id'."
+  (project-root (coq-eglot-lsp-project-id)))
+
+(defun coq-eglot-lsp-project-name (&optional project)
+  "Name of PROJECT in messages, by default the one of the current buffer.
+Its root directory, or the file if it is isolated."
+  (let ((project (or project (coq-eglot-lsp-project-id))))
+    (if (eq (car project) 'coq-eglot-file)
+        (file-name-nondirectory (nth 1 project))
+      (abbreviate-file-name (project-root project)))))
+
+(defun coq-eglot-lsp-project-server (&optional project)
+  "Command line of the server of PROJECT for the session, or nil.
+PROJECT defaults to the one of the current buffer.  Chosen, or fixed by
+its first server, see `coq-eglot-lsp--project-servers'."
+  (gethash (or project (coq-eglot-lsp-project-id))
+           coq-eglot-lsp--project-servers))
+
+(defun coq-eglot-lsp-set-project-server (project command)
+  "Make COMMAND the command line of the server of PROJECT.
+See `coq-eglot-lsp-project-id'.  For this session, for all its buffers
+but those with a server of their own, see `coq-eglot-lsp-own-server'.
+Nil forgets the choice.  The running server does not change: stop it
+first."
+  (if command
+      (puthash project command coq-eglot-lsp--project-servers)
+    (remhash project coq-eglot-lsp--project-servers)))
+
+(defun coq-eglot-lsp--absolute-command (command)
+  "COMMAND with the absolute file name of its program, if found.
+Not its true name: the other programs of Rocq are next to it."
+  (cons (or (executable-find (car command)) (car command)) (cdr command)))
+
+
+(defun coq-eglot-lsp-project-command ()
+  "Command line of the server of the project of the current buffer.
+The one of the project for the session, or `coq-eglot-server-program',
+or the program found in `exec-path'.  It ignores
+`coq-eglot-lsp-own-server'.  Signal an error if not found."
+  (let ((coq-eglot-lsp-own-server nil))
+    (coq-eglot-lsp-server-command)))
+
+(defun coq-eglot-lsp--program-file (program)
+  "True name of the executable PROGRAM, or PROGRAM if not found."
+  (let ((file (executable-find program)))
+    (if file (file-truename file) program)))
+
+(defun coq-eglot-lsp-same-server-p (command1 command2)
+  "Non-nil if the command lines COMMAND1 and COMMAND2 run the same server.
+The same executable, even through other names, with the same arguments.
+Nil if one of them is nil, like a server not found."
+  (and command1 command2
+       (equal (coq-eglot-lsp--program-file (car command1))
+              (coq-eglot-lsp--program-file (car command2)))
+       (equal (cdr command1) (cdr command2))))
+
+(defun coq-eglot-lsp-foreign-p ()
+  "Non-nil if the server of the current buffer is not the one of its project.
+Its Rocq may be another one: it cannot load the libraries compiled for
+the project.  See `coq-eglot-lsp-own-server'."
+  (and coq-eglot-lsp-own-server
+       (not (coq-eglot-lsp-same-server-p
+             coq-eglot-lsp-own-server
+             (ignore-errors (coq-eglot-lsp-project-command))))))
+
 (defun coq-eglot-lsp-server-command ()
   "Command line of the server, a list of strings.
-See `coq-eglot-server-program'.  Signal an error if the program is not
-found."
-  (let ((command (or coq-eglot-server-program
+The server of the buffer alone, `coq-eglot-lsp-own-server', or the one
+of its project for the session, see `coq-eglot-lsp--project-servers',
+or `coq-eglot-server-program', or the program found in `exec-path'.
+Signal an error if the program is not found."
+  (let ((command (or coq-eglot-lsp-own-server
+                     (coq-eglot-lsp-project-server)
+                     coq-eglot-server-program
                      (list (or (seq-find #'executable-find
                                          coq-eglot-lsp--program-names)
                                (user-error "Coq language server not found \
@@ -187,6 +302,22 @@ See `coq-eglot-strong-interrupt'."
 
 (defclass coq-eglot-lsp-server (eglot-lsp-server) ()
   :documentation "Coq language server (coq-lsp).")
+
+(defun coq-eglot-lsp--fix-server (server)
+  "Fix the server of the project of SERVER for the session, if not yet.
+To the one of SERVER, which started: later changes of `exec-path', like
+another opam switch, do not change it.  A function of
+`eglot-connect-hook'.  See `coq-eglot-lsp--project-servers'."
+  (when (cl-typep server 'coq-eglot-lsp-server)
+    (let* ((project (eglot--project server))
+           (command (gethash project coq-eglot-lsp--starting)))
+      (remhash project coq-eglot-lsp--starting)
+      (when (and command
+                 (not (eq (car-safe project) 'coq-eglot-own))
+                 (not (gethash project coq-eglot-lsp--project-servers)))
+        (puthash project command coq-eglot-lsp--project-servers)))))
+
+(add-hook 'eglot-connect-hook #'coq-eglot-lsp--fix-server)
 
 (defun coq-eglot-lsp--options ()
   "Options of coq-lsp, as a plist."
@@ -308,6 +439,10 @@ argument is unused here: Eglot starts the server in its root, where
 coq-lsp finds the project file.  Without one, no recursive load path is
 guessed: an implicit -R of the root may scan an arbitrarily large tree."
   (let* ((command (coq-eglot-lsp-server-command))
+         (_ (unless coq-eglot-lsp-own-server
+              (puthash (coq-eglot-lsp-project-id)
+                       (coq-eglot-lsp--absolute-command command)
+                       coq-eglot-lsp--starting)))
          (buffer-args
           (condition-case err
               (coq-eglot-lsp-load-path-args)
@@ -334,13 +469,42 @@ guessed: an implicit -R of the root may scan an arbitrarily large tree."
 It is the directory of the dominating Coq project file (_CoqProject),
 if any.  The server is started there, where it reads the project file,
 and is shared by the files of this directory and its subdirectories.
-If `coq-use-project-file' is nil, it is DIR: the server reads no project
-file, unless DIR has one, see `coq-eglot-lsp-check-load-path'."
-  (if (not coq-use-project-file)
-      (cons 'transient (expand-file-name dir))
-    (when-let* ((root (locate-dominating-file
-                       dir (lambda (d) (funcall coq-project-filename d)))))
-      (cons 'transient root))))
+Otherwise, or if `coq-use-project-file' is nil, the file is isolated:
+it is a project of its own, with a server of its own started in DIR.
+The server reads no project file, unless DIR has one, see
+`coq-eglot-lsp-check-load-path'.  If the buffer has a server of its
+own, see `coq-eglot-lsp-own-server', a project of its own too, with the
+same root.  Only in Coq buffers, see `coq-eglot-mode'."
+  (let ((shared (coq-eglot-lsp--shared-project dir)))
+    (cond
+     ;; another buffer: only the projects of the project files
+     ((not (derived-mode-p 'coq-mode))
+      (and (eq (car shared) 'transient) shared))
+     (coq-eglot-lsp-own-server
+      (list 'coq-eglot-own shared (or buffer-file-name (buffer-name))))
+     (t shared))))
+
+(cl-defmethod project-root ((project (head coq-eglot-own)))
+  "Root of PROJECT, the project of a buffer with a server of its own."
+  (project-root (nth 1 project)))
+
+(cl-defmethod project-root ((project (head coq-eglot-file)))
+  "Root of PROJECT, the project of an isolated file: its directory."
+  (nth 2 project))
+
+(defun coq-eglot-lsp-detach ()
+  "Stop using the server of the current buffer, without stopping it.
+The server forgets the document.  It stops if no other buffer uses it.
+The next request starts or finds the server of the buffer again, see
+`coq-eglot-lsp-connect': call it after changing the server of the
+buffer, see `coq-eglot-lsp-own-server'."
+  (coq-eglot-lsp--forget-waiting)
+  (coq-eglot-lsp--reset-scheduler)
+  (let ((server (coq-eglot-lsp-current-server)))
+    (when (bound-and-true-p eglot--managed-mode)
+      (eglot--managed-mode-off))
+    (when (and server (null (eglot--managed-buffers server)))
+      (ignore-errors (eglot-shutdown server nil 0.3 t)))))
 
 ;;; Positions and requests
 
