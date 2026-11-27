@@ -362,6 +362,15 @@ See `coq-syntax-db' for DB structure."
   "Face for names of cheating tactics in proof scripts."
   :group 'proof-faces)
 
+(defface coq-error-location-face
+  '((((supports :underline (:style wave)))
+     :underline (:style wave :color "red"))
+    (t :underline t))
+  "Face of the location of an error in the script.
+Underlined only by default: the text keeps its highlighting.  The rest
+of the failed sentence has `proof-boring-face'."
+  :group 'proof-faces)
+
 (defface coq-symbol-binder-face
   '((t :inherit font-lock-type-face :bold coq-bold-unicode-binders))
   "Face for Unicode binders, by default a bold version of `font-lock-type-face'."
