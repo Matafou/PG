@@ -304,14 +304,18 @@ output window alone in its column.  Not with
   :type 'boolean
   :group 'proof-user-options)
 
-(defcustom proof-output-windows-weights '((goals . 1) (response . 1))
+(defcustom proof-output-windows-weights
+  '((goals . 1) (response . 1) (hypotheses . 0.5))
   "*Weights of the output windows sharing their height.
 An alist from the role of an output window, like goals or response, to
-a positive number.  When the windows do not fit, a window gets a share
-of the height in proportion to its weight, and the windows of greater
-weight, then the upper ones, get the remaining lines first.  A window
-not listed has weight 1.  A very large weight, like 100, gives a window
-the height it needs before the others.  See `proof-shrink-windows-tofit'."
+a positive number.  The role hypotheses is the window of the
+hypotheses when the conclusion is apart, in the Eglot backend of Coq:
+with a lower weight, the conclusion below it gets the lines left.
+When the windows do not fit, a window gets a share of the height in
+proportion to its weight, and the windows of greater weight, then the
+upper ones, get the remaining lines first.  A window not listed has
+weight 1.  A very large weight, like 100, gives a window the height it
+needs before the others.  See `proof-shrink-windows-tofit'."
   :type '(alist :key-type symbol :value-type number)
   :group 'proof-user-options)
 

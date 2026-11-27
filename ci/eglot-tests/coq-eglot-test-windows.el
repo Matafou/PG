@@ -48,7 +48,8 @@ not change."
 (ert-deftest coq-eglot-resize-windows-split ()
   "With split goals, the hypotheses, the conclusion and the response
 windows share their height, each one getting what it needs if they fit.
-With a lower weight, the hypotheses never get more than they need."
+The conclusion gets the lines left, not the hypotheses above it: they
+have a lower weight by default, see `proof-output-windows-weights'."
   (with-test-file
     (unwind-protect
         (progn
@@ -64,13 +65,14 @@ With a lower weight, the hypotheses never get more than they need."
             ;; computation)
             (should (>= (window-total-height conclusion)
                         (proof-window-need conclusion)))
-            (should (>= (window-total-height goals)
-                        (max window-min-height (proof-window-need goals))))
+            (should (= (window-total-height goals)
+                       (max window-min-height (proof-window-need goals))))
             (should (= (window-total-height response)
                        (max window-min-height (proof-window-need response))))
-            (let ((proof-output-windows-weights '((hypotheses . 0.5))))
+            ;; with equal weights, the upper window gets them
+            (let ((proof-output-windows-weights '((hypotheses . 1))))
               (coq-eglot--resize-windows))
-            (should (= (window-total-height goals)
+            (should (> (window-total-height goals)
                        (max window-min-height (proof-window-need goals))))))
       (setq coq-eglot-split-goals nil)
       (let ((buffer (get-buffer "*conclusion*")))
