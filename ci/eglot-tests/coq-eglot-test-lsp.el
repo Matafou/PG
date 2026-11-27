@@ -339,7 +339,7 @@ With buffer positions for the sentence and messages with severities."
                      '(notice warning nil)))
       (should (equal (coq-eglot--format-messages
                       (coq-eglot-lsp-answer-messages answer))
-                     "printed\ncareful\nplain"))
+                     "printed\nWarning: careful\nplain"))
       (should (equal (coq-eglot-lsp-answer-error answer) "Oops."))
       (should (= (coq-eglot-lsp-answer-printing-width answer) 80))
       (should (equal (coq-eglot-lsp-answer-printing-flags answer)

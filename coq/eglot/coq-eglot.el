@@ -839,8 +839,9 @@ See `coq-eglot-detailed-goals'.  Without asking the server again."
            (if coq-eglot-detailed-goals "detailed" "like Coq")))
 
 (defun coq-eglot--format-messages (messages)
-  "Format MESSAGES of a sentence, a list of `coq-eglot-lsp-message'."
-  (mapconcat #'coq-eglot-lsp-message-text messages "\n"))
+  "Format MESSAGES of a sentence, a list of `coq-eglot-lsp-message'.
+See `coq-eglot-lsp-message-string'."
+  (mapconcat #'coq-eglot-lsp-message-string messages "\n"))
 
 (defvar coq-eglot-output-hook nil
   "Hook run in a script buffer when it displayed its goals or messages.
@@ -1127,10 +1128,12 @@ Only the goals if GOALS-ONLY."
   (coq-eglot--show-answer-enriched answer goals-only))
 
 (defun coq-eglot--show-error (text &optional scripted)
-  "Display error TEXT in the response buffer.
+  "Display error TEXT in the response buffer, after \"Error: \".
 With SCRIPTED, the error comes from scripting at the proof position."
   ;; not face: font-lock would remove it
-  (coq-eglot--show-response (propertize text 'font-lock-face 'error) scripted))
+  (coq-eglot--show-response
+   (propertize (concat "Error: " text) 'font-lock-face 'error)
+   scripted))
 
 (defun coq-eglot--goals-at-position (&optional ask goals-only)
   "Display the goals and messages at the proof position, without waiting.
@@ -1502,7 +1505,7 @@ See `coq-eglot--advance-done'.  Stop at the first error."
              (coq-eglot--trace-check start (car bounds) nil))
            (coq-eglot--fail (car bounds) (cdr bounds)
                             (or (and answer (coq-eglot-lsp-answer-error answer))
-                                "Error.")
+                                "No message.")
                             answer before)))))
      ;; an error the diagnostics did not report
      ((and bounds (coq-eglot-lsp-answer-error answer))
@@ -2049,8 +2052,10 @@ ignored.  The query is a request of the session, see
              (`(failure . ,failure)
               ;; cancelled by an edition or a new check: nothing to tell
               (unless (coq-eglot-lsp-failure-cancelled failure)
+                ;; the errors of Coq come after "Coq: "
                 (coq-eglot--show-error
-                 (coq-eglot-lsp-failure-message failure)))))))
+                 (string-remove-prefix
+                  "Coq: " (coq-eglot-lsp-failure-message failure))))))))
        (lambda (done)
          ;; in the last processed sentence: the state after it
          (coq-eglot-lsp-query-async

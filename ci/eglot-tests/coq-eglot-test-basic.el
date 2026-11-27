@@ -66,7 +66,7 @@ the error location with `proof-warning-face', and point moves there."
   (with-test-file
     (run #'coq-eglot-process-buffer)
     (should (position-at-marker-p "before error"))
-    (should (string-match-p "unknown_lemma" (buffer-text "*response*")))
+    (should (string-match-p "\\`Error: .*unknown_lemma" (buffer-text "*response*")))
     (should (string-match-p "\\`1 goal\n\n *=+\n *1 = 2" (buffer-text "*goals*")))
     (should (equal (error-overlay-text 'proof-boring-face)
                    "rewrite unknown_lemma."))
@@ -179,6 +179,20 @@ are common to all backends."
       (should (eq (get-text-property (point-min) 'font-lock-face) 'error)))
     ;; the proof position does not move
     (should (position-at-marker-p "definition"))))
+
+(ert-deftest coq-eglot-message-levels ()
+  "Errors and warnings come after \"Error: \" and \"Warning: \", like in
+Proof General, the other messages alone."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (should (string-prefix-p
+             "Warning: Could not enable unknown warning"
+             (query #'coq-eglot-run-query "Set Warnings \"+nonexistent-xyz\".")))
+    (let ((text (query #'coq-eglot-run-query "Check (1 + true).")))
+      (should (string-prefix-p "Error: " text))
+      (should-not (string-match-p "Coq: " text)))
+    (should (string-prefix-p "double\n" (query #'coq-eglot-run-query "Check double.")))))
 
 (ert-deftest coq-eglot-query-flags ()
   "Queries can use other printing flags, for this query only.
