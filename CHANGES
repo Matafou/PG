@@ -53,6 +53,10 @@ the Git ChangeLog, the GitHub repo https://github.com/ProofGeneral/PG
     It is an alternative to the unchanged electric terminator.
 
 ** Coq changes
+*** The location of an error in the script has its own face,
+    `coq-error-location-face': a red wavy underline by default, the
+    text keeping its highlighting, instead of `proof-warning-face'.
+    The rest of the failed command still has `proof-boring-face'.
 *** Fewer files in coq/: the code of coq-diffs.el is in coq-goals.el,
     of coq-abbrev.el in coq.el, of coq-local-vars.el in coq-project.el.
     The old files remain as compatibility files, which will be removed:
