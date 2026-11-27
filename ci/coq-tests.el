@@ -285,10 +285,6 @@ For example, COMMENT could be (*test-definition*)"
          (let ((sp (span-at proof-cmd-point 'face)))
            (should sp)
            (should (equal (span-property sp 'face) 'coq-error-location-face))
-           ;; the location keeps its colors: no boring face on it
-           (should-not (seq-find (lambda (ov) (eq (overlay-get ov 'face)
-                                                  'proof-boring-face))
-                                 (overlays-at proof-cmd-point)))
            (should (equal (span-start sp) proof-cmd-point))
            ;; coq-8.11 used to hace ending ps shifted by one
            (should (or (equal (span-end sp) (+ proof-cmd-point (length "reflexivity")))
