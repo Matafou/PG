@@ -403,14 +403,15 @@ Point is at the error, see `coq-eglot--highlight-error'.")
 
 (defun coq-eglot--highlight-error (start end)
   "Highlight the sentence between START and END, which failed.
-Like Proof General: the sentence with `proof-boring-face', the location
-of the error, if known, with `proof-warning-face'.  Move point to the
-error.  Run `coq-eglot-error-hook'."
+Like Proof General: the sentence with `proof-boring-face', and the
+location of the error, if known, with `coq-error-location-face' too.
+Move point to the error.  Run `coq-eglot-error-hook'."
   (coq-eglot--clear-error)
   (coq-eglot--error-overlay start end 'proof-boring-face 0)
   (let ((range (coq-eglot-session-error-range start end)))
     (when range
-      (coq-eglot--error-overlay (car range) (cdr range) 'proof-warning-face 1))
+      (coq-eglot--error-overlay (car range) (cdr range)
+                                'coq-error-location-face 1))
     (goto-char (if range (car range) start)))
   (when coq-eglot-error-highlight-duration
     (setq coq-eglot--error-timer
@@ -433,6 +434,7 @@ active script buffer."
   (setq coq-query-function #'coq-eglot-run-query)
   (setq coq-query-result-function #'coq-eglot-query-result)
   (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
+  (setq-local proof-output-windows-function #'coq-eglot--output-windows)
   (setq coq-set-flag-function #'coq-eglot-set-flag)
   (setq coq-set-search-blacklist-function #'coq-eglot-set-search-blacklist))
 
@@ -447,9 +449,37 @@ active script buffer."
   (add-hook 'window-size-change-functions
             #'coq-eglot--schedule-width-refresh nil t))
 
+(defvar coq-eglot--quoted-keywords nil
+  "The compiled `coq-goals-font-lock-keywords', for the quoted terms.
+See `coq-eglot--fontify-quoted'.")
+
+(defun coq-eglot--fontify-quoted (limit)
+  "Highlight the terms quoted in the messages, from point to LIMIT.
+Like the goals, see `coq-goals-font-lock-keywords'.  A font-lock
+matcher that highlights the quoted terms itself and matches nothing."
+  (unless coq-eglot--quoted-keywords
+    (setq coq-eglot--quoted-keywords
+          (font-lock-compile-keywords coq-goals-font-lock-keywords)))
+  ;; from the opening quote if point is inside a quoted term
+  (when (cl-oddp (how-many "\"" (point-min) (point)))
+    (search-backward "\""))
+  (while (re-search-forward "\"\\([^\"]*\\)\"" limit t)
+    (let ((end (match-end 0))
+          (font-lock-keywords coq-eglot--quoted-keywords))
+      (font-lock-fontify-keywords-region (match-beginning 1) (match-end 1))
+      (goto-char end)))
+  nil)
+
+(defvar coq-eglot--response-font-lock-keywords
+  (append coq-response-font-lock-keywords '(coq-eglot--fontify-quoted))
+  "Highlighting of the response buffer.
+Like in Proof General, see `coq-response-font-lock-keywords', but the
+quoted terms are highlighted like the goals, not as strings.")
+
 (define-derived-mode coq-eglot-response-mode coq-eglot-output-mode "Coq Response"
   "Major mode for the messages of the Eglot backend of Coq."
-  (setq-local font-lock-defaults '(coq-response-font-lock-keywords)))
+  ;; keywords only: the quoted terms are not strings
+  (setq-local font-lock-defaults '(coq-eglot--response-font-lock-keywords t)))
 
 (defun coq-eglot-layout-windows ()
   "Display the goals and response windows again, like in Proof General.
@@ -840,8 +870,9 @@ See `coq-eglot-detailed-goals'.  Without asking the server again."
            (if coq-eglot-detailed-goals "detailed" "like Coq")))
 
 (defun coq-eglot--format-messages (messages)
-  "Format MESSAGES of a sentence, a list of `coq-eglot-lsp-message'."
-  (mapconcat #'coq-eglot-lsp-message-text messages "\n"))
+  "Format MESSAGES of a sentence, a list of `coq-eglot-lsp-message'.
+See `coq-eglot-lsp-message-string'."
+  (mapconcat #'coq-eglot-lsp-message-string messages "\n"))
 
 (defvar coq-eglot-output-hook nil
   "Hook run in a script buffer when it displayed its goals or messages.
@@ -1128,10 +1159,14 @@ Only the goals if GOALS-ONLY."
   (coq-eglot--show-answer-enriched answer goals-only))
 
 (defun coq-eglot--show-error (text &optional scripted)
-  "Display error TEXT in the response buffer.
-With SCRIPTED, the error comes from scripting at the proof position."
+  "Display error TEXT in the response buffer, after \"Error: \".
+Only \"Error:\" has `proof-error-face', TEXT is highlighted like the
+other messages, like in Proof General.  With SCRIPTED, the error comes
+from scripting at the proof position."
   ;; not face: font-lock would remove it
-  (coq-eglot--show-response (propertize text 'font-lock-face 'error) scripted))
+  (coq-eglot--show-response
+   (concat (propertize "Error:" 'font-lock-face 'proof-error-face) " " text)
+   scripted))
 
 (defun coq-eglot--goals-at-position (&optional ask goals-only)
   "Display the goals and messages at the proof position, without waiting.
@@ -1503,7 +1538,7 @@ See `coq-eglot--advance-done'.  Stop at the first error."
              (coq-eglot--trace-check start (car bounds) nil))
            (coq-eglot--fail (car bounds) (cdr bounds)
                             (or (and answer (coq-eglot-lsp-answer-error answer))
-                                "Error.")
+                                "No message.")
                             answer before)))))
      ;; an error the diagnostics did not report
      ((and bounds (coq-eglot-lsp-answer-error answer))
@@ -2050,8 +2085,10 @@ ignored.  The query is a request of the session, see
              (`(failure . ,failure)
               ;; cancelled by an edition or a new check: nothing to tell
               (unless (coq-eglot-lsp-failure-cancelled failure)
+                ;; the errors of Coq come after "Coq: "
                 (coq-eglot--show-error
-                 (coq-eglot-lsp-failure-message failure)))))))
+                 (string-remove-prefix
+                  "Coq: " (coq-eglot-lsp-failure-message failure))))))))
        (lambda (done)
          ;; in the last processed sentence: the state after it
          (coq-eglot-lsp-query-async
@@ -2355,6 +2392,7 @@ buffer is set up, after the configuration of the user."
         (setq coq-set-search-blacklist-function #'coq-eglot-set-search-blacklist)
         (setq coq-show-at-point-function #'coq-eglot-show-at-point)
         (setq coq-processed-end-function #'coq-eglot-position)
+        (setq-local proof-output-windows-function #'coq-eglot--output-windows)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot-lsp-check-load-path nil t)
@@ -2372,6 +2410,7 @@ buffer is set up, after the configuration of the user."
     (kill-local-variable 'coq-set-search-blacklist-function)
     (kill-local-variable 'coq-show-at-point-function)
     (kill-local-variable 'coq-processed-end-function)
+    (kill-local-variable 'proof-output-windows-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot-session-reset t)

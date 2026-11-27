@@ -751,6 +751,15 @@ MESSAGE is a plist with the keys :level and :text, or a string."
      (coq-eglot-lsp--severity (plist-get message :level))
      (plist-get message :text))))
 
+(defun coq-eglot-lsp-message-string (message)
+  "Text of MESSAGE, a `coq-eglot-lsp-message', as Coq prints it.
+After \"Error: \" or \"Warning: \" according to its severity, like
+in Proof General."
+  (concat (pcase (coq-eglot-lsp-message-severity message)
+            ('error "Error: ")
+            ('warning "Warning: "))
+          (coq-eglot-lsp-message-text message)))
+
 (defun coq-eglot-lsp--answer (answer context width flags)
   "ANSWER of a goals request with CONTEXT, as a `coq-eglot-lsp-answer'.
 Printed at WIDTH with FLAGS.  Nil if ANSWER is nil."
@@ -1559,7 +1568,8 @@ No goals are computed.  ON-SUCCESS is called with a
   "Run Coq COMMAND asynchronously in the state at POS.
 The state is the one after the sentences ending before POS.  The
 document does not change.  ON-SUCCESS is called with the messages of
-COMMAND, a list of strings, ON-ERROR with a `coq-eglot-lsp-failure'.
+COMMAND, a list of strings, see `coq-eglot-lsp-message-string', ON-ERROR
+with a `coq-eglot-lsp-failure'.
 See `coq-eglot-lsp--async-request'.  Return the context of the
 request."
   ;; `user' by default; presentation adapters may supply `background'.
@@ -1572,7 +1582,11 @@ request."
    (lambda (answer _context)
      ;; each feedback is [LEVEL TEXT]
      (funcall on-success
-              (mapcar (lambda (feedback) (aref feedback 1))
+              (mapcar (lambda (feedback)
+                        (coq-eglot-lsp-message-string
+                         (coq-eglot-lsp--make-message
+                          (coq-eglot-lsp--severity (aref feedback 0))
+                          (aref feedback 1))))
                       (plist-get answer :feedback))))
    on-error policy queue-key))
 

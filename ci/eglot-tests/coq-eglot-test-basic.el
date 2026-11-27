@@ -62,15 +62,17 @@
 (ert-deftest coq-eglot-error-stops ()
   "Processing stops before the sentence that fails.
 Like Proof General, the sentence is highlighted with `proof-boring-face',
-the error location with `proof-warning-face', and point moves there."
+the error location with `coq-error-location-face' too, and point moves
+there."
   (with-test-file
     (run #'coq-eglot-process-buffer)
     (should (position-at-marker-p "before error"))
-    (should (string-match-p "unknown_lemma" (buffer-text "*response*")))
+    (should (string-match-p "\\`Error: .*unknown_lemma" (buffer-text "*response*")))
     (should (string-match-p "\\`1 goal\n\n *=+\n *1 = 2" (buffer-text "*goals*")))
-    (should (equal (error-overlay-text 'proof-boring-face)
-                   "rewrite unknown_lemma."))
-    (should (equal (error-overlay-text 'proof-warning-face) "unknown_lemma"))
+    (should (equal (error-overlay-texts 'proof-boring-face)
+                   '("rewrite unknown_lemma.")))
+    (should (equal (error-overlay-texts 'coq-error-location-face)
+                   '("unknown_lemma")))
     (should (looking-at "unknown_lemma"))
     ;; the next command removes the highlighting
     (run #'coq-eglot-undo-last-command)
@@ -173,12 +175,30 @@ are common to all backends."
     ;; l is defined after the proof position
     (should (string-match-p "not a defined object"
                             (query #'coq-run-query "About l")))
-    ;; errors are displayed as such
-    (should (string-match-p "was not found" (query #'coq-run-query "Check l")))
+    ;; errors are displayed as such: only "Error:" in the error face
+    (should (string-match-p "\\`Error: .*was not found"
+                            (query #'coq-run-query "Check l")))
     (with-current-buffer "*response*"
-      (should (eq (get-text-property (point-min) 'font-lock-face) 'error)))
+      (should (eq (get-text-property (point-min) 'font-lock-face)
+                  'proof-error-face))
+      (should-not (get-text-property (search-forward "was not found")
+                                     'font-lock-face)))
     ;; the proof position does not move
     (should (position-at-marker-p "definition"))))
+
+(ert-deftest coq-eglot-message-levels ()
+  "Errors and warnings come after \"Error: \" and \"Warning: \", like in
+Proof General, the other messages alone."
+  (with-test-file
+    (goto-marker "split")
+    (run #'coq-eglot-goto-point)
+    (should (string-prefix-p
+             "Warning: Could not enable unknown warning"
+             (query #'coq-eglot-run-query "Set Warnings \"+nonexistent-xyz\".")))
+    (let ((text (query #'coq-eglot-run-query "Check (1 + true).")))
+      (should (string-prefix-p "Error: " text))
+      (should-not (string-match-p "Coq: " text)))
+    (should (string-prefix-p "double\n" (query #'coq-eglot-run-query "Check double.")))))
 
 (ert-deftest coq-eglot-query-flags ()
   "Queries can use other printing flags, for this query only.
@@ -477,8 +497,13 @@ buffers, on the active script buffer, like in Proof General."
     (query #'coq-run-query "About double")
     (should (eq (face-of "*response*" "double :") 'proof-declaration-name-face))
     (query #'coq-run-query "Check unknown_thing")
-    ;; fontification keeps the face of errors
-    (should (eq (face-of "*response*" "The reference") 'error))))
+    ;; only "Error:" in the error face, the rest like the other messages
+    (should (eq (face-of "*response*" "Error:") 'proof-error-face))
+    (should-not (face-of "*response*" "The reference"))
+    ;; the quoted terms like the goals, the rest not
+    (query #'coq-run-query "Check (0 (fun n : nat => n))")
+    (should (eq (face-of "*response*" "fun n") 'font-lock-type-face))
+    (should-not (face-of "*response*" "cannot be applied"))))
 
 (ert-deftest coq-eglot-split-goals ()
   "The conclusion can be displayed apart from the hypotheses."
@@ -2248,11 +2273,11 @@ goals window needs: they are displayed only if the response leaves room."
                       (mode-line (- (window-total-height goals)
                                     (window-body-height goals))))
                   (should start)
-                  (should (= (coq-eglot--window-need goals)
+                  (should (= (proof-window-need goals)
                              (+ mode-line 1
                                 (count-screen-lines (point-min) start nil
                                                     goals))))
-                  (should (< (coq-eglot--window-need goals)
+                  (should (< (proof-window-need goals)
                              (+ mode-line
                                 (count-screen-lines (point-min) (point-max)
                                                     nil goals))))))))

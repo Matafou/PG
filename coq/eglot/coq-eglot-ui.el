@@ -244,9 +244,11 @@ Compact contexts are a presentation option, not a command sent to Rocq.")
                               (not proof-shrink-windows-tofit))
       :style toggle :selected proof-shrink-windows-tofit
       :active (not proof-multiple-frames-enable)
-      :help "The goals and messages windows below the script fit their content"])
+      :help "The goals and messages windows one above the other share their height"])
     ["Fold Other Goals" coq-toggle-other-goals
      :style toggle :selected coq-fold-other-goals]
+    ["Fold Error Environments" coq-toggle-error-environment
+     :style toggle :selected coq-fold-error-environment]
     ,(coq-eglot--menu-with-warnings coq-compile-menu)
     ["Double Hit Electric Terminator" proof-double-hit-toggle
      :style toggle :selected proof-double-hit-enable]

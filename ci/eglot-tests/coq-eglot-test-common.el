@@ -149,11 +149,23 @@ buffer: the server depends on it."
          (with-current-buffer buffer (set-buffer-modified-p nil))
          (kill-buffer buffer)))))
 
+(defun error-overlay-texts (face)
+  "Texts under the error overlays with FACE, in the order of the buffer."
+  (mapcar (lambda (ov) (buffer-substring (overlay-start ov) (overlay-end ov)))
+          (sort (seq-filter (lambda (ov) (eq (overlay-get ov 'face) face))
+                            coq-eglot--error-overlays)
+                (lambda (a b) (< (overlay-start a) (overlay-start b))))))
+
+(defun error-sentence-text ()
+  "Text of the sentence that failed, under all the error overlays, or nil."
+  (when coq-eglot--error-overlays
+    (buffer-substring
+     (apply #'min (mapcar #'overlay-start coq-eglot--error-overlays))
+     (apply #'max (mapcar #'overlay-end coq-eglot--error-overlays)))))
+
 (defun error-overlay-text (face)
-  "Text under the error overlay with FACE, or nil."
-  (cl-loop for ov in coq-eglot--error-overlays
-           when (eq (overlay-get ov 'face) face)
-           return (buffer-substring (overlay-start ov) (overlay-end ov))))
+  "Text under the first error overlay with FACE, or nil."
+  (car (error-overlay-texts face)))
 
 (defun query (command &rest args)
   "Run query COMMAND with ARGS, return the text of the response buffer."
