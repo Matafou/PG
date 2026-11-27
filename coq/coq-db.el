@@ -367,8 +367,7 @@ See `coq-syntax-db' for DB structure."
      :underline (:style wave :color "red"))
     (t :underline t))
   "Face of the location of an error in the script.
-Underlined only by default: the text keeps its highlighting.  The rest
-of the failed sentence has `proof-boring-face'."
+Added to `proof-boring-face', the face of the failed command."
   :group 'proof-faces)
 
 (defface coq-symbol-binder-face
