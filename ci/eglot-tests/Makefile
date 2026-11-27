@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # Tests of the Eglot backend for Coq. They need Emacs >= 29 and
-# coq-lsp, set COQ_LSP to use a given server.
+# coq-lsp, set COQ_LSP to use a given server: the Rocq next to it.
 
 # coq-eglot-test-common.el: the settings and utilities of the others
 COQ_EGLOT_TESTS:=$(filter-out coq-eglot-test-common.el,\

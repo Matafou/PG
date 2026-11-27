@@ -2438,6 +2438,7 @@ buffer is set up, after the configuration of the user."
 (autoload 'coq-eglot-set-rocq "coq-eglot-servers" nil t)
 (autoload 'coq-eglot-servers-rescan "coq-eglot-servers" nil t)
 (autoload 'coq-eglot-servers-menu "coq-eglot-servers")
+(autoload 'coq-eglot-servers-read "coq-eglot-servers")
 (autoload 'coq-eglot-twin-goto-twin-position "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-toggle-synchronize "coq-eglot-twin" nil t)
 (autoload 'coq-eglot-twin-swap-reference "coq-eglot-twin" nil t)

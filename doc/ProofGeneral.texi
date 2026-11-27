@@ -5864,9 +5864,10 @@ Changing it afterwards has no effect until Emacs is restarted.
 @item
 Emacs 29 or later, for its built-in Eglot.
 @item
-coq-lsp 0.2.3 or later, found in the @code{PATH}, or given by
-@code{coq-eglot-server-program}.  With an older server, nothing gets
-processed and a warning is displayed at startup.  coq-lsp 0.2.5
+coq-lsp 0.2.3 or later, installed with Rocq: next to its program
+@code{rocq} or @code{coqtop} (@pxref{Choosing Rocq with Eglot}).  With
+an older server, nothing gets processed and a warning is displayed at
+startup.  coq-lsp 0.2.5
 supports Coq 8.20 and Rocq 9.0, 9.1 and 9.2.  The opam package and the
 program are still named @code{coq-lsp}, although the project is now
 @code{rocq-community/rocq-lsp}.
@@ -5879,6 +5880,43 @@ opam install memprof-limits
 opam pin add coq-lsp "git+https://github.com/rocq-community/rocq-lsp.git#v9.2"
 @end example
 @end itemize
+
+@anchor{Choosing Rocq with Eglot}
+@subsection Choosing Rocq
+@vindex coq-prog-name
+@vindex coq-eglot-server-args
+@vindex proof-prog-name-ask
+
+Like with the Proof General backend, an installation of Rocq is
+designated by its program @code{rocq} (or @code{coqtop}), and the
+language server is the @code{rocq-lsp} or @code{coq-lsp} next to it: an
+installation without it cannot be used.  The Rocq of a file is, in this
+order:
+@enumerate
+@item
+the one chosen in the menu @samp{Coq > Rocq Version}, for the session;
+@item
+@code{coq-prog-name}, if you set it (with customize, or a file or
+directory variable);
+@item
+the one you are asked for if @code{proof-prog-name-ask} is non-nil;
+@item
+the one found in the @code{PATH}.
+@end enumerate
+
+The Rocq is a setting of the project: all the files under the same
+@code{_CoqProject} are checked by the same Rocq, which compiles their
+libraries; a file without project file is a project of its own.  The
+menu lists the opam switches, the Rocq of the @code{PATH} and any other
+executable you designate.  Choosing another Rocq restarts the server of
+the project, after confirmation if some files go back to their
+beginning; a @file{.dir-locals.el} file is never written.  Unless chosen
+in the menu, the Rocq of a project is fixed by its first server: an
+opam switch selected after visiting a file is taken into account, but
+not one selected later.  The compilation of the required libraries uses
+the programs next to this Rocq.
+
+@code{coq-eglot-server-args} gives other arguments to the server.
 
 @subsection Interrupting
 @vindex coq-eglot-strong-interrupt

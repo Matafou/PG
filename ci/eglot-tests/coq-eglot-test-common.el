@@ -24,8 +24,15 @@
 (require 'coq-eglot)
 (require 'coq-eglot-twin)
 
+;; The server given by COQ_LSP: the Rocq next to it, set like a user
+;; would, see `coq-eglot-lsp-user-rocq'.
 (when (getenv "COQ_LSP")
-  (setq coq-eglot-server-program (list (getenv "COQ_LSP"))))
+  (let ((bin (file-name-directory (expand-file-name (getenv "COQ_LSP")))))
+    (setq coq-prog-name
+          (seq-find #'file-executable-p
+                    (list (expand-file-name "rocq" bin)
+                          (expand-file-name "coqtop" bin))))
+    (put 'coq-prog-name 'customized-value (list coq-prog-name))))
 
 ;; The frame of batch mode is narrow: the smart policy would choose the
 ;; vertical layout.  The tests of the layouts bind it.
@@ -229,17 +236,49 @@ closed document: the following sentences are checked again."
               (lambda (name &rest _) (car (member name ,programs)))))
      ,@body))
 
-(defun other-server ()
-  "Command line of the server of another opam switch, or nil.
+(defmacro with-installation (names &rest body)
+  "Run BODY with a temporary installation of Rocq, executables NAMES.
+Like (\"rocq\" \"coq-lsp\"): empty scripts in a directory bound to
+`bin', deleted afterwards."
+  (declare (indent 1) (debug t))
+  `(let ((bin (file-name-as-directory (make-temp-file "coq-eglot-bin-" t))))
+     (unwind-protect
+         (progn
+           (dolist (name ,names)
+             (let ((file (expand-file-name name bin)))
+               (with-temp-file file (insert "#!/bin/sh\n"))
+               (set-file-modes file #o755)))
+           ,@body)
+       (delete-directory bin t))))
+
+(defmacro without-user-rocq (&rest body)
+  "Run BODY as if the user did not set `coq-prog-name' globally.
+Like with COQ_LSP: then the Rocq is found in `exec-path'."
+  (declare (indent 0) (debug t))
+  `(let ((customized (get 'coq-prog-name 'customized-value))
+         (saved (get 'coq-prog-name 'saved-value)))
+     (put 'coq-prog-name 'customized-value nil)
+     (put 'coq-prog-name 'saved-value nil)
+     (unwind-protect
+         (progn ,@body)
+       (put 'coq-prog-name 'customized-value customized)
+       (put 'coq-prog-name 'saved-value saved))))
+
+(defun other-rocq ()
+  "Rocq program of another opam switch with a server, or nil.
 Of rocq-9.2 or rocq-9.0, not the one of the current buffer."
   (require 'coq-eglot-servers)
-  (let ((current (coq-eglot-lsp--program-file
-                  (car (coq-eglot-lsp-server-command)))))
+  (let ((current (coq-eglot-lsp--program-file (coq-eglot-lsp-rocq))))
     (seq-some (lambda (candidate)
                 (and (member (car candidate) '("rocq-9.2" "rocq-9.0"))
                      (not (equal (file-truename (cdr candidate)) current))
-                     (list (cdr candidate))))
-              (coq-eglot-servers--opam-servers))))
+                     (coq-eglot-lsp-server-program (cdr candidate))
+                     (cdr candidate)))
+              (coq-eglot-servers--opam-rocqs))))
+
+(defun server-of (rocq)
+  "True name of the program of the server of the Rocq program ROCQ."
+  (file-truename (coq-eglot-lsp-server-program rocq)))
 
 (defun server-program ()
   "True name of the program of the running server of the current buffer."

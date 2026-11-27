@@ -56,11 +56,12 @@ the function to call at the end.")
 ;;; Programs
 
 (defvar coq-eglot-compile--rocq-versions (make-hash-table :test #'equal)
-  "Cache of the versions of Rocq of the servers, by file name.")
+  "Cache of the versions of Rocq of the programs, by file name.")
 
 (defun coq-eglot-compile-rocq-version (program)
-  "Version of the Rocq of the server PROGRAM, a string, or nil.
-The one of the rocq or coqc program next to it.  Cached."
+  "Version of the Rocq of PROGRAM, a string, or nil.
+The one of the rocq or coqc program next to PROGRAM, a Rocq program or
+its language server.  Cached."
   (let* ((file (or (executable-find program) program))
          (cached (gethash file coq-eglot-compile--rocq-versions 'unknown)))
     (if (not (eq cached 'unknown))
@@ -82,32 +83,43 @@ The one of the rocq or coqc program next to it.  Cached."
                   '("rocq" "coqc")))
                coq-eglot-compile--rocq-versions))))
 
+(defvar-local coq-eglot-compile--set-variables nil
+  "Variables set by `coq-eglot-compile--set-programs' in this buffer.
+Their local values are not set by the user, see `coq--user-set-p'.")
+
+(defun coq-eglot-compile--user-set-p (symbol)
+  "Non-nil if the user set SYMBOL, see `coq--user-set-p'.
+Not if its local value is set by `coq-eglot-compile--set-programs'."
+  (and (coq--user-set-p symbol)
+       (not (and (memq symbol coq-eglot-compile--set-variables)
+                 (local-variable-p symbol)
+                 (not (get symbol 'saved-value))
+                 (not (get symbol 'customized-value))))))
+
 (defun coq-eglot-compile--set-programs ()
-  "Use the Rocq or Coq programs next to the language server.
-Set buffer locally the programs used by the compilation, and the
-version of Rocq it adapts its options to, see `coq-version': those of
-the Rocq of the project, see `coq-eglot-lsp-server-command'.  Keep the
-global values if they are not found there."
-  (let* ((server (car (ignore-errors (coq-eglot-lsp-server-command))))
-         (server-path (and server (executable-find server)))
-         (exec-path (and server-path
-                         (list (file-name-directory server-path))))
-         (rocq (and exec-path (executable-find "rocq")))
-         (coqc (and exec-path (executable-find "coqc"))))
-    (cond
-     (rocq
-      (setq-local proof-prog-name rocq)
-      (setq-local coq-compiler rocq)
-      (setq-local coq-dependency-analyzer rocq))
-     (coqc
-      (setq-local proof-prog-name (executable-find "coqtop"))
-      (setq-local coq-compiler coqc)
-      (setq-local coq-dependency-analyzer (executable-find "coqdep"))))
-    ;; the options of coqdep and coqc depend on the version, see
-    ;; `coq--post-v818': not the one of the first Rocq used in the session
-    (when-let ((version (and server-path
-                             (coq-eglot-compile-rocq-version server-path))))
-      (setq-local coq-autodetected-version version))))
+  "Use the programs of the Rocq of the current buffer.
+Set buffer locally the programs used by the compilation and the version
+of Rocq it adapts its options to, see `coq-version': those next to the
+Rocq of the buffer, see `coq-eglot-lsp-rocq', like
+`coq-pg-detect-programs' does.  Keep the compilers set by the user.
+Keep the global values if the Rocq is not found."
+  (let ((rocq (ignore-errors (coq-eglot-lsp-rocq))))
+    (when rocq
+      (cl-flet ((set-detected (symbol value)
+                  (set (make-local-variable symbol) value)
+                  (cl-pushnew symbol coq-eglot-compile--set-variables)))
+        (set-detected 'proof-prog-name rocq)
+        (let ((exec-path (list (file-name-directory rocq))))
+          (unless (coq-eglot-compile--user-set-p 'coq-compiler)
+            (set-detected 'coq-compiler (executable-find (coq-detect-coqc))))
+          (unless (coq-eglot-compile--user-set-p 'coq-dependency-analyzer)
+            (set-detected 'coq-dependency-analyzer
+                          (executable-find (coq-detect-coqdep)))))
+        ;; the options of coqdep and coqc depend on the version, see
+        ;; `coq--post-v818': not the one of the first Rocq of the session
+        (let ((version (coq-eglot-compile-rocq-version rocq)))
+          (when version
+            (set-detected 'coq-autodetected-version version)))))))
 
 ;;; Require sentences
 
@@ -299,9 +311,9 @@ With `setq', not saved by customize."
 (defun coq-eglot-compile--check-version (requires)
   "Signal a user error if REQUIRES load libraries of another Rocq.
 REQUIRES are the bounds of Require sentences of the current buffer.  If
-its server is not the one of its project (see
-`coq-eglot-lsp-foreign-p'), its Rocq cannot load the libraries of the
-project: they are compiled for the Rocq of the project."
+its Rocq is not the one of its project (see `coq-eglot-lsp-foreign-p'),
+it cannot load the libraries of the project: they are compiled for the
+Rocq of the project."
   (when (and (coq-eglot-lsp-foreign-p)
              (let ((coq-compile-before-require t))
                (seq-some (lambda (bounds)

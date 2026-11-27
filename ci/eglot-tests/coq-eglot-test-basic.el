@@ -1393,38 +1393,82 @@ position before it, instead of going back to the beginning."
   (should-not (coq-eglot-lsp--memprof-p nil)))
 
 (ert-deftest coq-eglot-server-command ()
-  "The server is rocq-lsp, else coq-lsp, unless set by the user."
-  (let ((coq-eglot-server-program nil))
-    (with-programs '("rocq-lsp" "coq-lsp")
-      (should (equal (coq-eglot-lsp-server-command) '("rocq-lsp"))))
-    (with-programs '("coq-lsp")
-      (should (equal (coq-eglot-lsp-server-command) '("coq-lsp"))))
-    (with-programs '()
-      (should-error (coq-eglot-lsp-server-command) :type 'user-error)))
-  (let ((coq-eglot-server-program '("/opt/coq-lsp" "--foo")))
-    (with-programs '("/opt/coq-lsp" "coq-lsp")
-      (should (equal (coq-eglot-lsp-server-command) '("/opt/coq-lsp" "--foo"))))
-    (with-programs '("coq-lsp")
-      (should-error (coq-eglot-lsp-server-command) :type 'user-error))))
+  "The server is the rocq-lsp, else the coq-lsp, next to the Rocq found
+in `exec-path', with `coq-eglot-server-args'.  None next to it: refused,
+even if another one is in `exec-path'."
+  (without-user-rocq
+    (let ((coq-eglot-server-args '("--foo")))
+      (with-installation '("rocq" "coqtop" "rocq-lsp" "coq-lsp")
+        (let ((exec-path (list bin)))
+          (should (equal (coq-eglot-lsp-rocq) (expand-file-name "rocq" bin)))
+          (should (equal (coq-eglot-lsp-server-command)
+                         (list (expand-file-name "rocq-lsp" bin) "--foo")))))
+      (with-installation '("coqtop" "coq-lsp")
+        (let ((exec-path (list bin)))
+          (should (equal (coq-eglot-lsp-rocq) (expand-file-name "coqtop" bin)))
+          (should (equal (coq-eglot-lsp-server-command)
+                         (list (expand-file-name "coq-lsp" bin) "--foo")))))
+      (with-installation '("coq-lsp")
+        (let ((lsp-bin bin))
+          (with-installation '("rocq")
+            (let ((exec-path (list bin lsp-bin)))
+              (should-error (coq-eglot-lsp-server-command) :type 'user-error)))))
+      (let ((exec-path nil))
+        (should-error (coq-eglot-lsp-rocq) :type 'user-error)))))
+
+(ert-deftest coq-eglot-server-of-link ()
+  "Through a link to a Rocq, the server next to its true name."
+  (with-installation '("rocq" "coq-lsp")
+    (let ((link (make-temp-file "coq-eglot-link-")))
+      (delete-file link)
+      (make-symbolic-link (expand-file-name "rocq" bin) link)
+      (unwind-protect
+          (should (equal (coq-eglot-lsp-server-program link)
+                         (expand-file-name "coq-lsp" bin)))
+        (delete-file link)))))
+
+(ert-deftest coq-eglot-user-rocq ()
+  "The Rocq set by the user in `coq-prog-name', locally or with
+customize, takes precedence over the one of `exec-path'."
+  (with-installation '("rocq" "coq-lsp")
+    (let ((exec-path (list bin))
+          (found (expand-file-name "rocq" bin)))
+      (with-installation '("coqtop" "coq-lsp")
+        (let ((user (expand-file-name "coqtop" bin)))
+          (without-user-rocq
+            (with-temp-buffer
+              (should (equal (coq-eglot-lsp-rocq) found))
+              (setq-local coq-prog-name user)
+              (should (equal (coq-eglot-lsp-user-rocq) user))
+              (should (equal (coq-eglot-lsp-rocq) user)))
+            (with-temp-buffer
+              ;; a global value not set by the user, like the one of PG
+              (let ((coq-prog-name user))
+                (should (equal (coq-eglot-lsp-rocq) found))
+                (put 'coq-prog-name 'customized-value (list user))
+                (should (equal (coq-eglot-lsp-rocq) user))))))))))
 
 (ert-deftest coq-eglot-strong-interrupt-option ()
   "The option --int_backend=Mp is added according to the OCaml version."
-  (with-programs '("coq-lsp")
-    (let ((coq-eglot-server-program '("coq-lsp")))
-      (cl-flet ((with-ocaml (version value)
-                  (cl-letf (((symbol-function 'coq-eglot-lsp--ocaml-version)
-                             (lambda (_) version)))
-                    (let ((coq-eglot-strong-interrupt value))
-                      (member "--int_backend=Mp" (coq-eglot-lsp--contact))))))
-        (should (with-ocaml "5.4.1" 'auto))
-        (should-not (with-ocaml "5.1.0" 'auto))
-        (should-not (with-ocaml nil 'auto))
-        (should (with-ocaml "5.1.0" t))
-        (should-not (with-ocaml "5.4.1" nil))))
-    ;; not added if the program already has the option
-    (let ((coq-eglot-server-program '("coq-lsp" "--int_backend=Coq"))
-          (coq-eglot-strong-interrupt t))
-      (should-not (member "--int_backend=Mp" (coq-eglot-lsp--contact))))))
+  (with-installation '("rocq" "coq-lsp")
+    (without-user-rocq
+      (let ((exec-path (list bin))
+            (coq-eglot-server-args nil))
+        (cl-flet ((with-ocaml (version value)
+                    (cl-letf (((symbol-function 'coq-eglot-lsp--ocaml-version)
+                               (lambda (_) version)))
+                      (let ((coq-eglot-strong-interrupt value))
+                        (member "--int_backend=Mp" (coq-eglot-lsp--contact))))))
+          (should (with-ocaml "5.4.1" 'auto))
+          (should-not (with-ocaml "5.1.0" 'auto))
+          (should-not (with-ocaml nil 'auto))
+          (should (with-ocaml "5.1.0" t))
+          (should-not (with-ocaml "5.4.1" nil))))
+      ;; not added if the arguments already have the option
+      (let ((exec-path (list bin))
+            (coq-eglot-server-args '("--int_backend=Coq"))
+            (coq-eglot-strong-interrupt t))
+        (should-not (member "--int_backend=Mp" (coq-eglot-lsp--contact)))))))
 
 (ert-deftest coq-eglot-ocaml-version-detection ()
   "The OCaml version of the server is the one of ocamlc next to it."

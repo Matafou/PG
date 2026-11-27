@@ -40,18 +40,18 @@ alternatives of each.  Needs no server."
             (rx symbol-start (or "eglot--" "jsonrpc--")) nil t)))))))
 
 (defmacro with-fake-server (output &rest body)
-  "Run BODY with the server `fake-server', printing OUTPUT with --version."
+  "Run BODY with the server `fake-server', printing OUTPUT with --version.
+The coq-lsp next to the Rocq found in `exec-path'."
   (declare (indent 1) (debug t))
-  `(let* ((fake-server (make-temp-file "fake-lsp" nil ".sh"))
-          (coq-eglot-lsp--server-versions (make-hash-table :test #'equal))
-          (coq-eglot-server-program (list fake-server)))
-     (unwind-protect
-         (progn
-           (with-temp-file fake-server
-             (insert "#!/bin/sh\n" ,output))
-           (set-file-modes fake-server #o755)
-           ,@body)
-       (delete-file fake-server))))
+  `(with-installation '("rocq")
+     (without-user-rocq
+       (let* ((fake-server (expand-file-name "coq-lsp" bin))
+              (exec-path (list bin))
+              (coq-eglot-lsp--server-versions (make-hash-table :test #'equal)))
+         (with-temp-file fake-server
+           (insert "#!/bin/sh\n" ,output))
+         (set-file-modes fake-server #o755)
+         ,@body))))
 
 (ert-deftest coq-eglot-server-version-check ()
   "A server older than the minimal version is refused before starting,
@@ -83,27 +83,42 @@ an unknown version is not."
         (coq-eglot-lsp--server-version fake-server)
         (should (= calls 1))))))
 
-(ert-deftest coq-eglot-load-path-server-program-args ()
-  "The -R and -Q of `coq-eglot-server-program' are not compared with
-the load path of the buffer."
+(ert-deftest coq-eglot-load-path-server-args ()
+  "The -R and -Q of `coq-eglot-server-args' are not compared with the
+load path of the buffer."
   (let ((process (make-process :name "fake-coq-lsp" :noquery t
                                :command '("sleep" "30" "-R" "a,A"
                                           "-Q" "b,B" "-R" "c,C")))
-        (coq-eglot-server-program '("sleep" "30" "-R" "a,A" "-Q" "b,B")))
+        (coq-eglot-server-args '("-R" "a,A" "-Q" "b,B")))
     (unwind-protect
         (cl-letf (((symbol-function 'jsonrpc--process) (lambda (_) process)))
           (should (equal (coq-eglot-lsp--server-load-path-args nil)
                          '("-R" "c,C")))
-          (let ((coq-eglot-server-program '("sleep" "30")))
+          (let ((coq-eglot-server-args nil))
             (should (equal (coq-eglot-lsp--server-load-path-args nil)
                            '("-R" "a,A" "-Q" "b,B" "-R" "c,C")))))
       (delete-process process))))
 
+(ert-deftest coq-eglot-load-path-same ()
+  "Without `coq-eglot-server-args', a server with the load path of the
+buffer has the same load path: no warning."
+  (let* ((dir (file-name-as-directory (make-temp-file "coq-eglot-lp-" t)))
+         (coq-load-path (list (list 'rec dir "Lib")))
+         (coq-eglot-server-args nil)
+         (args (coq-eglot-lsp-load-path-args))
+         (process (make-process :name "fake-coq-lsp" :noquery t
+                                :command (append '("sleep" "30") args))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'jsonrpc--process) (lambda (_) process)))
+          (should args)
+          (should (equal (coq-eglot-lsp--server-load-path-args nil) args)))
+      (delete-process process)
+      (delete-directory dir t))))
+
 (ert-deftest coq-eglot-load-path-invalid ()
   "An invalid `coq-load-path' is a user error naming it."
-  (let ((coq-eglot-server-program '("coq-lsp"))
-        (coq-load-path '(42)))
-    (with-programs '("coq-lsp")
+  (with-fake-server ""
+    (let ((coq-load-path '(42)))
       (let ((err (should-error (coq-eglot-lsp--contact nil (cons 'transient "/tmp/"))
                                :type 'user-error)))
         (should (string-match-p "coq-load-path" (cadr err)))))))

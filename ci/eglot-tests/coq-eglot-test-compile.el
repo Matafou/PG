@@ -59,10 +59,9 @@ libraries loaded by the previous tests."
     (should (compiled-p "eglot_compile_b"))
     (should (compiled-p "eglot_compile_c"))
     (should-not (compiled-p "eglot_compile_bad"))
-    ;; the compiler is the one of the server
+    ;; the compiler is the one of the Rocq of the buffer
     (should (equal (file-name-directory coq-compiler)
-                   (file-name-directory
-                    (executable-find (car (coq-eglot-lsp-server-command))))))))
+                   (file-name-directory (coq-eglot-lsp-rocq))))))
 
 (ert-deftest coq-eglot-no-implicit-root-load-path ()
   "Without project file, the server does not recursively bind its root."

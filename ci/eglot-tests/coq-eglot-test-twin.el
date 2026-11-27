@@ -120,14 +120,12 @@ response buffers are killed.  Killing a twin unpairs."
       (should-not (get-buffer "*goals*<eglot_other.v>")))))
 
 (ert-deftest coq-eglot-twin-server-label ()
-  "The mode line shows the opam switch of the server of a twin."
-  (should (equal (coq-eglot-servers-label
-                  "/home/u/.opam/rocq-9.2/bin/coq-lsp")
+  "The mode line shows the opam switch of the Rocq of a twin."
+  (should (equal (coq-eglot-servers-label "/home/u/.opam/rocq-9.2/bin/rocq")
                  "rocq-9.2"))
-  (should (equal (coq-eglot-servers-label "/p/proj/_opam/bin/rocq-lsp")
-                 "proj"))
-  (should (equal (coq-eglot-servers-label "/usr/bin/coq-lsp") "coq-lsp"))
-  (should (equal (coq-eglot-servers-label "coq-lsp") "coq-lsp")))
+  (should (equal (coq-eglot-servers-label "/p/proj/_opam/bin/rocq") "proj"))
+  (should (equal (coq-eglot-servers-label "/usr/bin/coqtop") "coqtop"))
+  (should (equal (coq-eglot-servers-label "rocq") "rocq")))
 
 (ert-deftest coq-eglot-twin-other-rocq ()
   "A twin in another project checked by another Rocq: the Rocq of its
@@ -136,33 +134,33 @@ _CoqProject, eglot_test.v is in another project."
   (skip-unless (executable-find "opam"))
   (let ((twin nil))
     (with-test-file
-      (let ((server (other-server))
+      (let ((rocq (other-rocq))
             (program (coq-eglot-lsp--program-file
                       (car (coq-eglot-lsp-server-command)))))
-        (skip-unless server)
+        (skip-unless rocq)
         (unwind-protect
             (progn
               (setq twin (find-file-noselect
                           (expand-file-name "eglot_compile_c.v"
                                             compile-directory)))
               (coq-eglot-twin-pair twin)
-              (coq-eglot-twin-set-rocq server)
+              (coq-eglot-twin-set-rocq rocq)
               (with-current-buffer twin
-                (should (equal (coq-eglot-lsp-project-server
+                (should (equal (coq-eglot-lsp-project-rocq
                                 (cons 'transient compile-directory))
-                               server))
-                (should-not coq-eglot-lsp-own-server)
+                               rocq))
+                (should-not coq-eglot-lsp-own-rocq)
                 ;; its server connects without waiting
                 (should (wait-until #'coq-eglot-lsp-current-server 10))
-                (should (equal (server-program) (file-truename (car server))))
+                (should (equal (server-program) (server-of rocq)))
                 (should (string-search
-                         (format "[%s]" (coq-eglot-servers-label (car server)))
+                         (format "[%s]" (coq-eglot-servers-label rocq))
                          (coq-eglot--lighter)))
                 (run #'coq-eglot-process-buffer)
                 (should (string-match-p
                          (format "/%s/lib/"
                                  (regexp-quote
-                                  (coq-eglot-servers-label (car server))))
+                                  (coq-eglot-servers-label rocq)))
                          (car (lsp-query
                                (point-max)
                                "Locate Library Corelib.Init.Prelude.")))))
@@ -174,10 +172,10 @@ _CoqProject, eglot_test.v is in another project."
               ;; unpaired, the project of the twin keeps its Rocq
               (coq-eglot-twin-unpair)
               (with-current-buffer twin
-                (should (equal (coq-eglot-lsp-server-command) server))
+                (should (equal (coq-eglot-lsp-rocq) rocq))
                 (should-not (string-search "[" (coq-eglot--lighter)))))
-          (coq-eglot-lsp-set-project-server (cons 'transient compile-directory)
-                                            nil)
+          (coq-eglot-lsp-set-project-rocq (cons 'transient compile-directory)
+                                          nil)
           (when (buffer-live-p twin)
             (with-current-buffer twin
               ;; the next tests of compile/ use the current switch

@@ -59,38 +59,39 @@ See the comment above for what to check when Eglot changes.")
   "Coq backend using a language server through Eglot."
   :group 'coq-mode)
 
-(defcustom coq-eglot-server-program nil
-  "Command line running the Coq language server.
-A list of strings: the program and its arguments.  If nil, use the
-first of rocq-lsp and coq-lsp found in `exec-path'.  Only coq-lsp
-(renamed rocq-lsp) is supported.  Use an absolute file name to use the
-server of a given opam switch."
-  :type '(choice (const :tag "rocq-lsp or coq-lsp, found in exec-path" nil)
-                 (repeat :tag "Command line" string)))
+;; The Rocq of a buffer designates an installation of Rocq: its program
+;; rocq (or coqtop), like `coq-prog-name' for Proof General.  The
+;; language server is the rocq-lsp or coq-lsp next to it.
+
+(defcustom coq-eglot-server-args nil
+  "Arguments of the Coq language server, a list of strings.
+Added to those Proof General gives.  The server is the rocq-lsp or
+coq-lsp next to the Rocq program, see `coq-eglot-lsp-rocq'."
+  :type '(repeat string))
 
 (defconst coq-eglot-lsp--program-names '("rocq-lsp" "coq-lsp")
   "Names of the server program, tried in this order.")
 
-(defvar coq-eglot-lsp--project-servers (make-hash-table :test #'equal)
-  "Command lines of the servers of the projects, by project.
+(defvar coq-eglot-lsp--project-rocqs (make-hash-table :test #'equal)
+  "Rocq programs of the projects, by project, absolute file names.
 A project is checked by one Rocq for the session: the one chosen, see
-`coq-eglot-lsp-set-project-server', or else the one of its first server
-that started, see `coq-eglot-lsp--fix-server'.  Until then, its server
-is the one of `coq-eglot-server-program' or of `exec-path', which may
-still change, like with an opam switch.  They take precedence over
-`coq-eglot-server-program', even when set by a .dir-locals.el file.")
+`coq-eglot-lsp-set-project-rocq', or else the one of its first server
+that started, see `coq-eglot-lsp--fix-rocq'.  Until then, its Rocq is
+the one of `coq-prog-name' or of `exec-path', which may still change,
+like with an opam switch.  They take precedence over `coq-prog-name',
+even when set by a .dir-locals.el file.")
 
 (defvar coq-eglot-lsp--starting (make-hash-table :test #'equal)
-  "Command lines of the servers starting, by project.
-See `coq-eglot-lsp--fix-server'.")
+  "Rocq programs of the servers starting, by project.
+See `coq-eglot-lsp--fix-rocq'.")
 
-(defvar-local coq-eglot-lsp-own-server nil
-  "Command line of a server of the current buffer alone, or nil.
+(defvar-local coq-eglot-lsp-own-rocq nil
+  "Rocq program of a server of the current buffer alone, or nil.
 If non-nil, the buffer does not share the server of its project: it has
 a project of its own, with the same root, see `coq-eglot-lsp-project'.
 Its server is started in the same directory and reads the same project
 file.  Set by the twins, see `coq-eglot-twin-set-rocq'.")
-(put 'coq-eglot-lsp-own-server 'permanent-local t)
+(put 'coq-eglot-lsp-own-rocq 'permanent-local t)
 
 (defun coq-eglot-lsp--shared-project (dir)
   "Project of the current Coq buffer, in DIR, shared by its other files.
@@ -109,7 +110,7 @@ it is a project of its own, (coq-eglot-file FILE DIR).  See
 (defun coq-eglot-lsp-project-id ()
   "Project of the current buffer, shared by the other files of the project.
 Even if the buffer has a server of its own, see
-`coq-eglot-lsp-own-server'.  Two buffers are in the same project if
+`coq-eglot-lsp-own-rocq'.  Two buffers are in the same project if
 their projects are `equal'."
   (coq-eglot-lsp--shared-project default-directory))
 
@@ -126,78 +127,101 @@ Its root directory, or the file if it is isolated."
         (file-name-nondirectory (nth 1 project))
       (abbreviate-file-name (project-root project)))))
 
-(defun coq-eglot-lsp-project-server (&optional project)
-  "Command line of the server of PROJECT for the session, or nil.
+(defun coq-eglot-lsp-project-rocq (&optional project)
+  "Rocq program of PROJECT for the session, or nil.
 PROJECT defaults to the one of the current buffer.  Chosen, or fixed by
-its first server, see `coq-eglot-lsp--project-servers'."
+its first server, see `coq-eglot-lsp--project-rocqs'."
   (gethash (or project (coq-eglot-lsp-project-id))
-           coq-eglot-lsp--project-servers))
+           coq-eglot-lsp--project-rocqs))
 
-(defun coq-eglot-lsp-set-project-server (project command)
-  "Make COMMAND the command line of the server of PROJECT.
+(defun coq-eglot-lsp-set-project-rocq (project rocq)
+  "Make ROCQ the Rocq program of PROJECT.
 See `coq-eglot-lsp-project-id'.  For this session, for all its buffers
-but those with a server of their own, see `coq-eglot-lsp-own-server'.
+but those with a server of their own, see `coq-eglot-lsp-own-rocq'.
 Nil forgets the choice.  The running server does not change: stop it
 first."
-  (if command
-      (puthash project command coq-eglot-lsp--project-servers)
-    (remhash project coq-eglot-lsp--project-servers)))
+  (if rocq
+      (puthash project rocq coq-eglot-lsp--project-rocqs)
+    (remhash project coq-eglot-lsp--project-rocqs)))
 
-(defun coq-eglot-lsp--absolute-command (command)
-  "COMMAND with the absolute file name of its program, if found.
-Not its true name: the other programs of Rocq are next to it."
-  (cons (or (executable-find (car command)) (car command)) (cdr command)))
+(defun coq-eglot-lsp-user-rocq ()
+  "The Rocq program set by the user, `coq-prog-name', or nil.
+Nil if it is not set by the user, see `coq--user-set-p': then the Rocq
+is found in `exec-path'."
+  ;; Once coq-prog-name is nil by default, meaning "found in exec-path",
+  ;; this is just coq-prog-name.
+  (and (coq--user-set-p 'coq-prog-name) coq-prog-name))
 
+(defun coq-eglot-lsp-default-rocq ()
+  "Rocq program of the project of the current buffer, an absolute file name.
+The one of the project for the session, or the one set by the user, see
+`coq-eglot-lsp-user-rocq', or the one found in `exec-path', see
+`coq-autodetect-progname'.  It ignores `coq-eglot-lsp-own-rocq'.
+Signal a user error if not found."
+  (let ((rocq (or (coq-eglot-lsp-project-rocq)
+                  (coq-eglot-lsp-user-rocq)
+                  (coq-autodetect-progname))))
+    (or (executable-find rocq)
+        (user-error "Coq: Rocq program %s not found, see `coq-prog-name'"
+                    rocq))))
 
-(defun coq-eglot-lsp-project-command ()
-  "Command line of the server of the project of the current buffer.
-The one of the project for the session, or `coq-eglot-server-program',
-or the program found in `exec-path'.  It ignores
-`coq-eglot-lsp-own-server'.  Signal an error if not found."
-  (let ((coq-eglot-lsp-own-server nil))
-    (coq-eglot-lsp-server-command)))
+(defun coq-eglot-lsp-rocq ()
+  "Rocq program of the current buffer, an absolute file name.
+The one of its server alone, `coq-eglot-lsp-own-rocq', or the one of
+its project, see `coq-eglot-lsp-default-rocq'.  Signal a user error if
+not found."
+  (if coq-eglot-lsp-own-rocq
+      (or (executable-find coq-eglot-lsp-own-rocq)
+          (user-error "Coq: Rocq program %s not found"
+                      coq-eglot-lsp-own-rocq))
+    (coq-eglot-lsp-default-rocq)))
 
 (defun coq-eglot-lsp--program-file (program)
   "True name of the executable PROGRAM, or PROGRAM if not found."
   (let ((file (executable-find program)))
     (if file (file-truename file) program)))
 
-(defun coq-eglot-lsp-same-server-p (command1 command2)
-  "Non-nil if the command lines COMMAND1 and COMMAND2 run the same server.
-The same executable, even through other names, with the same arguments.
-Nil if one of them is nil, like a server not found."
-  (and command1 command2
-       (equal (coq-eglot-lsp--program-file (car command1))
-              (coq-eglot-lsp--program-file (car command2)))
-       (equal (cdr command1) (cdr command2))))
+(defun coq-eglot-lsp-same-rocq-p (rocq1 rocq2)
+  "Non-nil if the Rocq programs ROCQ1 and ROCQ2 are the same.
+The same executable, even through other names.  Nil if one of them is
+nil, like a Rocq not found."
+  (and rocq1 rocq2
+       (equal (coq-eglot-lsp--program-file rocq1)
+              (coq-eglot-lsp--program-file rocq2))))
 
 (defun coq-eglot-lsp-foreign-p ()
-  "Non-nil if the server of the current buffer is not the one of its project.
-Its Rocq may be another one: it cannot load the libraries compiled for
-the project.  See `coq-eglot-lsp-own-server'."
-  (and coq-eglot-lsp-own-server
-       (not (coq-eglot-lsp-same-server-p
-             coq-eglot-lsp-own-server
-             (ignore-errors (coq-eglot-lsp-project-command))))))
+  "Non-nil if the Rocq of the current buffer is not the one of its project.
+It cannot load the libraries compiled for the project.  See
+`coq-eglot-lsp-own-rocq'."
+  (and coq-eglot-lsp-own-rocq
+       (not (coq-eglot-lsp-same-rocq-p
+             coq-eglot-lsp-own-rocq
+             (ignore-errors (coq-eglot-lsp-default-rocq))))))
+
+(defun coq-eglot-lsp-server-program (rocq)
+  "The language server of the Rocq program ROCQ, or nil.
+The first of rocq-lsp and coq-lsp in its directory, or else in the
+directory of its true name, like when ROCQ is a link."
+  (seq-some (lambda (file)
+              (let ((bin (file-name-directory file)))
+                (and bin
+                     (seq-find #'file-executable-p
+                               (mapcar (lambda (name)
+                                         (expand-file-name name bin))
+                                       coq-eglot-lsp--program-names)))))
+            (list rocq (file-truename rocq))))
 
 (defun coq-eglot-lsp-server-command ()
-  "Command line of the server, a list of strings.
-The server of the buffer alone, `coq-eglot-lsp-own-server', or the one
-of its project for the session, see `coq-eglot-lsp--project-servers',
-or `coq-eglot-server-program', or the program found in `exec-path'.
-Signal an error if the program is not found."
-  (let ((command (or coq-eglot-lsp-own-server
-                     (coq-eglot-lsp-project-server)
-                     coq-eglot-server-program
-                     (list (or (seq-find #'executable-find
-                                         coq-eglot-lsp--program-names)
-                               (user-error "Coq language server not found \
-in exec-path: install coq-lsp (opam install coq-lsp), or set \
-`coq-eglot-server-program'"))))))
-    (unless (executable-find (car command))
-      (user-error "Coq language server %s not found, see \
-`coq-eglot-server-program'" (car command)))
-    command))
+  "Command line of the server of the current buffer, a list of strings.
+The language server of its Rocq, see `coq-eglot-lsp-rocq' and
+`coq-eglot-lsp-server-program', with `coq-eglot-server-args'.  Signal a
+user error if not found."
+  (let ((rocq (coq-eglot-lsp-rocq)))
+    (cons (or (coq-eglot-lsp-server-program rocq)
+              (user-error "Coq: no language server (rocq-lsp or coq-lsp) \
+next to %s: install coq-lsp for this Rocq, or choose another one, see \
+`coq-prog-name'" rocq))
+          coq-eglot-server-args)))
 
 (defcustom coq-eglot-server-idle-delay 0.01
   "Seconds the server waits when idle before looking for requests.
@@ -303,21 +327,21 @@ See `coq-eglot-strong-interrupt'."
 (defclass coq-eglot-lsp-server (eglot-lsp-server) ()
   :documentation "Coq language server (coq-lsp).")
 
-(defun coq-eglot-lsp--fix-server (server)
-  "Fix the server of the project of SERVER for the session, if not yet.
+(defun coq-eglot-lsp--fix-rocq (server)
+  "Fix the Rocq of the project of SERVER for the session, if not yet.
 To the one of SERVER, which started: later changes of `exec-path', like
 another opam switch, do not change it.  A function of
-`eglot-connect-hook'.  See `coq-eglot-lsp--project-servers'."
+`eglot-connect-hook'.  See `coq-eglot-lsp--project-rocqs'."
   (when (cl-typep server 'coq-eglot-lsp-server)
     (let* ((project (eglot--project server))
-           (command (gethash project coq-eglot-lsp--starting)))
+           (rocq (gethash project coq-eglot-lsp--starting)))
       (remhash project coq-eglot-lsp--starting)
-      (when (and command
+      (when (and rocq
                  (not (eq (car-safe project) 'coq-eglot-own))
-                 (not (gethash project coq-eglot-lsp--project-servers)))
-        (puthash project command coq-eglot-lsp--project-servers)))))
+                 (not (gethash project coq-eglot-lsp--project-rocqs)))
+        (puthash project rocq coq-eglot-lsp--project-rocqs)))))
 
-(add-hook 'eglot-connect-hook #'coq-eglot-lsp--fix-server)
+(add-hook 'eglot-connect-hook #'coq-eglot-lsp--fix-rocq)
 
 (defun coq-eglot-lsp--options ()
   "Options of coq-lsp, as a plist."
@@ -391,14 +415,15 @@ options."
 
 (defun coq-eglot-lsp--server-load-path-args (server)
   "Options -R and -Q of the command line of SERVER.
-Without those of `coq-eglot-server-program', which come first: they are
+Without those of `coq-eglot-server-args', which come first: they are
 the same for all the files."
   (let ((process (jsonrpc--process server)))
     (and (processp process)
          (let* ((args (coq-eglot-lsp-load-path-args
                        (cdr (process-command process))))
-                (own (coq-eglot-lsp-load-path-args
-                      (cdr coq-eglot-server-program))))
+                (own (and coq-eglot-server-args
+                          (coq-eglot-lsp-load-path-args
+                           coq-eglot-server-args))))
            (if (equal (seq-take args (length own)) own)
                (nthcdr (length own) args)
              args)))))
@@ -438,10 +463,10 @@ project file it finds in its root directory, if any.  The project
 argument is unused here: Eglot starts the server in its root, where
 coq-lsp finds the project file.  Without one, no recursive load path is
 guessed: an implicit -R of the root may scan an arbitrarily large tree."
+  (coq-eglot-lsp--ask-rocq)
   (let* ((command (coq-eglot-lsp-server-command))
-         (_ (unless coq-eglot-lsp-own-server
-              (puthash (coq-eglot-lsp-project-id)
-                       (coq-eglot-lsp--absolute-command command)
+         (_ (unless coq-eglot-lsp-own-rocq
+              (puthash (coq-eglot-lsp-project-id) (coq-eglot-lsp-rocq)
                        coq-eglot-lsp--starting)))
          (buffer-args
           (condition-case err
@@ -458,11 +483,28 @@ guessed: an implicit -R of the root may scan an arbitrarily large tree."
                                   coq-eglot-server-idle-delay)))
                   (when (and (not (seq-some
                                    (lambda (arg) (string-prefix-p "--int_backend" arg))
-                                   command))
+                                   coq-eglot-server-args))
                              (coq-eglot-lsp--strong-interrupt-p (car command)))
                     (list "--int_backend=Mp"))))))
 
 (add-to-list 'eglot-server-programs '(coq-mode . coq-eglot-lsp--contact))
+
+(declare-function coq-eglot-servers-read "coq-eglot-servers")
+
+(defun coq-eglot-lsp--ask-rocq ()
+  "Ask the Rocq of the project of the current buffer, if needed.
+If `proof-prog-name-ask' is non-nil and the Rocq of the project is not
+yet chosen nor fixed, see `coq-eglot-lsp-project-rocq': the answer is
+the Rocq of the project for the session.  Not for a buffer with a
+server of its own, see `coq-eglot-lsp-own-rocq'."
+  (when (and (bound-and-true-p proof-prog-name-ask)
+             (not coq-eglot-lsp-own-rocq)
+             (not (coq-eglot-lsp-project-rocq)))
+    (coq-eglot-lsp-set-project-rocq
+     (coq-eglot-lsp-project-id)
+     (coq-eglot-servers-read
+      (format "Rocq of %s: " (coq-eglot-lsp-project-name))
+      (ignore-errors (coq-eglot-lsp-default-rocq))))))
 
 (defun coq-eglot-lsp-project (dir)
   "Return the project of a Coq file in DIR, for `project-find-functions'.
@@ -473,14 +515,14 @@ Otherwise, or if `coq-use-project-file' is nil, the file is isolated:
 it is a project of its own, with a server of its own started in DIR.
 The server reads no project file, unless DIR has one, see
 `coq-eglot-lsp-check-load-path'.  If the buffer has a server of its
-own, see `coq-eglot-lsp-own-server', a project of its own too, with the
+own, see `coq-eglot-lsp-own-rocq', a project of its own too, with the
 same root.  Only in Coq buffers, see `coq-eglot-mode'."
   (let ((shared (coq-eglot-lsp--shared-project dir)))
     (cond
      ;; another buffer: only the projects of the project files
      ((not (derived-mode-p 'coq-mode))
       (and (eq (car shared) 'transient) shared))
-     (coq-eglot-lsp-own-server
+     (coq-eglot-lsp-own-rocq
       (list 'coq-eglot-own shared (or buffer-file-name (buffer-name))))
      (t shared))))
 
@@ -497,7 +539,7 @@ same root.  Only in Coq buffers, see `coq-eglot-mode'."
 The server forgets the document.  It stops if no other buffer uses it.
 The next request starts or finds the server of the buffer again, see
 `coq-eglot-lsp-connect': call it after changing the server of the
-buffer, see `coq-eglot-lsp-own-server'."
+buffer, see `coq-eglot-lsp-own-rocq'."
   (coq-eglot-lsp--forget-waiting)
   (coq-eglot-lsp--reset-scheduler)
   (let ((server (coq-eglot-lsp-current-server)))

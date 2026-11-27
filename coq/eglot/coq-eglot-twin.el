@@ -131,10 +131,8 @@ sets PLACE to nil first."
 See `coq-eglot--twin-label'."
   (setq coq-eglot--twin-label
         (ignore-errors
-          (let ((program (car (coq-eglot-lsp-server-command))))
-            ;; found in exec-path: its opam switch
-            (coq-eglot-servers-label (or (executable-find program)
-                                         program)))))
+          ;; an absolute file name: its opam switch
+          (coq-eglot-servers-label (coq-eglot-lsp-rocq))))
   (force-mode-line-update))
 
 (defun coq-eglot-twin--candidates ()
@@ -205,7 +203,7 @@ one server, see Two Servers in the menu"
 ;; have two servers, which check them at the same time.  Twins in the
 ;; same project share its server, which checks them one after the
 ;; other.  Then OTHER, the twin with an output of its own, may get a
-;; server of its own, see `coq-eglot-lsp-own-server': with the same
+;; server of its own, see `coq-eglot-lsp-own-rocq': with the same
 ;; Rocq, faster but one more server in memory, see
 ;; `coq-eglot-twin-toggle-two-servers'; or with another Rocq, if it
 ;; requires no library of the project, compiled by the Rocq of the
@@ -218,23 +216,22 @@ Then they share its server, unless OTHER has one of its own."
   (equal (with-current-buffer this (coq-eglot-lsp-project-id))
          (with-current-buffer other (coq-eglot-lsp-project-id))))
 
-(defun coq-eglot-twin--set-own-server (command)
-  "Give the current buffer, a twin, a server of its own running COMMAND.
-Or share again the server of its project if COMMAND is nil.  Confirm if
-its proof position goes back to its beginning.  Do nothing if it
-already has this server."
-  (unless (if command
-              (and coq-eglot-lsp-own-server
-                   (coq-eglot-lsp-same-server-p command coq-eglot-lsp-own-server))
-            (null coq-eglot-lsp-own-server))
+(defun coq-eglot-twin--set-own-server (rocq)
+  "Give the current buffer, a twin, a server of its own with ROCQ.
+ROCQ is a Rocq program.  Or share again the server of its project if
+ROCQ is nil.  Confirm if its proof position goes back to its beginning.
+Do nothing if it already has this server."
+  (unless (if rocq
+              (coq-eglot-lsp-same-rocq-p rocq coq-eglot-lsp-own-rocq)
+            (null coq-eglot-lsp-own-rocq))
     (coq-eglot-servers-confirm-restart
      (list (current-buffer))
-     (or command (coq-eglot-lsp-project-command)))
+     (or rocq (coq-eglot-lsp-default-rocq)))
     (coq-eglot-change-server
-     (lambda () (setq coq-eglot-lsp-own-server command)))))
+     (lambda () (setq coq-eglot-lsp-own-rocq rocq)))))
 
-(defun coq-eglot-twin--check-requires (buffer command)
-  "Signal a user error if BUFFER cannot be checked by server COMMAND.
+(defun coq-eglot-twin--check-requires (buffer rocq)
+  "Signal a user error if BUFFER cannot be checked by ROCQ.
 In the project of its twin, another Rocq than the one of the project
 cannot load its libraries, see `coq-eglot-compile-local-requires'."
   (with-current-buffer buffer
@@ -243,17 +240,17 @@ cannot load its libraries, see `coq-eglot-compile-local-requires'."
 they are compiled for the Rocq of the project, %s cannot load them.  \
 Change the Rocq of the whole project instead, see `coq-eglot-set-rocq'"
                   (buffer-name) (line-number-at-pos (car require))
-                  (coq-eglot-servers-label (car command))))))
+                  (coq-eglot-servers-label rocq)))))
 
-(defun coq-eglot-twin-set-rocq (command &optional buffer)
-  "Check BUFFER, a twin, with server COMMAND.
+(defun coq-eglot-twin-set-rocq (rocq &optional buffer)
+  "Check BUFFER, a twin, with ROCQ, a Rocq program.
 BUFFER defaults to the twin with an output of its own.  In another
 project than its twin, the Rocq of its project changes, see
 `coq-eglot-set-rocq'.  In the same project, it gets a server of its
 own, see `coq-eglot-twin--set-own-server': with another Rocq, only if
 it requires no library of the project.  Choosing the Rocq of the
 project again, it shares its server again, unless Two Servers is on,
-see `coq-eglot-twin-toggle-two-servers'.  Interactively, ask COMMAND
+see `coq-eglot-twin-toggle-two-servers'.  Interactively, ask ROCQ
 among the candidates, see `coq-eglot-servers-candidates'."
   (interactive
    (let ((twin (coq-eglot-twin--twins-other
@@ -263,8 +260,9 @@ among the candidates, see `coq-eglot-servers-candidates'."
      (list (with-current-buffer twin
              (coq-eglot-servers-read
               (format "Rocq of %s: " (buffer-name twin))
-              (ignore-errors (coq-eglot-lsp-server-command))))
+              (ignore-errors (coq-eglot-lsp-rocq))))
            twin)))
+  (coq-eglot-servers-check rocq)
   (let* ((twins (buffer-local-value
                  'coq-eglot-twin--twins
                  (or buffer (car (coq-eglot-twin--script-and-twin)))))
@@ -274,26 +272,25 @@ among the candidates, see `coq-eglot-servers-candidates'."
     (cond
      ((not (coq-eglot-twin--same-project-p this other))
       (with-current-buffer buffer
-        (coq-eglot-servers-set-project-rocq command)))
+        (coq-eglot-servers-set-project-rocq rocq)))
      ;; THIS shares the server of the project: the Rocq of the project
      ((eq buffer this)
       (with-current-buffer this
-        (coq-eglot-servers-set-project-rocq command)))
-     ((coq-eglot-lsp-same-server-p
-       command (with-current-buffer other (coq-eglot-lsp-project-command)))
+        (coq-eglot-servers-set-project-rocq rocq)))
+     ((coq-eglot-lsp-same-rocq-p
+       rocq (with-current-buffer other (coq-eglot-lsp-default-rocq)))
       (with-current-buffer other
         (coq-eglot-twin--set-own-server
-         (and (coq-eglot-twin--twins-two-servers twins) command))))
+         (and (coq-eglot-twin--twins-two-servers twins) rocq))))
      (t
-      (coq-eglot-twin--check-requires other command)
+      (coq-eglot-twin--check-requires other rocq)
       (with-current-buffer other
-        (coq-eglot-twin--set-own-server command))))
+        (coq-eglot-twin--set-own-server rocq))))
     (with-current-buffer buffer
       (message "Coq: %s is checked by %s%s"
                (buffer-name)
-               (coq-eglot-servers-describe
-                (coq-eglot-servers-label (car command)) (car command))
-               (if coq-eglot-lsp-own-server ", with a server of its own" "")))))
+               (coq-eglot-servers-describe (coq-eglot-servers-label rocq) rocq)
+               (if coq-eglot-lsp-own-rocq ", with a server of its own" "")))))
 
 (defun coq-eglot-twin-toggle-two-servers ()
   "Give the twin a server of its own, or share the server of its project.
@@ -318,8 +315,8 @@ a server of its own" (buffer-name)))
             (setf (coq-eglot-twin--twins-two-servers twins) nil)
             (message "Coq: the twins share one server, which checks them \
 one after the other"))
-        (unless coq-eglot-lsp-own-server
-          (coq-eglot-twin--set-own-server (coq-eglot-lsp-project-command)))
+        (unless coq-eglot-lsp-own-rocq
+          (coq-eglot-twin--set-own-server (coq-eglot-lsp-default-rocq)))
         (setf (coq-eglot-twin--twins-two-servers twins) t)
         (message "Coq: %s has a server of its own: the twins are checked \
 at the same time, one more server uses memory" (buffer-name))))))
@@ -329,7 +326,7 @@ at the same time, one more server uses memory" (buffer-name))))))
   (let ((twins coq-eglot-twin--twins))
     (and twins
          (buffer-live-p (coq-eglot-twin--twins-other twins))
-         (buffer-local-value 'coq-eglot-lsp-own-server
+         (buffer-local-value 'coq-eglot-lsp-own-rocq
                              (coq-eglot-twin--twins-other twins))
          t)))
 
@@ -343,8 +340,8 @@ See `coq-eglot-twin-set-rocq'."
         (list ["No twin" ignore :active nil])
       (with-current-buffer other
         (coq-eglot-servers-menu-items
-         (ignore-errors (coq-eglot-lsp-server-command))
-         (lambda (command) (coq-eglot-twin-set-rocq command other)))))))
+         (ignore-errors (coq-eglot-lsp-rocq))
+         (lambda (rocq) (coq-eglot-twin-set-rocq rocq other)))))))
 
 (defun coq-eglot-twin--forget (buffer)
   "Forget the twin of BUFFER, in BUFFER only."
@@ -374,12 +371,12 @@ buffers of its output are killed."
       (with-current-buffer side
         (coq-eglot-share-output)
         ;; the exception of the twins: back to the server of its project
-        (when coq-eglot-lsp-own-server
+        (when coq-eglot-lsp-own-rocq
           (if (eq side coq-eglot-twin--dying)
               ;; its own server stops with it
               (coq-eglot-lsp-detach)
             (coq-eglot-change-server
-             (lambda () (setq coq-eglot-lsp-own-server nil)))
+             (lambda () (setq coq-eglot-lsp-own-rocq nil)))
             (message "Coq: %s is checked again by the server of its project"
                      (buffer-name))))))
     (coq-eglot-twin--stop-alignment buffer)
