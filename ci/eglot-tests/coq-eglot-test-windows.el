@@ -16,19 +16,9 @@
                            (file-name-directory
                             (or load-file-name buffer-file-name))))
 
-(ert-deftest coq-eglot-allocate-heights ()
-  "Windows get the height they need by priority, the first one the rest."
-  ;; enough for everybody
-  (should (equal (coq-eglot--allocate-heights 30 '(5 6 4) 4) '(20 6 4)))
-  ;; the first one takes what it needs, the others their minimum
-  (should (equal (coq-eglot--allocate-heights 30 '(40 6 4) 4) '(22 4 4)))
-  (should (equal (coq-eglot--allocate-heights 30 '(10 40 4) 4) '(10 16 4)))
-  ;; too small
-  (should-not (coq-eglot--allocate-heights 10 '(5 6 4) 4)))
-
 (ert-deftest coq-eglot-resize-windows ()
-  "The response window gets the height it needs, the goals window the
-rest, like with `coq-optimise-resp-windows-enable' in Proof General."
+  "The response window gets the height it needs, the goals window above
+it the rest, like in Proof General, see `proof-fit-output-windows'."
   (with-test-file
     (with-layout t 'hybrid
       (goto-marker "split")
@@ -38,26 +28,27 @@ rest, like with `coq-optimise-resp-windows-enable' in Proof General."
             (response (get-buffer-window "*response*")))
         (should (and goals response))
         (should (= (window-total-height response)
-                   (max window-min-height (coq-eglot--window-need response))))
-        (should (> (window-total-height goals) (coq-eglot--window-need goals)))))))
+                   (max window-min-height (proof-window-need response))))
+        (should (> (window-total-height goals) (proof-window-need goals)))))))
 
 (ert-deftest coq-eglot-resize-windows-off ()
-  "Without `coq-optimise-resp-windows-enable', the heights of the windows
-do not change."
+  "Without `proof-shrink-windows-tofit', the heights of the windows do
+not change."
   (with-test-file
-    (with-layout t 'vertical
-      (let ((coq-optimise-resp-windows-enable nil)
+    (with-layout t 'hybrid
+      (let ((proof-shrink-windows-tofit nil)
             (calls 0))
-        (cl-letf (((symbol-function 'coq-eglot-resize-windows-by-priority)
-                   (lambda () (setq calls (1+ calls)))))
+        (cl-letf (((symbol-function 'proof-resize-output-column)
+                   (lambda (&rest _) (setq calls (1+ calls)))))
           (goto-marker "split")
           (run #'coq-eglot-goto-point)
           (query #'coq-eglot-run-query "Check double"))
         (should (= calls 0))))))
 
 (ert-deftest coq-eglot-resize-windows-split ()
-  "With split goals, the conclusion gets its height first, and the rest,
-the hypotheses and the response window the height they need."
+  "With split goals, the hypotheses, the conclusion and the response
+windows share their height, each one getting what it needs if they fit.
+With a lower weight, the hypotheses never get more than they need."
   (with-test-file
     (unwind-protect
         (progn
@@ -72,13 +63,15 @@ the hypotheses and the response window the height they need."
             ;; (batch mode ignores the display property in this
             ;; computation)
             (should (>= (window-total-height conclusion)
-                        (coq-eglot--window-need conclusion)))
-            ;; the hypotheses: never more than they need
-            (should (= (window-total-height goals)
-                       (max window-min-height (coq-eglot--window-need goals))))
+                        (proof-window-need conclusion)))
+            (should (>= (window-total-height goals)
+                        (max window-min-height (proof-window-need goals))))
             (should (= (window-total-height response)
-                       (max window-min-height
-                            (coq-eglot--window-need response))))))
+                       (max window-min-height (proof-window-need response))))
+            (let ((proof-output-windows-weights '((hypotheses . 0.5))))
+              (coq-eglot--resize-windows))
+            (should (= (window-total-height goals)
+                       (max window-min-height (proof-window-need goals))))))
       (setq coq-eglot-split-goals nil)
       (let ((buffer (get-buffer "*conclusion*")))
         (when buffer
@@ -151,7 +144,7 @@ even when the messages window is higher."
     (with-layout t 'hybrid
       (goto-marker "split")
       (run #'coq-eglot-goto-point)
-      (let ((coq-optimise-resp-windows-enable nil))
+      (let ((proof-shrink-windows-tofit nil))
         (pcase-let ((`(,goals ,response)
                      (windows-of "*goals*" "*response*")))
           (window-resize goals (- window-min-height (window-total-height goals)))
@@ -317,45 +310,25 @@ deleted, and comes back with some content."
         (should (get-buffer-window "*response*"))))))
 
 (ert-deftest coq-eglot-shrink-windows-tofit ()
-  "With `proof-shrink-windows-tofit', the windows below the script get
-the height they need, the script window the rest."
+  "With `proof-shrink-windows-tofit', the script window keeps its height,
+the goals and response windows below it share theirs."
   (with-test-file
     (with-layout t 'vertical
       (let ((proof-shrink-windows-tofit t)
-            (coq-optimise-resp-windows-enable nil)
             (script (selected-window)))
         (goto-marker "split")
         (run #'coq-eglot-goto-point)
-        (pcase-let ((`(,goals ,response) (windows-of "*goals*" "*response*")))
-          (should (= (window-total-height goals)
-                     (max window-min-height (coq-eglot--window-need goals))))
-          (should (= (window-total-height response) window-min-height))
-          (should (> (window-total-height script)
-                     (window-total-height goals))))))
-    ;; two windows: the shared window too
-    (with-layout nil 'vertical
-      (let ((proof-shrink-windows-tofit t)
-            (split-width-threshold 1000))
-        (goto-marker "hello")
-        (run #'coq-eglot-goto-point)
-        (let ((shared (car (output-windows))))
-          (should (= (window-total-height shared)
-                     (max window-min-height
-                          (coq-eglot--window-need shared)))))))))
-
-(ert-deftest coq-eglot-shrink-windows-tofit-columns ()
-  "`proof-shrink-windows-tofit' does nothing to windows on the right of
-the script."
-  (with-test-file
-    (with-layout t 'hybrid
-      (let ((proof-shrink-windows-tofit t)
-            (coq-optimise-resp-windows-enable nil)
-            (calls 0))
-        (cl-letf (((symbol-function 'coq-eglot--resize-column)
-                   (lambda (&rest _) (setq calls (1+ calls)))))
-          (goto-marker "split")
-          (run #'coq-eglot-goto-point))
-        (should (= calls 0))))))
+        (pcase-let* ((`(,goals ,response) (windows-of "*goals*" "*response*"))
+                     (height (window-total-height script))
+                     (outputs (+ (window-total-height goals)
+                                 (window-total-height response))))
+          (query #'coq-eglot-run-query "Check double")
+          (should (= (window-total-height script) height))
+          (should (= (+ (window-total-height goals)
+                        (window-total-height response))
+                     outputs))
+          (should (= (window-total-height response)
+                     (max window-min-height (proof-window-need response)))))))))
 
 (ert-deftest coq-eglot-display-some-buffers ()
   "C-c C-o displays the messages, the trace and the goals in turn, in
@@ -414,8 +387,8 @@ simulated by a window."
                      (let ((window (split-window (frame-root-window) nil 'below)))
                        (set-window-buffer window buffer)
                        window)))
-                  ((symbol-function 'coq-eglot-resize-windows-by-priority)
-                   (lambda () (setq resized (1+ resized))))
+                  ((symbol-function 'proof-resize-output-column)
+                   (lambda (&rest _) (setq resized (1+ resized))))
                   ((symbol-function 'coq-eglot--frames)
                    (lambda () '(frame-of-goals)))
                   ((symbol-function 'delete-frame)
@@ -446,5 +419,33 @@ when visiting a file."
         (accept-process-output nil 0.1)
         (should (get-buffer-window "*goals*"))
         (should (get-buffer-window "*response*"))))))
+
+(ert-deftest coq-eglot-fold-error-environment ()
+  "The environments of the error messages are folded in the response
+buffer.  `coq-toggle-error-environment' unfolds them and fits the
+output windows again, see `proof-output-windows-function'."
+  (with-test-file
+    (with-layout t 'vertical
+      (let ((coq-fold-error-environment t)
+            (folded (lambda ()
+                      (with-current-buffer "*response*"
+                        (seq-some (lambda (ov)
+                                    (and (overlay-get ov 'coq-error-environment)
+                                         (overlay-get ov 'display)))
+                                  (overlays-in (point-min) (point-max))))))
+            (resized 0))
+        (goto-marker "split")
+        (run #'coq-eglot-goto-point)
+        (coq-eglot--show-response
+         (concat "In environment\nn : nat\nm : nat\n"
+                 "The term \"n\" has type \"nat\" while it is expected"
+                 " to have type \"bool\"."))
+        (should (funcall folded))
+        (cl-letf (((symbol-function 'proof-resize-output-column)
+                   (lambda (&rest _) (setq resized (1+ resized)))))
+          (with-current-buffer "*response*"
+            (coq-toggle-error-environment)))
+        (should-not (funcall folded))
+        (should (> resized 0))))))
 
 ;;; coq-eglot-test-windows.el ends here

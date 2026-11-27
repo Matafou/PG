@@ -17,8 +17,9 @@
 ;; shows its end, see `proof-response-show-end'.
 ;;
 ;; A backend with other output windows passes them with their roles to
-;; `proof-fit-output-windows', and may count the lines of its buffers
-;; its own way, see `proof-window-lines-function'.
+;; `proof-fit-output-windows', or sets `proof-output-windows-function',
+;; and may count the lines of its buffers its own way, see
+;; `proof-window-lines-function'.
 
 ;;; Code:
 
@@ -191,14 +192,20 @@ An alist from the windows to goals or response."
           (push (cons window (car role)) windows))))
     (nreverse windows)))
 
+(defvar-local proof-output-windows-function #'proof-output-windows
+  "Function returning the output windows, with their roles.
+Called without argument by `proof-fit-output-windows' when it is not
+given the windows.  Set locally by a backend with other output
+windows, in its script and output buffers.")
+
 (defun proof-fit-output-windows (&optional windows)
   "Fit the output windows to their contents, and show the responses.
 WINDOWS is an alist from the output windows to their roles, the goals
-and response windows by default, see `proof-output-windows'.  If
+and response windows by default, see `proof-output-windows-function'.  If
 `proof-shrink-windows-tofit', the windows one above the other share
 their height, see `proof-resize-output-column'.  Then the response
 windows show the end of their response, see `proof-show-response'."
-  (let ((windows (or windows (proof-output-windows))))
+  (let ((windows (or windows (funcall proof-output-windows-function))))
     (when (and proof-shrink-windows-tofit
                (not proof-multiple-frames-enable))
       (dolist (column (proof-output-window-columns (mapcar #'car windows)))

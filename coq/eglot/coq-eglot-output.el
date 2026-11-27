@@ -26,6 +26,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'coq-goals)                    ; folding the other goals
+(require 'pg-output-windows)            ; the heights of the windows
 (require 'coq-eglot-goals)              ; folding their hypotheses
 
 (defvar coq-eglot-mode)
@@ -372,7 +373,7 @@ the active script buffer displays its state."
 (defun coq-eglot--set-buffer-text (name mode text)
   "Replace the content of buffer NAME (in MODE) by TEXT, and display it.
 Then adjust the heights of the windows, see
-`coq-optimise-resp-windows-enable'.  Do nothing if called from a script
+`coq-eglot--resize-windows'.  Do nothing if called from a script
 buffer that is not active, see `coq-eglot--displays-p'."
   (when (coq-eglot--displays-p)
     (coq-eglot--render-buffer-text name mode text)))
@@ -405,7 +406,10 @@ empty if `proof-delete-empty-windows'."
       ;; before resizing: folded, the other goals take one line
       (when (derived-mode-p 'coq-eglot-goals-mode)
         (coq-eglot-goals-decorate)
-        (coq-goals-fold-other-goals)))
+        (coq-goals-fold-other-goals))
+      ;; and the environments of the errors
+      (when (derived-mode-p 'coq-eglot-response-mode)
+        (coq-fold-error-environments)))
     (when delete-empty
       ;; also the windows that the layout created for empty buffers
       (dolist (other (list (coq-eglot--goals-name)
@@ -425,102 +429,35 @@ Not the only window of the frame.  See `proof-delete-empty-windows'."
     (unless (frame-root-window-p window)
       (delete-window window))))
 
-(defun coq-eglot--allocate-heights (total needs minimum)
-  "Share TOTAL lines between windows needing NEEDS lines.
-NEEDS lists the heights the windows need, by priority.  Each window
-gets at least MINIMUM lines, then by priority what it needs if there is
-enough left.  The first one gets what remains.  Return the list of
-heights in the same order, or nil if TOTAL is too small."
-  (let ((rest (- total (* minimum (length needs)))))
-    (when (and needs (>= rest 0))
-      (let ((heights (mapcar (lambda (need)
-                               (let ((extra (min rest (max 0 (- need minimum)))))
-                                 (setq rest (- rest extra))
-                                 (+ minimum extra)))
-                             needs)))
-        (setcar heights (+ (car heights) rest))
-        heights))))
-
-(defun coq-eglot--window-need (window)
-  "Height WINDOW needs to display its buffer, mode line included.
-The goals after the first one count for one line, the first of them or
-their summary when folded: they are displayed only if the other windows
-leave room."
-  (+ (- (window-total-height window) (window-body-height window))
-     (with-current-buffer (window-buffer window)
-       (let ((others (and (derived-mode-p 'coq-eglot-goals-mode)
-                          (coq-goals--other-goals-start))))
-         (if others
-             (1+ (count-screen-lines (point-min) others nil window))
-           (count-screen-lines (point-min) (point-max) nil window))))))
+(defun coq-eglot--output-windows ()
+  "The goals, conclusion and response windows of the current output.
+An alist from the windows to their roles, see `proof-fit-output-windows'.
+The conclusion window has the role of the goals, and the goals window
+the role of the hypotheses when the conclusion is apart (see
+`coq-eglot-split-goals'), with weight 1 unless set in
+`proof-output-windows-weights'."
+  (let ((windows nil))
+    (pcase-dolist (`(,name . ,role)
+                   `((,(coq-eglot--goals-name)
+                      . ,(if coq-eglot-split-goals 'hypotheses 'goals))
+                     (,(coq-eglot--conclusion-name) . goals)
+                     (,(coq-eglot--response-name) . response)))
+      (let ((buffer (get-buffer name)))
+        (when buffer
+          (dolist (window (get-buffer-window-list buffer nil t))
+            (push (cons window role) windows)))))
+    (nreverse windows)))
 
 (defun coq-eglot--resize-windows ()
-  "Adjust the heights of the windows.
-See `coq-optimise-resp-windows-enable' and `proof-shrink-windows-tofit'.
-Not with `proof-multiple-frames-enable'."
-  (when (and (or coq-optimise-resp-windows-enable proof-shrink-windows-tofit)
-             (not (coq-eglot--multiple-frames-p)))
-    (coq-eglot-resize-windows-by-priority)))
-
-(defun coq-eglot-resize-windows-by-priority ()
-  "Give the windows the height they need, by priority.
-The goals, conclusion and response windows displayed one above the
-other share their height: each one gets the height it needs, the
-conclusion first, then the goals, then the response.  The first one
-gets what remains: the conclusion if `coq-eglot-split-goals', the
-hypotheses never get more than they need; the goals otherwise.  In
-three columns (see `proof-three-window-mode-policy'), only the windows
-of the same column.  The script window keeps its height, unless
-`proof-shrink-windows-tofit': then the windows below it get only the
-height they need, at most half of the frame (two thirds without
-`proof-three-window-enable'), like in Proof General, and the script
-window the rest.  Without `coq-optimise-resp-windows-enable', only the
-windows below the script are resized."
-  (let* ((names `((goals . ,(coq-eglot--goals-name))
-                  (conclusion . ,(coq-eglot--conclusion-name))
-                  (response . ,(coq-eglot--response-name))))
-         (windows (delq nil (mapcar (lambda (role)
-                                      (get-buffer-window
-                                       (cdr (assq role names))))
-                                    '(conclusion goals response))))
-         (script (coq-eglot--main-window)))
-    (pcase-dolist (`(,parent . ,column) (seq-group-by #'window-parent windows))
-      (let ((shrink (and proof-shrink-windows-tofit
-                         parent
-                         (eq (window-parent script) parent))))
-        (when (and (or shrink coq-optimise-resp-windows-enable)
-                   (or shrink (cdr column))
-                   (window-combined-p (car column)))
-          (coq-eglot--resize-column (if shrink (cons script column) column)
-                                    shrink))))))
-
-(defun coq-eglot--resize-column (windows &optional script)
-  "Give WINDOWS, one above the other, the height they need, by priority.
-If SCRIPT is non-nil, the first window is the script window: it gets
-what remains, the others at most half of the frame (two thirds in two
-windows mode).  See `coq-eglot-resize-windows-by-priority'."
-  (let* ((max-need (floor (frame-height)
-                          (if (coq-eglot--three-windows-p) 2 1.5)))
-         (needs (mapcar (lambda (window)
-                          (let ((need (coq-eglot--window-need window)))
-                            (if script (min max-need need) need)))
-                        windows))
-         (heights (coq-eglot--allocate-heights
-                   (apply #'+ (mapcar #'window-total-height windows))
-                   (if script (cons 0 (cdr needs)) needs)
-                   window-min-height)))
-    (when heights
-      ;; from top to bottom, the last one takes what remains: only the
-      ;; edges between them move
-      (let ((sorted (sort (cl-mapcar #'cons windows heights)
-                          (lambda (a b) (< (window-top-line (car a))
-                                           (window-top-line (car b)))))))
-        (dolist (window-height (butlast sorted))
-          (ignore-errors
-            (adjust-window-trailing-edge
-             (car window-height)
-             (- (cdr window-height)
-                (window-total-height (car window-height))))))))))
+  "Fit the output windows to their contents, see `proof-fit-output-windows'.
+The goals and response windows one above the other share their height,
+see `proof-shrink-windows-tofit', and the response windows show the end
+of a long response, see `proof-response-show-end'."
+  (let ((windows (coq-eglot--output-windows))
+        ;; the twins are in one frame, see `coq-eglot--multiple-frames-p'
+        (proof-multiple-frames-enable (coq-eglot--multiple-frames-p)))
+    (when windows
+      (proof-fit-output-windows windows))))
 
 (provide 'coq-eglot-output)
 

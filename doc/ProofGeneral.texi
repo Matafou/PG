@@ -5943,7 +5943,10 @@ The display options of Proof General are honored (menu @code{Coq ->
 Windows}): @code{proof-auto-raise-buffers},
 @code{proof-multiple-frames-enable}, @code{proof-delete-empty-windows},
 @code{proof-shrink-windows-tofit} and
-@code{proof-layout-windows-on-visit-file}.  @kbd{C-c C-o} displays the
+@code{proof-layout-windows-on-visit-file}.  With
+@code{coq-eglot-split-goals}, the window of the hypotheses has the role
+@code{hypotheses} in @code{proof-output-windows-weights}, and the
+window of the conclusion the role of the goals.  @kbd{C-c C-o} displays the
 messages, the trace and the goals in turn.
 @item
 All the insertion commands and the menu @code{Coq -> INSERT} work,

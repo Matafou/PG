@@ -2235,11 +2235,11 @@ goals window needs: they are displayed only if the response leaves room."
                       (mode-line (- (window-total-height goals)
                                     (window-body-height goals))))
                   (should start)
-                  (should (= (coq-eglot--window-need goals)
+                  (should (= (proof-window-need goals)
                              (+ mode-line 1
                                 (count-screen-lines (point-min) start nil
                                                     goals))))
-                  (should (< (coq-eglot--window-need goals)
+                  (should (< (proof-window-need goals)
                              (+ mode-line
                                 (count-screen-lines (point-min) (point-max)
                                                     nil goals))))))))

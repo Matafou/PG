@@ -431,6 +431,7 @@ active script buffer."
   (setq coq-query-function #'coq-eglot-run-query)
   (setq coq-query-result-function #'coq-eglot-query-result)
   (setq coq-ask-printing-width-function #'coq-eglot-ask-printing-width)
+  (setq-local proof-output-windows-function #'coq-eglot--output-windows)
   (setq coq-set-flag-function #'coq-eglot-set-flag)
   (setq coq-set-search-blacklist-function #'coq-eglot-set-search-blacklist))
 
@@ -2307,6 +2308,7 @@ buffer is set up, after the configuration of the user."
         (setq coq-set-search-blacklist-function #'coq-eglot-set-search-blacklist)
         (setq coq-show-at-point-function #'coq-eglot-show-at-point)
         (setq coq-processed-end-function #'coq-eglot-position)
+        (setq-local proof-output-windows-function #'coq-eglot--output-windows)
         (add-hook 'project-find-functions #'coq-eglot-lsp-project nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc nil t)
         (add-hook 'eglot-managed-mode-hook #'coq-eglot-lsp-check-load-path nil t)
@@ -2324,6 +2326,7 @@ buffer is set up, after the configuration of the user."
     (kill-local-variable 'coq-set-search-blacklist-function)
     (kill-local-variable 'coq-show-at-point-function)
     (kill-local-variable 'coq-processed-end-function)
+    (kill-local-variable 'proof-output-windows-function)
     (remove-hook 'project-find-functions #'coq-eglot-lsp-project t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot--setup-eldoc t)
     (remove-hook 'eglot-managed-mode-hook #'coq-eglot-session-reset t)
