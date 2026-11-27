@@ -889,11 +889,7 @@ twins are highlighted; not while they are at other positions."
       (should-not (coq-eglot-checking-p))
       (should (= (coq-eglot-position) (search-position "1 = 1.\nProof.")))
       ;; the sentence that failed
-      (should (cl-some (lambda (overlay)
-                         (equal (buffer-substring (overlay-start overlay)
-                                                  (overlay-end overlay))
-                                "exact 0."))
-                       coq-eglot--error-overlays))
+      (should (equal (error-sentence-text) "exact 0."))
       ;; its window shows the error
       (should (<= (- (search-position "exact 0.") (length "exact 0."))
                   (window-point (get-buffer-window twin))
@@ -915,11 +911,7 @@ twins are highlighted; not while they are at other positions."
     (run #'coq-eglot-process-buffer)
     (wait-for-twins)
     (should-not (coq-eglot-checking-p))
-    (should (cl-some (lambda (overlay)
-                       (equal (buffer-substring (overlay-start overlay)
-                                                (overlay-end overlay))
-                              "exact 0."))
-                     coq-eglot--error-overlays))
+    (should (equal (error-sentence-text) "exact 0."))
     (should-not (with-current-buffer twin (coq-eglot-checking-p)))
     (should (= (with-current-buffer twin (coq-eglot-position))
                (coq-eglot-twin-position (coq-eglot-position))))))
@@ -938,11 +930,7 @@ twins are highlighted; not while they are at other positions."
       (should (= (coq-eglot-position) before-first-error))
       (should (= (with-current-buffer twin (coq-eglot-position))
                  (coq-eglot-twin-position before-first-error))))
-    (should (cl-some (lambda (overlay)
-                       (equal (buffer-substring (overlay-start overlay)
-                                                (overlay-end overlay))
-                              "exact 0."))
-                     coq-eglot--error-overlays))))
+    (should (equal (error-sentence-text) "exact 0."))))
 
 (ert-deftest coq-eglot-twin-pair-errors ()
   "A buffer has at most one twin, and it is not itself."

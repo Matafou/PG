@@ -401,14 +401,21 @@ Point is at the error, see `coq-eglot--highlight-error'.")
 
 (defun coq-eglot--highlight-error (start end)
   "Highlight the sentence between START and END, which failed.
-Like Proof General: the sentence with `proof-boring-face', the location
-of the error, if known, with `proof-warning-face'.  Move point to the
-error.  Run `coq-eglot-error-hook'."
+Like Proof General: the location of the error, if known, with
+`coq-error-location-face', the rest of the sentence with
+`proof-boring-face'.  Move point to the error.  Run
+`coq-eglot-error-hook'."
   (coq-eglot--clear-error)
-  (coq-eglot--error-overlay start end 'proof-boring-face 0)
   (let ((range (coq-eglot-session-error-range start end)))
-    (when range
-      (coq-eglot--error-overlay (car range) (cdr range) 'proof-warning-face 1))
+    (if (not range)
+        (coq-eglot--error-overlay start end 'proof-boring-face 0)
+      ;; not on the location: it keeps its colors
+      (when (< start (car range))
+        (coq-eglot--error-overlay start (car range) 'proof-boring-face 0))
+      (when (< (cdr range) end)
+        (coq-eglot--error-overlay (cdr range) end 'proof-boring-face 0))
+      (coq-eglot--error-overlay (car range) (cdr range)
+                                'coq-error-location-face 1))
     (goto-char (if range (car range) start)))
   (when coq-eglot-error-highlight-duration
     (setq coq-eglot--error-timer

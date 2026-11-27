@@ -61,16 +61,17 @@
 
 (ert-deftest coq-eglot-error-stops ()
   "Processing stops before the sentence that fails.
-Like Proof General, the sentence is highlighted with `proof-boring-face',
-the error location with `proof-warning-face', and point moves there."
+Like Proof General, the error location is highlighted with
+`coq-error-location-face', the rest of the sentence with
+`proof-boring-face', and point moves there."
   (with-test-file
     (run #'coq-eglot-process-buffer)
     (should (position-at-marker-p "before error"))
     (should (string-match-p "\\`Error: .*unknown_lemma" (buffer-text "*response*")))
     (should (string-match-p "\\`1 goal\n\n *=+\n *1 = 2" (buffer-text "*goals*")))
-    (should (equal (error-overlay-text 'proof-boring-face)
-                   "rewrite unknown_lemma."))
-    (should (equal (error-overlay-text 'proof-warning-face) "unknown_lemma"))
+    (should (equal (error-overlay-texts 'proof-boring-face) '("rewrite " ".")))
+    (should (equal (error-overlay-texts 'coq-error-location-face)
+                   '("unknown_lemma")))
     (should (looking-at "unknown_lemma"))
     ;; the next command removes the highlighting
     (run #'coq-eglot-undo-last-command)
